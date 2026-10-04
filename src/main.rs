@@ -41,8 +41,8 @@ fn main() -> lsmkv::Result<()> {
             ["stats"] => {
                 let s = db.stats();
                 println!(
-                    "memtable: {} entries, ~{} bytes | log: {:06}.log",
-                    s.memtable_entries, s.memtable_bytes, s.log_number
+                    "memtable: {} versions, ~{} bytes | log: {:06}.log | last seq: {}",
+                    s.memtable_entries, s.memtable_bytes, s.log_number, s.last_sequence
                 );
                 println!(
                     "  writes: {} in {} groups, {} WAL fsyncs",

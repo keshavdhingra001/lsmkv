@@ -4,23 +4,26 @@
 //! On-disk record layout (all integers little-endian):
 //!
 //! ```text
-//! +-----------+----------+--------------+--------------+---------+-----------+
-//! | crc32 u32 | kind u8  | key_len u32  | val_len u32  | key ... | value ... |
-//! +-----------+----------+--------------+--------------+---------+-----------+
+//! +-----------+---------+---------+-------------+-------------+---------+-----------+
+//! | crc32 u32 | kind u8 | seq u64 | key_len u32 | val_len u32 | key ... | value ... |
+//! +-----------+---------+---------+-------------+-------------+---------+-----------+
 //! ```
 //!
 //! - `crc32` covers every byte AFTER the crc field (kind through value).
 //! - `kind`: 1 = Put, 2 = Delete (Delete has `val_len = 0`).
-//! - Header is 13 bytes.
+//! - `seq`: the write's sequence number (DESIGN.md D18), so a replay rebuilds
+//!   the memtable with the same versions it had.
+//! - Header is 21 bytes.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 
-use crate::codec::{len_u32, read_u32};
+use crate::codec::{len_u32, read_u32, read_u64};
 use crate::error::{Error, Result};
+use crate::key::SeqNo;
 
-pub const HEADER_LEN: usize = 4 + 1 + 4 + 4;
+pub const HEADER_LEN: usize = 4 + 1 + 8 + 4 + 4;
 pub const KIND_PUT: u8 = 1;
 pub const KIND_DELETE: u8 = 2;
 
@@ -33,7 +36,8 @@ pub enum Record {
 /// Result of replaying a log file.
 #[derive(Debug, Default)]
 pub struct Replay {
-    pub records: Vec<Record>,
+    /// Each record with its sequence number, in log order.
+    pub records: Vec<(SeqNo, Record)>,
     /// Byte offset just past the last valid record. Anything after this is a
     /// torn or corrupt tail, and `Db::open` truncates the file back to here
     /// before appending again (otherwise new writes land after garbage and
@@ -57,11 +61,11 @@ impl Wal {
         })
     }
 
-    /// Encodes `rec` and writes it to the log buffer.
+    /// Encodes `rec` (the write numbered `seq`) and writes it to the log buffer.
     ///
     /// Does NOT fsync; that's `sync`'s job, which lets a caller batch several
     /// appends under one fsync later (group commit).
-    pub fn append(&mut self, rec: &Record) -> Result<()> {
+    pub fn append(&mut self, seq: SeqNo, rec: &Record) -> Result<()> {
         let (kind, key, value): (u8, &[u8], &[u8]) = match rec {
             Record::Put { key, value } => (KIND_PUT, key, value),
             Record::Delete { key } => (KIND_DELETE, key, &[]),
@@ -72,6 +76,7 @@ impl Wal {
         // Everything after the CRC field, built first so the CRC can cover it.
         let mut body = Vec::with_capacity(HEADER_LEN - 4 + key.len() + value.len());
         body.push(kind);
+        body.extend_from_slice(&seq.to_le_bytes());
         body.extend_from_slice(&key_len.to_le_bytes());
         body.extend_from_slice(&val_len.to_le_bytes());
         body.extend_from_slice(key);
@@ -129,8 +134,8 @@ impl Wal {
         let mut pos = 0;
         loop {
             match decode(&buf[pos..]) {
-                Decoded::Record(rec, len) => {
-                    records.push(rec);
+                Decoded::Record(seq, rec, len) => {
+                    records.push((seq, rec));
                     pos += len;
                 }
                 Decoded::Incomplete => break,
@@ -156,7 +161,7 @@ impl Wal {
 
 enum Decoded {
     /// A valid record and its encoded length.
-    Record(Record, usize),
+    Record(SeqNo, Record, usize),
     /// Not enough bytes for the header, or for the length the header claims.
     Incomplete,
     /// Complete per its header, but the checksum or contents are wrong.
@@ -171,8 +176,9 @@ fn decode(buf: &[u8]) -> Decoded {
     }
     let crc = read_u32(buf, 0);
     let kind = buf[4];
-    let key_len = read_u32(buf, 5) as usize;
-    let val_len = read_u32(buf, 9) as usize;
+    let seq = read_u64(buf, 5);
+    let key_len = read_u32(buf, 13) as usize;
+    let val_len = read_u32(buf, 17) as usize;
 
     // Lengths come from disk and may be garbage, so guard the addition too.
     let Some(total) = HEADER_LEN
@@ -197,7 +203,7 @@ fn decode(buf: &[u8]) -> Decoded {
         KIND_DELETE if val_len == 0 => Record::Delete { key },
         _ => return Decoded::Bad(total),
     };
-    Decoded::Record(rec, total)
+    Decoded::Record(seq, rec, total)
 }
 
 #[cfg(test)]
@@ -212,12 +218,18 @@ mod tests {
         }
     }
 
+    /// Logs `recs` numbered 1, 2, 3, ...
     fn write_all(path: &Path, recs: &[Record]) {
         let mut wal = Wal::open(path).unwrap();
-        for r in recs {
-            wal.append(r).unwrap();
+        for (i, r) in recs.iter().enumerate() {
+            wal.append(i as SeqNo + 1, r).unwrap();
         }
         wal.sync().unwrap();
+    }
+
+    /// What `write_all(recs)` replays as.
+    fn numbered(recs: &[Record]) -> Vec<(SeqNo, Record)> {
+        (1..).zip(recs.iter().cloned()).collect()
     }
 
     #[test]
@@ -240,7 +252,7 @@ mod tests {
         write_all(&path, &recs);
 
         let r = Wal::replay(&path).unwrap();
-        assert_eq!(r.records, recs);
+        assert_eq!(r.records, numbered(&recs));
         assert_eq!(r.valid_len, fs::metadata(&path).unwrap().len());
     }
 
@@ -265,7 +277,7 @@ mod tests {
         f.set_len(full - 3).unwrap();
 
         let r = Wal::replay(&path).unwrap();
-        assert_eq!(r.records, vec![put("a", "1"), put("b", "2")]);
+        assert_eq!(r.records, numbered(&[put("a", "1"), put("b", "2")]));
         assert!(r.valid_len < full - 3);
     }
 
@@ -281,13 +293,14 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         let r = Wal::replay(&path).unwrap();
-        assert_eq!(r.records, vec![put("a", "1")]);
+        assert_eq!(r.records, numbered(&[put("a", "1")]));
     }
 
     /// Builds a record by hand with a correct CRC, so tests can reach the
     /// checks that come after the checksum.
     fn raw_record(kind: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
         let mut body = vec![kind];
+        body.extend_from_slice(&7u64.to_le_bytes());
         body.extend_from_slice(&(key.len() as u32).to_le_bytes());
         body.extend_from_slice(&(value.len() as u32).to_le_bytes());
         body.extend_from_slice(key);
@@ -309,7 +322,7 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         let r = Wal::replay(&path).unwrap();
-        assert_eq!(r.records, vec![put("a", "1")]);
+        assert_eq!(r.records, numbered(&[put("a", "1")]));
         assert_eq!(r.valid_len, good_len);
     }
 
@@ -330,6 +343,7 @@ mod tests {
         let path = dir.path().join("wal.log");
         let mut bytes = vec![0u8; 4];
         bytes.push(KIND_PUT);
+        bytes.extend_from_slice(&1u64.to_le_bytes());
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         bytes.extend_from_slice(&u32::MAX.to_le_bytes());
         fs::write(&path, &bytes).unwrap();
@@ -369,7 +383,7 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
 
         let r = Wal::replay(&path).unwrap();
-        assert_eq!(r.records, vec![put("a", "1"), put("b", "2")]);
+        assert_eq!(r.records, numbered(&[put("a", "1"), put("b", "2")]));
         assert_eq!(r.valid_len, good_len);
     }
 

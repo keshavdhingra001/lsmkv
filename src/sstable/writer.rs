@@ -1,4 +1,5 @@
-//! Builds an SSTable from entries supplied in strictly increasing key order.
+//! Builds an SSTable from entries supplied in strictly increasing internal key
+//! order: key ascending, then seq descending (DESIGN.md D18).
 //!
 //! Crash safety: everything is written to `<path>.tmp`, fsynced, renamed to
 //! `<path>`, and then the directory is fsynced. A crash at any point leaves
@@ -14,6 +15,7 @@ use super::{Footer, DEFAULT_BLOCK_SIZE};
 use crate::codec::len_u32;
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
+use crate::key::{self, SeqNo};
 use crate::memtable::Entry;
 
 #[derive(Debug, Clone, Copy)]
@@ -44,8 +46,8 @@ pub struct SstWriter {
     index: Vec<u8>,
     /// Bytes written so far, i.e. where the next block starts.
     offset: u64,
-    last_key: Option<Vec<u8>>,
-    /// Hash of every key, for the bloom filter built in `finish`. 8 bytes per
+    last_key: Option<(Vec<u8>, SeqNo)>,
+    /// Hash of every distinct key, for the bloom filter built in `finish`. 8 bytes per
     /// key, far less than keeping the keys themselves.
     key_hashes: Vec<u64>,
     entry_count: u64,
@@ -98,24 +100,28 @@ impl SstWriter {
         })
     }
 
-    /// Adds one entry. Keys must be strictly increasing (a memtable flush
-    /// produces exactly that order).
-    pub fn add(&mut self, key: &[u8], entry: &Entry) -> Result<()> {
-        if let Some(last) = &self.last_key {
-            if key <= last.as_slice() {
+    /// Adds version `seq` of `key`. (key, seq) must be strictly increasing in
+    /// internal key order (a memtable flush produces exactly that order).
+    pub fn add(&mut self, key: &[u8], seq: SeqNo, entry: &Entry) -> Result<()> {
+        let mut new_key = true;
+        if let Some((last, last_seq)) = &self.last_key {
+            if !key::compare(key, seq, last, *last_seq).is_gt() {
                 return Err(Error::InvalidArgument(format!(
-                    "keys must be strictly increasing: {:?} after {:?}",
+                    "entries must be strictly increasing: {:?}@{seq} after {:?}@{last_seq}",
                     String::from_utf8_lossy(key),
                     String::from_utf8_lossy(last)
                 )));
             }
+            new_key = key != last.as_slice();
         }
-        self.block.add(key, entry)?;
-        self.last_key = Some(key.to_vec());
+        self.block.add(key, seq, entry)?;
+        self.last_key = Some((key.to_vec(), seq));
         self.entry_count += 1;
-        // Tombstones go in the filter too: a lookup must find them to learn
-        // the key is deleted, or it would fall through to older tables.
-        if self.opts.bloom_bits_per_key > 0 {
+        // The filter answers "might this table hold the key at all", so it
+        // takes each key once, however many versions it has. Tombstones go
+        // in too: a lookup must find them to learn the key is deleted, or it
+        // would fall through to older tables.
+        if self.opts.bloom_bits_per_key > 0 && new_key {
             self.key_hashes.push(filter::hash(key));
         }
         if self.block.size() >= self.opts.block_size {
@@ -129,7 +135,8 @@ impl SstWriter {
         if self.block.is_empty() {
             return Ok(());
         }
-        let last_key = self.block.last_key().to_vec();
+        let (last_key, last_seq) = self.block.last_key();
+        let last_key = last_key.to_vec();
         let data = self.block.finish();
         let size = len_u32(&data, "block")?;
         self.file.write_all(&data)?;
@@ -137,6 +144,7 @@ impl SstWriter {
         self.index
             .extend_from_slice(&len_u32(&last_key, "key")?.to_le_bytes());
         self.index.extend_from_slice(&last_key);
+        self.index.extend_from_slice(&last_seq.to_le_bytes());
         self.index.extend_from_slice(&self.offset.to_le_bytes());
         self.index.extend_from_slice(&size.to_le_bytes());
 

@@ -11,11 +11,13 @@ use super::filter::BloomFilter;
 use super::{Footer, ReadContext, ReadStats, FOOTER_LEN};
 use crate::codec::{read_u32, read_u64};
 use crate::error::{Error, Result};
+use crate::key::{self, SeqNo};
 use crate::memtable::Entry;
 
 #[derive(Debug)]
 struct IndexEntry {
     last_key: Vec<u8>,
+    last_seq: SeqNo,
     offset: u64,
     size: u32,
 }
@@ -100,7 +102,7 @@ impl SstReader {
         if let Some(first) = reader.index.first() {
             let raw = reader.read_block(first)?;
             let block = Block::new(&raw).map_err(|e| reader.block_error(e, first))?;
-            let (key, _) = block
+            let (key, _, _) = block
                 .iter()
                 .next()
                 .ok_or_else(|| corrupt("first block is empty".into()))?
@@ -110,16 +112,17 @@ impl SstReader {
         Ok(reader)
     }
 
-    /// `None` = key not in this table; `Some(Tombstone)` = deleted here.
-    pub fn get(&self, key: &[u8]) -> Result<Option<Entry>> {
+    /// The newest version of `key` at or below `snapshot`. `None` = no such
+    /// version in this table; `Some(Tombstone)` = deleted as of `snapshot`.
+    pub fn get(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Entry>> {
         let Some(filter) = &self.filter else {
-            return self.search(key);
+            return self.search(key, snapshot);
         };
         if !filter.may_contain(key) {
             ReadStats::bump(&self.ctx.stats.filter_negatives);
             return Ok(None);
         }
-        let found = self.search(key)?;
+        let found = self.search(key, snapshot)?;
         if found.is_none() {
             ReadStats::bump(&self.ctx.stats.filter_false_positives);
         }
@@ -127,15 +130,19 @@ impl SstReader {
     }
 
     /// The lookup without the filter: index, then one block.
-    fn search(&self, key: &[u8]) -> Result<Option<Entry>> {
-        // First block whose last key >= key: the only block that can hold it.
-        let i = self.index.partition_point(|e| e.last_key.as_slice() < key);
+    fn search(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Entry>> {
+        // First block whose last entry is at or after (key, snapshot): the
+        // only block that can hold the first entry at or after it, which is
+        // the version this lookup wants if it belongs to `key`.
+        let i = self
+            .index
+            .partition_point(|e| key::compare(&e.last_key, e.last_seq, key, snapshot).is_lt());
         let Some(entry) = self.index.get(i) else {
             return Ok(None);
         };
         let raw = self.cached_block(entry)?;
         Block::from_verified(&raw)
-            .get(key)
+            .get(key, snapshot)
             .map_err(|e| self.block_error(e, entry))
     }
 
@@ -157,22 +164,22 @@ impl SstReader {
         Ok(raw)
     }
 
-    /// Every entry in key order. Reads the whole table; used by tests now and
+    /// Every entry (each version of each key) in internal key order. Reads the whole table; used by tests now and
     /// by flush/compaction later (M9 replaces it with a streaming iterator).
     /// Bypasses the block cache: a compaction reads each block once, and
     /// caching them would evict the blocks that reads actually reuse.
-    pub fn entries(&self) -> Result<Vec<(Vec<u8>, Entry)>> {
+    pub fn entries(&self) -> Result<Vec<(Vec<u8>, SeqNo, Entry)>> {
         let mut out = Vec::with_capacity(self.footer.entry_count as usize);
         for entry in &self.index {
             let raw = self.read_block(entry)?;
             let block = Block::new(&raw).map_err(|e| self.block_error(e, entry))?;
             for item in block.iter() {
-                let (k, v) = item.map_err(|e| self.block_error(e, entry))?;
+                let (k, seq, v) = item.map_err(|e| self.block_error(e, entry))?;
                 let v = match v {
                     Some(v) => Entry::Value(v.to_vec()),
                     None => Entry::Tombstone,
                 };
-                out.push((k.to_vec(), v));
+                out.push((k.to_vec(), seq, v));
             }
         }
         if out.len() as u64 != self.footer.entry_count {
@@ -240,7 +247,8 @@ impl SstReader {
 }
 
 /// Parses and validates the index block. Blocks must be contiguous from
-/// offset 0 up to `blocks_end`, and last keys strictly increasing.
+/// offset 0 up to `blocks_end`, and last entries strictly increasing in
+/// internal key order.
 fn decode_index(buf: &[u8], blocks_end: u64) -> std::result::Result<Vec<IndexEntry>, String> {
     if buf.len() < 4 {
         return Err("index shorter than its checksum".into());
@@ -259,25 +267,29 @@ fn decode_index(buf: &[u8], blocks_end: u64) -> std::result::Result<Vec<IndexEnt
             return Err("index entry truncated".into());
         }
         let key_len = read_u32(rest, 0) as usize;
-        let need = 4 + key_len + 8 + 4;
+        let Some(need) = key_len.checked_add(4 + 8 + 8 + 4) else {
+            return Err("index entry truncated".into());
+        };
         if rest.len() < need {
             return Err("index entry truncated".into());
         }
         let last_key = rest[4..4 + key_len].to_vec();
-        let offset = read_u64(rest, 4 + key_len);
-        let size = read_u32(rest, 4 + key_len + 8);
+        let last_seq = read_u64(rest, 4 + key_len);
+        let offset = read_u64(rest, 4 + key_len + 8);
+        let size = read_u32(rest, 4 + key_len + 16);
 
         if offset != expected_offset {
             return Err(format!("block at {offset}, expected {expected_offset}"));
         }
         if let Some(prev) = index.last() {
-            if last_key <= prev.last_key {
+            if !key::compare(&last_key, last_seq, &prev.last_key, prev.last_seq).is_gt() {
                 return Err("index keys not strictly increasing".into());
             }
         }
         expected_offset = offset + size as u64;
         index.push(IndexEntry {
             last_key,
+            last_seq,
             offset,
             size,
         });

@@ -1,6 +1,7 @@
 //! SSTable writer + reader tests. Corruption and randomized tests: section 4.
 
 use super::*;
+use crate::key::{SeqNo, MAX_SEQ};
 use crate::memtable::Entry;
 use crate::test_util::Rng;
 use std::path::{Path, PathBuf};
@@ -9,12 +10,21 @@ fn val(s: &str) -> Entry {
     Entry::Value(s.as_bytes().to_vec())
 }
 
+/// Writes one version per key, all at seq 1.
 fn write_table(path: &Path, block_size: usize, entries: &[(Vec<u8>, Entry)]) {
     let mut w = SstWriter::with_block_size(path, block_size).unwrap();
     for (k, e) in entries {
-        w.add(k, e).unwrap();
+        w.add(k, 1, e).unwrap();
     }
     w.finish().unwrap();
+}
+
+/// What `entries()` returns for a table `write_table` wrote.
+fn at_seq_1(entries: &[(Vec<u8>, Entry)]) -> Vec<(Vec<u8>, SeqNo, Entry)> {
+    entries
+        .iter()
+        .map(|(k, e)| (k.clone(), 1, e.clone()))
+        .collect()
 }
 
 fn numbered(n: usize) -> Vec<(Vec<u8>, Entry)> {
@@ -49,10 +59,10 @@ fn small_roundtrip() {
     let r = SstReader::open(&path).unwrap();
     assert_eq!(r.entry_count(), 3);
     assert_eq!(r.block_count(), 1);
-    assert_eq!(r.get(b"apple").unwrap(), Some(val("red")));
-    assert_eq!(r.get(b"banana").unwrap(), Some(Entry::Tombstone));
-    assert_eq!(r.get(b"cherry").unwrap(), Some(val("")));
-    assert_eq!(r.entries().unwrap(), entries);
+    assert_eq!(r.get(b"apple", MAX_SEQ).unwrap(), Some(val("red")));
+    assert_eq!(r.get(b"banana", MAX_SEQ).unwrap(), Some(Entry::Tombstone));
+    assert_eq!(r.get(b"cherry", MAX_SEQ).unwrap(), Some(val("")));
+    assert_eq!(r.entries().unwrap(), at_seq_1(&entries));
 }
 
 #[test]
@@ -66,7 +76,11 @@ fn misses_before_between_and_after() {
     );
     let r = SstReader::open(&path).unwrap();
     for missing in ["", "a", "c", "e", "zzz"] {
-        assert_eq!(r.get(missing.as_bytes()).unwrap(), None, "{missing:?}");
+        assert_eq!(
+            r.get(missing.as_bytes(), MAX_SEQ).unwrap(),
+            None,
+            "{missing:?}"
+        );
     }
 }
 
@@ -81,7 +95,7 @@ fn many_blocks_every_key_found() {
     assert!(r.block_count() > 100, "only {} blocks", r.block_count());
     for (k, e) in &entries {
         assert_eq!(
-            r.get(k).unwrap().as_ref(),
+            r.get(k, MAX_SEQ).unwrap().as_ref(),
             Some(e),
             "{:?}",
             String::from_utf8_lossy(k)
@@ -90,9 +104,9 @@ fn many_blocks_every_key_found() {
     // Keys that sort between two existing keys, including across block edges.
     for i in 0..2000 {
         let probe = format!("key{i:06}x");
-        assert_eq!(r.get(probe.as_bytes()).unwrap(), None);
+        assert_eq!(r.get(probe.as_bytes(), MAX_SEQ).unwrap(), None);
     }
-    assert_eq!(r.entries().unwrap(), entries);
+    assert_eq!(r.entries().unwrap(), at_seq_1(&entries));
 }
 
 #[test]
@@ -107,8 +121,8 @@ fn entry_larger_than_block_size() {
     ];
     write_table(&path, 64, &entries);
     let r = SstReader::open(&path).unwrap();
-    assert_eq!(r.get(b"b").unwrap(), Some(val(&big)));
-    assert_eq!(r.entries().unwrap(), entries);
+    assert_eq!(r.get(b"b", MAX_SEQ).unwrap(), Some(val(&big)));
+    assert_eq!(r.entries().unwrap(), at_seq_1(&entries));
 }
 
 #[test]
@@ -119,7 +133,7 @@ fn empty_table() {
     let r = SstReader::open(&path).unwrap();
     assert_eq!(r.entry_count(), 0);
     assert_eq!(r.block_count(), 0);
-    assert_eq!(r.get(b"anything").unwrap(), None);
+    assert_eq!(r.get(b"anything", MAX_SEQ).unwrap(), None);
     assert!(r.entries().unwrap().is_empty());
 }
 
@@ -127,16 +141,19 @@ fn empty_table() {
 fn rejects_out_of_order_and_duplicate_keys() {
     let dir = tempfile::tempdir().unwrap();
     let mut w = SstWriter::create(&table_path(&dir)).unwrap();
-    w.add(b"b", &val("1")).unwrap();
-    assert!(matches!(
-        w.add(b"a", &val("2")),
-        Err(Error::InvalidArgument(_))
-    ));
-    assert!(matches!(
-        w.add(b"b", &val("3")),
-        Err(Error::InvalidArgument(_))
-    ));
-    w.add(b"c", &val("4")).unwrap();
+    w.add(b"b", 5, &val("1")).unwrap();
+    for (key, seq) in [("a", 9), ("b", 5), ("b", 6)] {
+        assert!(
+            matches!(
+                w.add(key.as_bytes(), seq, &val("x")),
+                Err(Error::InvalidArgument(_))
+            ),
+            "{key}@{seq} after b@5"
+        );
+    }
+    // An older version of the same key, or any later key, is fine.
+    w.add(b"b", 4, &val("2")).unwrap();
+    w.add(b"c", 9, &val("3")).unwrap();
 }
 
 #[test]
@@ -144,7 +161,7 @@ fn file_appears_only_after_finish() {
     let dir = tempfile::tempdir().unwrap();
     let path = table_path(&dir);
     let mut w = SstWriter::create(&path).unwrap();
-    w.add(b"a", &val("1")).unwrap();
+    w.add(b"a", 1, &val("1")).unwrap();
     assert!(!path.exists(), "final file visible before finish");
     w.finish().unwrap();
     assert!(path.exists());
@@ -157,7 +174,7 @@ fn abandoned_writer_leaves_nothing() {
     let path = table_path(&dir);
     {
         let mut w = SstWriter::create(&path).unwrap();
-        w.add(b"a", &val("1")).unwrap();
+        w.add(b"a", 1, &val("1")).unwrap();
     } // dropped without finish
     assert!(!path.exists());
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
@@ -184,7 +201,7 @@ fn footer_roundtrip_and_magic_at_end() {
         entry_count: 5,
     };
     let bytes = f.encode();
-    assert_eq!(&bytes[44..], b"LSMKVSST");
+    assert_eq!(&bytes[44..], b"LSMKVSS2");
     assert_eq!(Footer::decode(&bytes).unwrap(), f);
 }
 
@@ -217,14 +234,14 @@ fn flipped_data_byte_fails_only_that_block() {
     // Index, footer and block 0 are intact, so open succeeds...
     let r = SstReader::open(&path).unwrap();
     // ...but reading the last block is caught by its CRC,
-    match r.get(&entries.last().unwrap().0) {
+    match r.get(&entries.last().unwrap().0, MAX_SEQ) {
         Err(Error::Corruption(msg)) => assert!(msg.contains("block at offset"), "{msg}"),
         other => panic!("expected Corruption, got {other:?}"),
     }
     expect_corruption(r.entries(), "full scan over bad block");
     // ...while keys in other blocks are still readable.
     let (k, e) = &entries[0];
-    assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+    assert_eq!(r.get(k, MAX_SEQ).unwrap().as_ref(), Some(e));
 
     // Block 0 is read on open (for the smallest key), so damage there
     // is caught immediately.
@@ -305,36 +322,51 @@ fn non_sstable_files_are_rejected() {
     }
 }
 
+/// Random tables holding several versions per key, checked against a model
+/// at random snapshots.
 #[test]
 fn randomized_tables_match_a_btreemap() {
+    use std::cmp::Reverse;
     let dir = tempfile::tempdir().unwrap();
     for seed in 1..=40u64 {
         let mut rng = Rng::new(seed);
+        // Internal key order: key ascending, then seq descending.
         let mut model = std::collections::BTreeMap::new();
-        for _ in 0..rng.below(1500) {
+        let n = rng.below(1500);
+        for seq in 1..=n {
             let e = if rng.below(5) == 0 {
                 Entry::Tombstone
             } else {
                 Entry::Value(rng.value())
             };
-            model.insert(rng.key(), e);
+            model.insert((rng.key(), Reverse(seq)), e);
         }
-        let entries: Vec<(Vec<u8>, Entry)> = model.clone().into_iter().collect();
+        let entries: Vec<(Vec<u8>, SeqNo, Entry)> = model
+            .iter()
+            .map(|((k, Reverse(seq)), e)| (k.clone(), *seq, e.clone()))
+            .collect();
         let block_size = 32 + rng.below(1024) as usize;
         let path = dir.path().join(format!("{seed}.sst"));
-        write_table(&path, block_size, &entries);
+        let mut w = SstWriter::with_block_size(&path, block_size).unwrap();
+        for (k, seq, e) in &entries {
+            w.add(k, *seq, e).unwrap();
+        }
+        w.finish().unwrap();
 
         let r = SstReader::open(&path).unwrap();
         assert_eq!(r.entries().unwrap(), entries, "seed {seed}");
-        for (k, e) in &entries {
-            assert_eq!(r.get(k).unwrap().as_ref(), Some(e), "seed {seed} key {k:?}");
-        }
         for _ in 0..500 {
             let probe = rng.key();
+            let snapshot = rng.below(n + 2);
+            let want = model
+                .range((probe.clone(), Reverse(snapshot))..)
+                .next()
+                .filter(|((k, _), _)| *k == probe)
+                .map(|(_, e)| e);
             assert_eq!(
-                r.get(&probe).unwrap().as_ref(),
-                model.get(&probe),
-                "seed {seed} probe {probe:?}"
+                r.get(&probe, snapshot).unwrap().as_ref(),
+                want,
+                "seed {seed} probe {probe:?} at {snapshot}"
             );
         }
     }
@@ -366,7 +398,7 @@ fn write_with_bloom(path: &Path, bits_per_key: usize, entries: &[(Vec<u8>, Entry
     };
     let mut w = SstWriter::with_options(path, opts).unwrap();
     for (k, e) in entries {
-        w.add(k, e).unwrap();
+        w.add(k, 1, e).unwrap();
     }
     w.finish().unwrap();
 }
@@ -386,7 +418,7 @@ fn filter_skips_block_reads_for_missing_keys() {
 
     // Present keys (tombstones included) always get through the filter.
     for (k, e) in &entries {
-        assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+        assert_eq!(r.get(k, MAX_SEQ).unwrap().as_ref(), Some(e));
     }
     let s = r.stats();
     assert_eq!(count(&s.block_reads), 2000);
@@ -397,7 +429,10 @@ fn filter_skips_block_reads_for_missing_keys() {
     // costs a block read.
     let misses = 2000;
     for i in 0..misses {
-        assert_eq!(r.get(format!("key{i:06}x").as_bytes()).unwrap(), None);
+        assert_eq!(
+            r.get(format!("key{i:06}x").as_bytes(), MAX_SEQ).unwrap(),
+            None
+        );
     }
     let fp = count(&s.filter_false_positives);
     assert_eq!(count(&s.filter_negatives) + fp, misses);
@@ -418,9 +453,9 @@ fn table_without_filter_reads_correctly() {
     let r = SstReader::open(&path).unwrap();
     assert!(!r.has_filter());
     for (k, e) in &entries {
-        assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+        assert_eq!(r.get(k, MAX_SEQ).unwrap().as_ref(), Some(e));
     }
-    assert_eq!(r.get(b"key000000x").unwrap(), None);
+    assert_eq!(r.get(b"key000000x", MAX_SEQ).unwrap(), None);
     // No filter, so no filter verdicts, and the miss cost a block read.
     assert_eq!(count(&r.stats().filter_negatives), 0);
     assert_eq!(count(&r.stats().filter_false_positives), 0);
@@ -454,7 +489,7 @@ fn repeat_reads_hit_the_cache() {
 
     for _ in 0..3 {
         for (k, e) in &entries {
-            assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+            assert_eq!(r.get(k, MAX_SEQ).unwrap().as_ref(), Some(e));
         }
     }
     let s = r.stats();
@@ -480,8 +515,8 @@ fn cache_keys_include_the_table_id() {
         readers.push(SstReader::open_with(&path, id, std::sync::Arc::clone(&ctx)).unwrap());
     }
     for _ in 0..2 {
-        assert_eq!(readers[0].get(b"k050").unwrap(), Some(val("AAAA")));
-        assert_eq!(readers[1].get(b"k050").unwrap(), Some(val("BBBB")));
+        assert_eq!(readers[0].get(b"k050", MAX_SEQ).unwrap(), Some(val("AAAA")));
+        assert_eq!(readers[1].get(b"k050", MAX_SEQ).unwrap(), Some(val("BBBB")));
     }
     assert_eq!(count(&ctx.stats.block_reads), 2);
     assert_eq!(count(&ctx.stats.cache_hits), 2);
@@ -502,7 +537,7 @@ fn corrupt_block_is_never_cached() {
     let r = SstReader::open_with(&path, 1, std::sync::Arc::clone(&ctx)).unwrap();
     let last = &entries.last().unwrap().0;
     for _ in 0..2 {
-        expect_corruption(r.get(last), "bad block, read again");
+        expect_corruption(r.get(last, MAX_SEQ), "bad block, read again");
     }
     // Both reads went to the disk, and nothing bad was kept.
     assert_eq!(count(&ctx.stats.block_reads), 2);

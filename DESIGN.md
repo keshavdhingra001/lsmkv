@@ -5,7 +5,7 @@ Living document. Every non-obvious decision gets a short entry: **what**, **alte
 ## Architecture
 
 ```
-put/delete ──> WAL (append + fsync) ──> MemTable (BTreeMap) ──flush──> SSTable L0 ──compact──> L1..Ln
+put/delete ──> WAL (append + fsync) ──> MemTable (BTreeMap of (key, seq)) ──flush──> SSTable L0 ──compact──> L1..Ln
 get ─────────> MemTable ──miss──> SSTables newest-first (bloom filter -> index -> block)
 ```
 
@@ -186,4 +186,32 @@ get ─────────> MemTable ──miss──> SSTables newest-firs
   - Two mutations survived the first round of tests (the uncounted fsync, and three races the randomized test couldn't hit reliably). That's why the staged tests exist.
 - **Not covered:** power-loss durability. It needs a VM or a fault-injecting filesystem (LazyFS, dm-log-writes); see M10.
 
-<!-- Add D12+ as milestones land: concurrency (M8)... -->
+### M8: Concurrency, approved 2026-10-04 (D12–D18)
+The owner approved the whole proposal ("go"). Each entry is filled in as its section lands.
+- **D12 SuperVersion:** reads grab an `Arc` snapshot of (memtable, immutable memtable, levels) under a brief lock, then read with no lock held.
+- **D13 Memtable:** `crossbeam-skiplist` (lock-free reads while it's being written).
+- **D14 Background flush:** a full memtable becomes immutable (one at most, like LevelDB), a fresh one and a new WAL take over, and a background thread flushes it. Writers stall only if a second memtable fills first.
+- **D15 Background compaction:** the same single background thread, flush first. Compaction picks its inputs under the lock, merges without it, and commits under it. Background errors poison the database.
+- **D16 L0 backpressure:** LevelDB's triggers: compact at 4 L0 files, slow each write by 1 ms at 8, stop writes at 12.
+- **D17 Writer wakeups:** one condition variable per writer instead of `notify_all`.
+- **D18 Sequence numbers and snapshots:** done first, in M8 rather than Tier 3, because M9's range scans need a consistent view too.
+
+### D18: Sequence numbers and the internal key order (approved 2026-10-04)
+- **What:** every write gets the next sequence number (`SeqNo`, a `u64`; 0 means "before any write"). Every stored version carries it: WAL records, memtable keys and table entries. A read picks a snapshot number and sees, per key, the newest version at or below it.
+- **Order:** versions sort by user key ascending, then by seq **descending**, so a key's newest version comes first and a lookup stops at the first version it may see (LevelDB's internal key order).
+  - The pair is compared field by field (`key::compare`), never as one byte string. With the seq bytes appended to the key, bytewise order would put `"a"`+seq after `"ab"`+seq whenever the seq's first byte is above `b'b'`, though `"a"` is a prefix of `"ab"` and must come first. LevelDB gets away with appending because it plugs in a comparator that splits them again.
+  - Tables store the seq as its own 8-byte field in every entry and index entry, rather than as a key suffix, for the same reason.
+- **Lookup** (memtable, block and index alike): find the first entry at or after (key, snapshot) in this order. If it belongs to `key`, it's the newest version the snapshot may see; if it belongs to a later key, there is none. In the index, the target block is the first one whose last entry is at or after (key, snapshot), so a key whose versions span two blocks still costs one block read.
+- **Read path across sources:** memtable, then L0 newest first, then one table per deeper level. Every version in a newer source is newer than every version in an older one (flush and compaction preserve that), so the first visible version found is the answer.
+- **Who assigns numbers:** the group commit leader, under the state lock, right after the last applied write (only one group is ever in flight). The group's records go to the WAL with their numbers, are applied in the same order, and only then does `last_seq` move. Reads use `last_seq` as their snapshot, so a group becomes visible all at once, and never before it's durable.
+- **Recovery:** WAL records carry their numbers, so a replay rebuilds the same versions. A flush deletes the WAL that held its numbers, so the flush's manifest edit also records `SetLastSequence`. On open, `last_seq = max(manifest's last sequence, highest seq in the live WALs)`. Without that edit, numbering would restart at 1 after a reopen: new writes would be invisible next to tables holding higher numbers, and the reads would miss data (`sequence_numbers_survive_replay_and_flush`).
+- **Garbage (`key::Shadowed`):** a version can be dropped once a newer version of the same key is visible to every reader (that newer version's seq is at or below the oldest snapshot). This is LevelDB's rule. It tracks one number, and keeps a few versions a per-snapshot rule would drop.
+  - Flush applies it too, so a hot key overwritten 1,000 times becomes one table entry, not 1,000. The memtable itself keeps every version until the flush (`approx_size` now counts each one, which also answers M1's "never shrinks on overwrite" question: there's nothing to shrink).
+  - A tombstone is dropped only if every reader already sees it, and no deeper level can hold the key (D8's rule, plus the snapshot condition).
+  - Compaction outputs end only between user keys, so one key's versions never span two tables, and tables in a level still never overlap.
+- **Format version:** this changes the WAL, table and manifest formats. The manifest's first record is now `Format(2)`, and the table magic is `LSMKVSS2`. Directories from before M8 have no format record and are refused with a clear error. Opening them anyway would be worse than failing: an M7 WAL read as format 2 parses as garbage, which the torn-tail rule (D2) would truncate, silently losing data. No migration tool exists; the project has no users with old data.
+- **Cost:** 8 bytes more per WAL record, per table entry and per index entry; the filter still hashes each distinct key once.
+- **Verified by:** unit tests for the order and the shadowing rule; snapshot lookups in the memtable and a block; a randomized table test with several versions per key, checked at random snapshots against a `BTreeMap` model; the reopen/flush numbering test; the flush-garbage test; pre-M8 manifests refused.
+  - Mutation checks, each caught: no `SetLastSequence` at flush; replay ignoring WAL numbers; nothing ever shadowed; a block or memtable lookup returning the next key's version; the index searched by user key only; a group reusing the last number; compaction keeping shadowed versions; the filter skipping each key's first version; the format record not required.
+  - **Survived (for now):** a compaction splitting one key's versions across two tables. With no snapshots yet, a key has only one live version at compaction time, so it can't happen. Section 4 (snapshots) must add a test that kills it.
+

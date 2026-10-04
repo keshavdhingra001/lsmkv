@@ -2,18 +2,26 @@
 //!
 //! ```text
 //! record = [crc32 u32][tag u8][value u64]      (13 bytes; CRC covers tag + value)
+//! tag 4        = Format(v): always the first record
 //! tag 0x10 + L = AddTable(id) at level L (0 <= L < MAX_LEVELS)
 //! tag 2        = RemoveTable(id)
 //! tag 3        = SetLogNumber(n)
-//! tag 1        = AddTable(id) at level 0 (written by M4; still read)
+//! tag 5        = SetLastSequence(n)
 //! ```
 //!
-//! Putting the level in the tag keeps records fixed-size and lets manifests
-//! written before levels existed still open.
+//! Putting the level in the tag keeps records fixed-size.
 //!
+//! - `Format(v)`: the on-disk format of the whole database: manifest, WALs
+//!   and tables. Format 2 (M8) added sequence numbers to WAL records and table
+//!   entries. Directories from before M8 have no format record and are
+//!   refused: misreading an old WAL as format 2 would look like a torn tail,
+//!   and truncating it would silently lose data.
 //! - Replaying every edit in order rebuilds the current `Version`.
 //! - `SetLogNumber(n)`: WALs numbered below `n` are already in tables, so
 //!   they're obsolete; WALs numbered `n` and above are live and get replayed.
+//! - `SetLastSequence(n)`: every write numbered `n` or below is in a table.
+//!   A flush records it, because the flushed WAL (which held the numbers) is
+//!   deleted; without it, numbering would restart below what tables hold.
 //! - Same torn-tail rules as the WAL (DESIGN.md D2): an incomplete or bad final
 //!   record, or an all-zero tail, is a crash artifact and is cut off. A bad
 //!   record with more data after it is corruption.
@@ -29,19 +37,29 @@ use crate::fsutil::sync_dir;
 
 pub const MANIFEST_FILE: &str = "MANIFEST";
 const RECORD_LEN: usize = 4 + 1 + 8;
-const TAG_ADD_TABLE_L0_LEGACY: u8 = 1;
 const TAG_REMOVE_TABLE: u8 = 2;
 const TAG_SET_LOG_NUMBER: u8 = 3;
+const TAG_FORMAT: u8 = 4;
+const TAG_SET_LAST_SEQUENCE: u8 = 5;
 const TAG_ADD_TABLE_BASE: u8 = 0x10;
+
+/// The on-disk format this build reads and writes.
+pub const FORMAT_VERSION: u64 = 2;
 
 /// Levels 0..MAX_LEVELS. Level MAX_LEVELS - 1 is the bottom.
 pub const MAX_LEVELS: usize = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edit {
-    AddTable { id: u64, level: u8 },
+    AddTable {
+        id: u64,
+        level: u8,
+    },
     RemoveTable(u64),
     SetLogNumber(u64),
+    SetLastSequence(u64),
+    /// Written once, first, by `Manifest::open` on a fresh database.
+    Format(u64),
 }
 
 /// The set of live files, as of the last manifest edit.
@@ -51,6 +69,8 @@ pub struct Version {
     pub tables: BTreeMap<u64, u8>,
     /// WALs numbered >= this are live. 0 = fresh database, no log yet.
     pub log_number: u64,
+    /// Every write numbered at or below this is in a table.
+    pub last_sequence: u64,
 }
 
 impl Version {
@@ -82,6 +102,22 @@ impl Version {
                 }
                 self.log_number = n;
             }
+            Edit::SetLastSequence(n) => {
+                if n < self.last_sequence {
+                    return Err(format!(
+                        "last sequence went backwards: {} -> {n}",
+                        self.last_sequence
+                    ));
+                }
+                self.last_sequence = n;
+            }
+            Edit::Format(v) => {
+                if v != FORMAT_VERSION {
+                    return Err(format!(
+                        "format {v}, but this build reads format {FORMAT_VERSION} only"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -94,35 +130,34 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// Opens the manifest in `dir`, creating an empty one for a fresh
-    /// database, and returns the current `Version`.
+    /// Opens the manifest in `dir`, creating one for a fresh database, and
+    /// returns the current `Version`.
     pub fn open(dir: &Path) -> Result<(Self, Version)> {
         let path = dir.join(MANIFEST_FILE);
         let buf = match fs::read(&path) {
             Ok(buf) => buf,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let file = OpenOptions::new().create(true).append(true).open(&path)?;
-                file.sync_all()?;
-                sync_dir(dir)?;
-                return Ok((Self { file, len: 0 }, Version::default()));
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
 
         let (version, valid_len) = replay(&buf)?;
-        let file = OpenOptions::new().append(true).open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         if valid_len < buf.len() as u64 {
             // Cut the torn tail so new edits aren't appended after garbage.
             file.set_len(valid_len)?;
             file.sync_all()?;
         }
-        Ok((
-            Self {
-                file,
-                len: valid_len,
-            },
-            version,
-        ))
+        let mut manifest = Self {
+            file,
+            len: valid_len,
+        };
+        if valid_len == 0 {
+            // Fresh, or a crash before the first record was durable: either
+            // way nothing was ever committed, so start the history now.
+            manifest.append(&[Edit::Format(FORMAT_VERSION)])?;
+            sync_dir(dir)?;
+        }
+        Ok((manifest, version))
     }
 
     /// Durably appends `edits` with one write and one fsync. On failure the
@@ -155,6 +190,8 @@ fn encode(edit: Edit, out: &mut Vec<u8>) {
         Edit::AddTable { id, level } => (TAG_ADD_TABLE_BASE + level, id),
         Edit::RemoveTable(id) => (TAG_REMOVE_TABLE, id),
         Edit::SetLogNumber(n) => (TAG_SET_LOG_NUMBER, n),
+        Edit::SetLastSequence(n) => (TAG_SET_LAST_SEQUENCE, n),
+        Edit::Format(v) => (TAG_FORMAT, v),
     };
     let mut body = [0u8; RECORD_LEN - 4];
     body[0] = tag;
@@ -170,10 +207,6 @@ fn decode(rec: &[u8]) -> Option<Edit> {
     }
     let value = read_u64(rec, 5);
     match rec[4] {
-        TAG_ADD_TABLE_L0_LEGACY => Some(Edit::AddTable {
-            id: value,
-            level: 0,
-        }),
         tag if (TAG_ADD_TABLE_BASE..TAG_ADD_TABLE_BASE + MAX_LEVELS as u8).contains(&tag) => {
             Some(Edit::AddTable {
                 id: value,
@@ -182,6 +215,8 @@ fn decode(rec: &[u8]) -> Option<Edit> {
         }
         TAG_REMOVE_TABLE => Some(Edit::RemoveTable(value)),
         TAG_SET_LOG_NUMBER => Some(Edit::SetLogNumber(value)),
+        TAG_SET_LAST_SEQUENCE => Some(Edit::SetLastSequence(value)),
+        TAG_FORMAT => Some(Edit::Format(value)),
         _ => None,
     }
 }
@@ -194,6 +229,16 @@ fn replay(buf: &[u8]) -> Result<(Version, u64)> {
         let rest = &buf[pos..];
         match decode(&rest[..RECORD_LEN]) {
             Some(edit) => {
+                let is_format = matches!(edit, Edit::Format(_));
+                if (pos == 0) != is_format {
+                    return Err(Error::Corruption(if pos == 0 {
+                        "manifest has no format record: written by lsmkv before M8 \
+                         (format 1), which this build can't read"
+                            .into()
+                    } else {
+                        format!("manifest offset {pos}: format record after the first")
+                    }));
+                }
                 version
                     .apply(edit)
                     .map_err(|msg| Error::Corruption(format!("manifest offset {pos}: {msg}")))?;
@@ -234,7 +279,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (_, v) = Manifest::open(dir.path()).unwrap();
         assert_eq!(v, Version::default());
-        assert!(dir.path().join(MANIFEST_FILE).exists());
+        let bytes = fs::read(dir.path().join(MANIFEST_FILE)).unwrap();
+        assert_eq!(decode(&bytes), Some(Edit::Format(FORMAT_VERSION)));
+        assert_eq!(bytes.len(), RECORD_LEN);
+        assert_eq!(reopen(dir.path()), Version::default());
+    }
+
+    #[test]
+    fn last_sequence_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (mut m, _) = Manifest::open(dir.path()).unwrap();
+            m.append(&[add(2), Edit::SetLastSequence(40)]).unwrap();
+            m.append(&[add(3), Edit::SetLastSequence(95)]).unwrap();
+        }
+        assert_eq!(reopen(dir.path()).last_sequence, 95);
+    }
+
+    #[test]
+    fn empty_manifest_from_a_crash_at_creation_starts_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(MANIFEST_FILE), b"").unwrap();
+        assert_eq!(reopen(dir.path()), Version::default());
+        // ...and it now has its format record.
+        let (mut m, _) = Manifest::open(dir.path()).unwrap();
+        m.append(&[add(1)]).unwrap();
+        assert_eq!(ids(&reopen(dir.path())), vec![1]);
     }
 
     #[test]
@@ -305,21 +375,25 @@ mod tests {
             let (mut m, _) = Manifest::open(dir.path()).unwrap();
             m.append(&[add(1), add(2), add(3)]).unwrap();
         }
+        // Records: format, add(1), add(2), add(3).
         let mut bytes = fs::read(&path).unwrap();
-        bytes[RECORD_LEN + 6] ^= 0xFF; // inside record 2 of 3
+        bytes[2 * RECORD_LEN + 6] ^= 0xFF; // inside add(2)
         fs::write(&path, &bytes).unwrap();
         match Manifest::open(dir.path()) {
-            Err(Error::Corruption(msg)) => assert!(msg.contains("offset 13"), "{msg}"),
+            Err(Error::Corruption(msg)) => assert!(msg.contains("offset 26"), "{msg}"),
             other => panic!("expected Corruption, got {:?}", other.map(|(_, v)| v)),
         }
     }
 
     #[test]
     fn impossible_histories_are_corruption() {
-        let cases: [&[Edit]; 3] = [
+        let cases: [&[Edit]; 6] = [
             &[add(1), add(1)],
             &[Edit::RemoveTable(9)],
             &[Edit::SetLogNumber(5), Edit::SetLogNumber(4)],
+            &[Edit::SetLastSequence(5), Edit::SetLastSequence(4)],
+            &[Edit::Format(FORMAT_VERSION)],
+            &[Edit::Format(1)],
         ];
         for edits in cases {
             let dir = tempfile::tempdir().unwrap();
@@ -368,15 +442,18 @@ mod tests {
     }
 
     #[test]
-    fn m4_manifests_still_open_with_tables_at_level_0() {
-        // Hand-encode a legacy tag-1 record, as M4 wrote it.
+    fn pre_m8_manifests_are_refused() {
+        // What M4-M7 wrote first on a fresh database: SetLogNumber(1), tag 3.
         let dir = tempfile::tempdir().unwrap();
         let mut body = [0u8; RECORD_LEN - 4];
-        body[0] = TAG_ADD_TABLE_L0_LEGACY;
-        body[1..].copy_from_slice(&42u64.to_le_bytes());
+        body[0] = TAG_SET_LOG_NUMBER;
+        body[1..].copy_from_slice(&1u64.to_le_bytes());
         let mut rec = crc32fast::hash(&body).to_le_bytes().to_vec();
         rec.extend_from_slice(&body);
         fs::write(dir.path().join(MANIFEST_FILE), &rec).unwrap();
-        assert_eq!(reopen(dir.path()).tables, BTreeMap::from([(42, 0)]));
+        match Manifest::open(dir.path()) {
+            Err(Error::Corruption(msg)) => assert!(msg.contains("before M8"), "{msg}"),
+            other => panic!("expected Corruption, got {:?}", other.map(|(_, v)| v)),
+        }
     }
 }

@@ -6,16 +6,22 @@
 //! - Level n >= 1 compacts when its bytes exceed its limit. One table goes in,
 //!   chosen round-robin through the key space (`compact_pointer`).
 //! - The chosen tables plus every overlapping table in the next level are
-//!   merged, newest version of each key wins, and the result is written to the
-//!   next level as new tables of about `target_file_size`.
-//! - A tombstone is dropped only when no deeper level could hold an older
-//!   version of its key. Dropping it earlier would bring that version back.
+//!   merged in internal key order, and the result is written to the next
+//!   level as new tables of about `target_file_size`. A table only ends
+//!   between two user keys, so each key's versions stay in one table and
+//!   tables in a level never overlap.
+//! - A version is dropped once a newer version of its key is visible to
+//!   every reader (`Shadowed`, DESIGN.md D18).
+//! - A tombstone is also dropped when every reader sees it and no deeper
+//!   level could hold an older version of its key. Dropping it earlier would
+//!   bring that version back.
 //! - Commit: one manifest write adds the outputs and removes the inputs.
 
 use std::collections::{BTreeMap, HashSet};
 
 use super::{open_table, remove_obsolete_files, table_for_key, table_path, State, Table};
 use crate::error::Result;
+use crate::key::{InternalKey, Shadowed};
 use crate::manifest::{Edit, MAX_LEVELS};
 use crate::memtable::Entry;
 use crate::sstable::SstWriter;
@@ -113,30 +119,47 @@ impl State {
         }
         let out_level = c.level + 1;
 
-        // Merge, newest first: the input level (level 0 is already newest
-        // first), then the next level. The first version seen of a key wins.
-        let mut merged: BTreeMap<Vec<u8>, Entry> = BTreeMap::new();
+        // Merge every version into internal key order: per key, newest first.
+        // Sequence numbers are unique, so no two inputs hold the same version.
+        let mut merged: BTreeMap<InternalKey, Entry> = BTreeMap::new();
         for (level, ids) in [(c.level, &c.inputs), (out_level, &c.next)] {
             for id in ids {
                 let table = self.levels[level]
                     .iter()
                     .find(|t| t.id == *id)
                     .expect("compaction input is live");
-                for (key, entry) in table.reader.entries()? {
-                    merged.entry(key).or_insert(entry);
+                for (key, seq, entry) in table.reader.entries()? {
+                    merged.insert(InternalKey { user_key: key, seq }, entry);
                 }
             }
         }
 
         // Write the outputs. Not live until the commit, so a crash before it
         // only leaves orphan files, which the next open deletes.
+        let oldest_snapshot = self.oldest_snapshot();
+        let mut shadowed = Shadowed::new(oldest_snapshot);
         let deeper = &self.levels[out_level + 1..];
         let mut outputs: Vec<Table> = Vec::new();
-        let mut current: Option<(u64, SstWriter, usize)> = None;
-        for (key, entry) in merged {
-            let shadows_nothing = !deeper.iter().any(|l| table_for_key(l, &key).is_some());
-            if entry == Entry::Tombstone && shadows_nothing {
+        // (table id, writer, bytes so far, last user key written)
+        let mut current: Option<(u64, SstWriter, usize, Vec<u8>)> = None;
+        for (InternalKey { user_key: key, seq }, entry) in merged {
+            if shadowed.check(&key, seq) {
                 continue;
+            }
+            let shadows_nothing = !deeper.iter().any(|l| table_for_key(l, &key).is_some());
+            if entry == Entry::Tombstone && seq <= oldest_snapshot && shadows_nothing {
+                continue;
+            }
+            // A full table ends at the first new user key.
+            if let Some((_, _, size, last)) = &current {
+                if *size >= self.opts.target_file_size && *last != key {
+                    let (id, writer, _, _) = current.take().expect("just checked");
+                    writer.finish()?;
+                    outputs.push(Table {
+                        id,
+                        reader: open_table(&self.dir, id, &self.read_ctx)?,
+                    });
+                }
             }
             if current.is_none() {
                 let id = self.next_file;
@@ -145,21 +168,15 @@ impl State {
                     id,
                     SstWriter::with_options(&table_path(&self.dir, id), self.writer_options())?,
                     0,
+                    Vec::new(),
                 ));
             }
-            let (_, writer, size) = current.as_mut().expect("just set");
-            writer.add(&key, &entry)?;
+            let (_, writer, size, last) = current.as_mut().expect("just set");
+            writer.add(&key, seq, &entry)?;
             *size += key.len() + entry_len(&entry);
-            if *size >= self.opts.target_file_size {
-                let (id, writer, _) = current.take().expect("just used");
-                writer.finish()?;
-                outputs.push(Table {
-                    id,
-                    reader: open_table(&self.dir, id, &self.read_ctx)?,
-                });
-            }
+            *last = key;
         }
-        if let Some((id, writer, _)) = current.take() {
+        if let Some((id, writer, _, _)) = current.take() {
             writer.finish()?;
             outputs.push(Table {
                 id,
@@ -219,9 +236,10 @@ impl State {
     }
 }
 
-/// Encoded size of an entry's value plus the fixed entry header.
+/// Encoded size of an entry's value plus the fixed entry header
+/// (kind, seq, two lengths).
 fn entry_len(entry: &Entry) -> usize {
-    9 + match entry {
+    17 + match entry {
         Entry::Value(v) => v.len(),
         Entry::Tombstone => 0,
     }

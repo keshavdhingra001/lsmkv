@@ -8,6 +8,7 @@ mod codec;
 pub mod db;
 pub mod error;
 mod fsutil;
+pub mod key;
 pub mod manifest;
 pub mod memtable;
 pub mod sstable;

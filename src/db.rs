@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
+use crate::key::{SeqNo, Shadowed};
 use crate::manifest::{Edit, Manifest, Version, MAX_LEVELS};
 use crate::memtable::{Entry, MemTable};
 use crate::sstable::filter::DEFAULT_BITS_PER_KEY;
@@ -81,6 +82,7 @@ impl Default for Options {
 /// Point-in-time numbers for the REPL and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stats {
+    /// Versions in the memtable (each write adds one).
     pub memtable_entries: usize,
     pub memtable_bytes: usize,
     /// Total live tables across all levels.
@@ -90,6 +92,8 @@ pub struct Stats {
     /// Bytes per level, index = level.
     pub level_bytes: Vec<u64>,
     pub log_number: u64,
+    /// Sequence number of the newest write readers can see.
+    pub last_sequence: SeqNo,
     /// Writes (puts and deletes) acknowledged since open.
     pub writes: u64,
     /// WAL write groups since open: each one a single append-and-sync for
@@ -197,6 +201,10 @@ struct State {
     levels: Vec<Vec<Table>>,
     /// Next unused file number, for both logs and tables.
     next_file: u64,
+    /// Sequence number of the newest write applied to the memtable. Reads
+    /// see everything up to here. A group in flight has numbers above it,
+    /// and becomes visible all at once when it's applied (DESIGN.md D18).
+    last_seq: SeqNo,
     /// Block cache and read counters, shared by every open table.
     read_ctx: Arc<ReadContext>,
     /// Set after a WAL or manifest write fails; see `Error::Poisoned`.
@@ -262,11 +270,15 @@ impl Db {
         let levels = open_levels(&dir, &version, &read_ctx)?;
 
         let mut memtable = MemTable::new();
+        // Writes in tables are numbered up to `last_sequence`; anything newer
+        // is in the logs.
+        let mut last_seq = version.last_sequence;
         for (i, &n) in live_logs.iter().enumerate() {
             let path = log_path(&dir, n);
             let replay = Wal::replay(&path)?;
-            for rec in replay.records {
-                apply(&mut memtable, rec);
+            for (seq, rec) in replay.records {
+                last_seq = last_seq.max(seq);
+                apply(&mut memtable, seq, rec);
             }
             // Only the newest log gets appended to, so only it needs its torn
             // tail cut off (new writes must not land after garbage).
@@ -305,6 +317,7 @@ impl Db {
             version,
             levels,
             next_file,
+            last_seq,
             read_ctx,
             poisoned: None,
             compact_pointer: vec![None; MAX_LEVELS],
@@ -363,7 +376,8 @@ impl Db {
     /// then at most one table per deeper level. The first hit wins, and a
     /// tombstone hit means "deleted": older data is not consulted.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.lock().get(key)
+        let st = self.lock();
+        st.get(key, st.last_seq)
     }
 
     /// Flushes the memtable, then compacts until no level is over its limit.
@@ -406,6 +420,9 @@ impl Db {
         }
 
         let group = st.take_group();
+        // Numbered in queue order. Only one group is ever in flight, so the
+        // numbers right after the last applied write are free.
+        let first_seq = st.last_seq + 1;
         // The database may have been poisoned while this group waited.
         let ready = st.check_writable();
         let injected = st.failpoint("wal:sync");
@@ -421,8 +438,8 @@ impl Db {
         let logged = ready.and_then(|()| {
             let mut wal = lock(&wal);
             let syncs_before = wal.sync_count();
-            for (_, rec) in &group {
-                wal.append(rec)?;
+            for (seq, (_, rec)) in (first_seq..).zip(&group) {
+                wal.append(seq, rec)?;
             }
             #[cfg(test)]
             thread::sleep(slow);
@@ -443,7 +460,7 @@ impl Db {
         if let Ok(synced) = logged {
             st.wal_syncs += synced;
         }
-        let result = st.finish_group(group, logged.map(drop));
+        let result = st.finish_group(group, first_seq, logged.map(drop));
         drop(st);
         self.shared.turn.notify_all();
         result
@@ -539,10 +556,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl State {
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.memtable.get(key) {
-            Some(Entry::Value(v)) => return Ok(Some(v.clone())),
-            Some(Entry::Tombstone) => return Ok(None),
+    /// The newest version of `key` at or below `snapshot`. Sources are
+    /// searched newest first, and every version in a newer source is newer
+    /// than every version in an older one, so the first version found that
+    /// the snapshot may see is the answer.
+    fn get(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Vec<u8>>> {
+        match self.memtable.get(key, snapshot) {
+            Some((_, Entry::Value(v))) => return Ok(Some(v.clone())),
+            Some((_, Entry::Tombstone)) => return Ok(None),
             None => {}
         }
         let level0 = self.levels[0].iter();
@@ -550,7 +571,7 @@ impl State {
             .iter()
             .filter_map(|level| table_for_key(level, key));
         for table in level0.chain(deeper) {
-            match table.reader.get(key)? {
+            match table.reader.get(key, snapshot)? {
                 Some(Entry::Value(v)) => return Ok(Some(v)),
                 Some(Entry::Tombstone) => return Ok(None),
                 None => {}
@@ -576,11 +597,17 @@ impl State {
     }
 
     /// After the leader logged a group: apply it to the memtable in queue
-    /// order (the same order as in the WAL, so a replay rebuilds exactly
-    /// this memtable) and record each follower's outcome. If logging failed,
+    /// order with the numbers it was logged with (so a replay rebuilds
+    /// exactly this memtable), make it visible, and record each follower's
+    /// outcome. If logging failed,
     /// none of the group was acknowledged, and the database is poisoned: the
     /// log may now end in a partial record.
-    fn finish_group(&mut self, group: Vec<(u64, Record)>, logged: Result<()>) -> Result<()> {
+    fn finish_group(
+        &mut self,
+        group: Vec<(u64, Record)>,
+        first_seq: SeqNo,
+        logged: Result<()>,
+    ) -> Result<()> {
         let leader = group[0].0;
         if let Err(e) = logged {
             let e = self.poison(e);
@@ -592,10 +619,11 @@ impl State {
             return Err(e);
         }
         self.write_groups += 1;
-        for (ticket, rec) in group {
+        for (seq, (ticket, rec)) in (first_seq..).zip(group) {
             self.writes += 1;
             self.user_bytes += record_len(&rec) as u64;
-            apply(&mut self.memtable, rec);
+            apply(&mut self.memtable, seq, rec);
+            self.last_seq = seq;
             if ticket != leader {
                 self.finished.insert(ticket, Ok(()));
             }
@@ -642,8 +670,13 @@ impl State {
 
         let table_path = table_path(&self.dir, table_id);
         let mut writer = SstWriter::with_options(&table_path, self.writer_options())?;
-        for (key, entry) in self.memtable.iter() {
-            writer.add(key, entry)?;
+        // Overwritten versions no reader can see stay behind. Tombstones all
+        // go in: older tables may hold what they delete.
+        let mut shadowed = Shadowed::new(self.oldest_snapshot());
+        for (key, seq, entry) in self.memtable.iter() {
+            if !shadowed.check(key, seq) {
+                writer.add(key, seq, entry)?;
+            }
         }
         writer.finish()?;
         let reader = open_table(&self.dir, table_id, &self.read_ctx)?;
@@ -659,6 +692,8 @@ impl State {
                 level: 0,
             },
             Edit::SetLogNumber(log_id),
+            // The old WAL, which held these writes' numbers, is going away.
+            Edit::SetLastSequence(self.last_seq),
         ];
         self.commit(&edits, "flush")?;
 
@@ -690,6 +725,7 @@ impl State {
                 .map(|l| l.iter().map(|t| t.reader.file_size()).sum())
                 .collect(),
             log_number: self.wal_number,
+            last_sequence: self.last_seq,
             writes: self.writes,
             write_groups: self.write_groups,
             wal_syncs: self.wal_syncs,
@@ -702,6 +738,13 @@ impl State {
             filter_negatives: ReadStats::get(&r.filter_negatives),
             filter_false_positives: ReadStats::get(&r.filter_false_positives),
         }
+    }
+
+    /// The oldest snapshot any reader may still read at: versions it can't
+    /// see, and nothing newer can, may be dropped. Reads always use the
+    /// latest snapshot for now, so it's `last_seq`.
+    fn oldest_snapshot(&self) -> SeqNo {
+        self.last_seq
     }
 
     fn writer_options(&self) -> WriterOptions {
@@ -772,10 +815,10 @@ fn record_len(rec: &Record) -> usize {
     }
 }
 
-fn apply(memtable: &mut MemTable, rec: Record) {
+fn apply(memtable: &mut MemTable, seq: SeqNo, rec: Record) {
     match rec {
-        Record::Put { key, value } => memtable.put(&key, &value),
-        Record::Delete { key } => memtable.delete(&key),
+        Record::Put { key, value } => memtable.put(&key, seq, &value),
+        Record::Delete { key } => memtable.delete(&key, seq),
     }
 }
 
@@ -948,6 +991,58 @@ mod tests {
     }
 
     #[test]
+    fn sequence_numbers_survive_replay_and_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open(dir.path()).unwrap();
+            for i in 0..3 {
+                db.put(b"a", format!("v{i}").as_bytes()).unwrap();
+            }
+            assert_eq!(db.stats().last_sequence, 3);
+        }
+        // From the WAL alone.
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.stats().last_sequence, 3);
+        assert_eq!(db.get(b"a").unwrap(), Some(b"v2".to_vec()));
+
+        // After a flush the WAL that held 1..=3 is gone; the manifest has to
+        // remember them, or numbering restarts below what the table holds and
+        // reads at the restarted numbers can't see the table's versions.
+        db.flush().unwrap();
+        drop(db);
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.stats().last_sequence, 3);
+        assert_eq!(db.get(b"a").unwrap(), Some(b"v2".to_vec()));
+        db.put(b"a", b"v3").unwrap();
+        assert_eq!(db.stats().last_sequence, 4);
+        db.compact_all().unwrap();
+        assert_eq!(db.get(b"a").unwrap(), Some(b"v3".to_vec()));
+    }
+
+    #[test]
+    fn flush_keeps_only_versions_a_reader_can_see() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        for i in 0..5 {
+            db.put(b"a", format!("v{i}").as_bytes()).unwrap();
+        }
+        db.delete(b"b").unwrap();
+        db.put(b"b", b"back").unwrap();
+        db.delete(b"c").unwrap();
+        assert_eq!(
+            db.stats().memtable_entries,
+            8,
+            "every version is kept in memory"
+        );
+        db.flush().unwrap();
+        let st = db.state();
+        let entries = st.levels[0][0].reader.entries().unwrap();
+        let kept: Vec<(&[u8], SeqNo)> = entries.iter().map(|(k, s, _)| (&k[..], *s)).collect();
+        // Newest of a and b; c's tombstone stays (older tables may hold c).
+        assert_eq!(kept, vec![(&b"a"[..], 5), (b"b", 7), (b"c", 8)]);
+    }
+
+    #[test]
     fn open_refuses_mid_log_corruption() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -1098,7 +1193,8 @@ mod tests {
     }
 
     /// Writes a table file directly and registers it at `level`, bypassing
-    /// flush/compaction, so tests can set up exact level layouts.
+    /// flush/compaction, so tests can set up exact level layouts. Its
+    /// entries are numbered `id`, so place newer data with higher ids.
     fn place_table(dir: &Path, id: u64, level: u8, entries: &[(&str, Option<&str>)]) {
         let mut w = SstWriter::create(&table_path(dir, id)).unwrap();
         for (k, v) in entries {
@@ -1106,11 +1202,12 @@ mod tests {
                 Some(v) => Entry::Value(v.as_bytes().to_vec()),
                 None => Entry::Tombstone,
             };
-            w.add(k.as_bytes(), &e).unwrap();
+            w.add(k.as_bytes(), id, &e).unwrap();
         }
         w.finish().unwrap();
         let (mut m, _) = Manifest::open(dir).unwrap();
-        m.append(&[Edit::AddTable { id, level }]).unwrap();
+        m.append(&[Edit::AddTable { id, level }, Edit::SetLastSequence(id)])
+            .unwrap();
     }
 
     #[test]

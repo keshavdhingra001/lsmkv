@@ -7,12 +7,13 @@
 //! ```
 //!
 //! - Data blocks: see `block.rs`.
-//! - Filter block: a bloom filter over every key (see `filter.rs`). Zero bytes
+//! - Filter block: a bloom filter over every distinct key (see `filter.rs`). Zero bytes
 //!   means "no filter": tables written before M6, or with filters turned off.
 //! - Index block: one entry per data block, then a CRC32 of the entries:
-//!   `[key_len u32][last_key][offset u64][size u32]`.
-//!   `last_key` is the largest key in that block, so a binary search over the
-//!   index finds the only block that can hold a key.
+//!   `[key_len u32][last_key][last_seq u64][offset u64][size u32]`.
+//!   (`last_key`, `last_seq`) is the block's last entry in internal key order
+//!   (DESIGN.md D18), so a binary search over the index finds the only block
+//!   that can hold the version a lookup wants.
 //! - Footer: `[index_offset u64][index_len u64][filter_offset u64][filter_len u64]
 //!   [entry_count u64][crc32 u32][magic u64]`. The CRC covers the five u64s.
 //!   The footer is fixed size at a fixed place (end of file), so it's where a
@@ -39,8 +40,9 @@ use crate::error::{Error, Result};
 /// can exceed it by at most one entry.
 pub const DEFAULT_BLOCK_SIZE: usize = 4096;
 pub const FOOTER_LEN: usize = 5 * 8 + 4 + 8;
-/// "LSMKVSST" read as a little-endian u64.
-pub const MAGIC: u64 = u64::from_le_bytes(*b"LSMKVSST");
+/// "LSMKVSS2" read as a little-endian u64. The 2 is the format: sequence
+/// numbers in every entry (M8). M3–M7 tables ended in "LSMKVSST".
+pub const MAGIC: u64 = u64::from_le_bytes(*b"LSMKVSS2");
 
 /// What every table a database has open shares: one block cache and one set
 /// of counters. The default has the cache turned off.
