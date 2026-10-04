@@ -2,8 +2,10 @@
 //! operation, run against the database and against a `BTreeMap`.
 //!
 //! The operations: put, delete, get and scan (random bounds), each now or
-//! through a live snapshot, take a snapshot, drop one, flush, compact, and close +
-//! reopen (which ends every snapshot). The options are random too: memtables
+//! through a live snapshot, take a snapshot, drop one, atomic batches,
+//! transactions (with direct writes racing them, so they must conflict
+//! exactly when they share a key), flush, compact, and close + reopen (which
+//! ends every snapshot). The options are random too: memtables
 //! and tables small enough that a hundred operations run flushes and
 //! compactions, either sync mode, filters and the cache on or off.
 //!
@@ -16,7 +18,7 @@ use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::time::Duration;
 
-use lsmkv::{Db, Options, Snapshot, SyncMode};
+use lsmkv::{Db, Error, Options, Snapshot, SyncMode, WriteBatch};
 use proptest::prelude::*;
 use proptest::sample::Index;
 
@@ -32,6 +34,14 @@ enum Op {
     Scan(Bound<Vec<u8>>, Bound<Vec<u8>>, Option<Index>),
     Snapshot,
     DropSnapshot(Index),
+    /// Puts (`Some`) and deletes (`None`) applied as one atomic batch.
+    Batch(Vec<(Vec<u8>, Option<Vec<u8>>)>),
+    /// A transaction writes `writes`; before it commits, `meanwhile` is
+    /// written directly. It must conflict exactly when the two share a key.
+    Txn {
+        writes: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+        meanwhile: Vec<Vec<u8>>,
+    },
     Flush,
     CompactAll,
     Reopen,
@@ -51,6 +61,13 @@ fn bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
     ]
 }
 
+fn write() -> impl Strategy<Value = (Vec<u8>, Option<Vec<u8>>)> {
+    (
+        key(),
+        prop::option::weighted(0.75, prop::collection::vec(any::<u8>(), 0..32)),
+    )
+}
+
 fn op() -> impl Strategy<Value = Op> {
     prop_oneof![
         30 => (key(), prop::collection::vec(any::<u8>(), 0..64)).prop_map(|(k, v)| Op::Put(k, v)),
@@ -62,6 +79,9 @@ fn op() -> impl Strategy<Value = Op> {
         2 => Just(Op::Flush),
         1 => Just(Op::CompactAll),
         1 => Just(Op::Reopen),
+        4 => prop::collection::vec(write(), 0..6).prop_map(Op::Batch),
+        3 => (prop::collection::vec(write(), 1..4), prop::collection::vec(key(), 0..3))
+            .prop_map(|(writes, meanwhile)| Op::Txn { writes, meanwhile }),
     ]
 }
 
@@ -155,6 +175,51 @@ fn run(opts: Options, ops: Vec<Op>) -> Result<(), TestCaseError> {
                         snaps.swap_remove(i.index(snaps.len()));
                     }
                 }
+                Op::Batch(writes) => {
+                    let mut batch = WriteBatch::new();
+                    for (k, v) in &writes {
+                        match v {
+                            Some(v) => batch.put(k, v),
+                            None => batch.delete(k),
+                        };
+                    }
+                    db.write(batch).unwrap();
+                    for (k, v) in writes {
+                        apply(&mut model, k, v);
+                    }
+                }
+                Op::Txn { writes, meanwhile } => {
+                    let mut tx = db.transaction();
+                    for (k, v) in &writes {
+                        // Reads see its own writes, layered over its snapshot.
+                        let before = tx.get(k).unwrap();
+                        match v {
+                            Some(v) => tx.put(k, v),
+                            None => tx.delete(k),
+                        }
+                        prop_assert_eq!(
+                            tx.get(k).unwrap(),
+                            v.clone(),
+                            "own write, was {:?}",
+                            before
+                        );
+                    }
+                    for k in &meanwhile {
+                        db.put(k, b"meanwhile").unwrap();
+                        model.insert(k.clone(), b"meanwhile".to_vec());
+                    }
+                    let clash = writes.iter().any(|(k, _)| meanwhile.contains(k));
+                    match tx.commit() {
+                        Ok(()) => {
+                            prop_assert!(!clash, "committed over a newer write");
+                            for (k, v) in writes {
+                                apply(&mut model, k, v);
+                            }
+                        }
+                        Err(Error::Conflict(_)) => prop_assert!(clash, "a conflict with no clash"),
+                        Err(e) => panic!("{e}"),
+                    }
+                }
                 Op::Flush => db.flush().unwrap(),
                 Op::CompactAll => db.compact_all().unwrap(),
                 Op::Reopen => break,
@@ -167,6 +232,14 @@ fn run(opts: Options, ops: Vec<Op>) -> Result<(), TestCaseError> {
         }
     }
     Ok(())
+}
+
+/// A put (`Some`) or delete (`None`) applied to the model.
+fn apply(model: &mut Model, k: Vec<u8>, v: Option<Vec<u8>>) {
+    match v {
+        Some(v) => model.insert(k, v),
+        None => model.remove(&k),
+    };
 }
 
 fn cases() -> u32 {

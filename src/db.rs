@@ -20,18 +20,21 @@ use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
-use crate::key::SeqNo;
+use crate::key::{SeqNo, MAX_SEQ};
 use crate::manifest::{Edit, Manifest, Version, MAX_LEVELS};
 use crate::memtable::{Entry, MemTable};
 use crate::sstable::filter::DEFAULT_BITS_PER_KEY;
 use crate::sstable::{ReadContext, ReadStats, SstReader, WriterOptions, DEFAULT_BLOCK_SIZE};
 use crate::wal::{Record, Wal};
+use batch::Pending;
 
 mod background;
+mod batch;
 mod compaction;
 mod iter;
 mod snapshot;
 
+pub use batch::{Transaction, WriteBatch};
 pub use iter::DbIter;
 pub use snapshot::Snapshot;
 
@@ -216,6 +219,27 @@ impl SuperVersion {
         }
         Ok(None)
     }
+
+    /// The sequence number of `key`'s newest version (a value or a
+    /// tombstone), if it has one: what a transaction's conflict check needs.
+    /// Sources are newest first, so the first version found is the newest.
+    fn newest_seq(&self, key: &[u8]) -> Result<Option<SeqNo>> {
+        for mem in std::iter::once(&self.mem).chain(&self.imm) {
+            if let Some((seq, _)) = mem.get(key, MAX_SEQ) {
+                return Ok(Some(seq));
+            }
+        }
+        let level0 = self.levels[0].iter();
+        let deeper = self.levels[1..]
+            .iter()
+            .filter_map(|level| table_for_key(level, key));
+        for table in level0.chain(deeper) {
+            if let Some((seq, _)) = table.reader.get_versioned(key, MAX_SEQ)? {
+                return Ok(Some(seq));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// What readers take, in one brief lock and never the state lock: the
@@ -319,7 +343,7 @@ struct State {
     compact_pointer: Vec<Option<Vec<u8>>>,
     /// Writes waiting to be logged, oldest first, tagged with a ticket.
     /// Each with the condition variable its writer sleeps on (D17).
-    queue: VecDeque<(u64, Record, Arc<Condvar>)>,
+    queue: VecDeque<(u64, Pending, Arc<Condvar>)>,
     next_ticket: u64,
     /// A leader is logging a group right now (with the state lock released).
     writing: bool,
@@ -520,14 +544,22 @@ impl Db {
     /// Writes `key = value`. Returns once the write is as durable as the
     /// `SyncMode` promises. An `Err` means the write was not logged.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.write(Record::Put {
-            key: key.to_vec(),
-            value: value.to_vec(),
+        self.commit(Pending {
+            ops: vec![Record::Put {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            }],
+            read_seq: None,
+            also_check: Vec::new(),
         })
     }
 
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.write(Record::Delete { key: key.to_vec() })
+        self.commit(Pending {
+            ops: vec![Record::Delete { key: key.to_vec() }],
+            read_seq: None,
+            also_check: Vec::new(),
+        })
     }
 
     /// Newest data first: memtable, then every level-0 table (newest first),
@@ -618,7 +650,14 @@ impl Db {
         &self.shared.dir
     }
 
-    fn write(&self, rec: Record) -> Result<()> {
+    /// Queues `pending` (a put, a delete, a batch or a transaction's writes)
+    /// and returns once a leader has logged and applied it, or refused it.
+    fn commit(&self, pending: Pending) -> Result<()> {
+        // Nothing to write and nothing to check. (A transaction that only
+        // locked keys still goes through the queue: its check must run.)
+        if pending.ops.is_empty() && pending.also_check.is_empty() {
+            return Ok(());
+        }
         let mut st = self.lock();
         st.check_writable()?;
         let ticket = st.next_ticket;
@@ -626,7 +665,7 @@ impl Db {
         // Its own condition variable, so a leader wakes exactly the writers
         // whose state it changed, not every waiter (DESIGN.md D17).
         let wake = Arc::new(Condvar::new());
-        st.queue.push_back((ticket, rec, Arc::clone(&wake)));
+        st.queue.push_back((ticket, pending, Arc::clone(&wake)));
         loop {
             // A leader already logged this write (or failed to).
             if let Some(result) = st.finished.remove(&ticket) {
@@ -652,15 +691,26 @@ impl Db {
         let slow = st.slow_wal;
         st.writing = true;
         let wal = Arc::clone(&st.wal);
+        let current = Arc::clone(&st.current);
         drop(st);
 
         // The slow part, without the state lock: readers keep reading and new
         // writers keep queueing (they become the next group).
+        // First, transactions' conflict checks (D26): an entry that fails one
+        // is left out, and gets no sequence numbers.
+        let verdicts = batch::check_conflicts(&current, &group);
+        drop(current);
         let logged = ready.and_then(|()| {
             let mut wal = lock(&wal);
             let syncs_before = wal.sync_count();
-            for (seq, (_, rec)) in (first_seq..).zip(&group) {
-                wal.append(seq, rec)?;
+            let mut seq = first_seq;
+            for ((_, pending), verdict) in group.iter().zip(&verdicts) {
+                if verdict.is_ok() {
+                    // One WAL record per batch, so it survives a crash whole
+                    // or not at all (D25).
+                    wal.append_batch(seq, &pending.ops)?;
+                    seq += pending.ops.len() as SeqNo;
+                }
             }
             #[cfg(test)]
             thread::sleep(slow);
@@ -681,7 +731,7 @@ impl Db {
         if let Ok(synced) = logged {
             st.wal_syncs += synced;
         }
-        let result = st.finish_group(group, first_seq, logged.map(drop));
+        let result = st.finish_group(group, verdicts, first_seq, logged.map(drop));
         // Whoever is first in line now leads the next group: it waited
         // because this group was in flight.
         let next = st.queue.front().map(|q| Arc::clone(&q.2));
@@ -845,21 +895,21 @@ impl State {
     /// record, then more while the group stays under `MAX_GROUP_BYTES`.
     /// Returns it with its followers' condition variables (all but the
     /// leader's, which is first).
-    fn take_group(&mut self) -> (Vec<(u64, Record)>, Vec<Arc<Condvar>>) {
+    fn take_group(&mut self) -> (Vec<(u64, Pending)>, Vec<Arc<Condvar>>) {
         let mut group = Vec::new();
         let mut followers = Vec::new();
         let mut bytes = 0;
-        while let Some((_, rec, _)) = self.queue.front() {
-            let size = record_len(rec);
+        while let Some((_, pending, _)) = self.queue.front() {
+            let size = pending.bytes();
             if !group.is_empty() && bytes + size > MAX_GROUP_BYTES {
                 break;
             }
             bytes += size;
-            let (ticket, rec, wake) = self.queue.pop_front().expect("front exists");
+            let (ticket, pending, wake) = self.queue.pop_front().expect("front exists");
             if !group.is_empty() {
                 followers.push(wake);
             }
-            group.push((ticket, rec));
+            group.push((ticket, pending));
         }
         (group, followers)
     }
@@ -872,7 +922,8 @@ impl State {
     /// log may now end in a partial record.
     fn finish_group(
         &mut self,
-        group: Vec<(u64, Record)>,
+        group: Vec<(u64, Pending)>,
+        verdicts: Vec<Result<()>>,
         first_seq: SeqNo,
         logged: Result<()>,
     ) -> Result<()> {
@@ -887,18 +938,28 @@ impl State {
             return Err(e);
         }
         self.write_groups += 1;
-        for (seq, (ticket, rec)) in (first_seq..).zip(group) {
-            self.writes += 1;
-            self.user_bytes += record_len(&rec) as u64;
-            apply(&self.current.mem, seq, rec);
-            self.last_seq = seq;
-            if ticket != leader {
-                self.finished.insert(ticket, Ok(()));
+        let mut seq = first_seq;
+        let mut leader_result = Ok(());
+        for ((ticket, pending), verdict) in group.into_iter().zip(verdicts) {
+            // Refused entries (conflicts) were never logged and take no numbers.
+            if verdict.is_ok() {
+                for op in pending.ops {
+                    self.writes += 1;
+                    self.user_bytes += record_len(&op) as u64;
+                    apply(&self.current.mem, seq, op);
+                    self.last_seq = seq;
+                    seq += 1;
+                }
+            }
+            if ticket == leader {
+                leader_result = verdict;
+            } else {
+                self.finished.insert(ticket, verdict);
             }
         }
-        // Now the whole group is visible, at once.
+        // Now the whole group is visible, at once: every batch in it whole.
         lock(&self.view).last_seq = self.last_seq;
-        Ok(())
+        leader_result
     }
 
     /// Makes the memtable immutable, for the background thread to flush,

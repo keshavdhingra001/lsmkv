@@ -136,6 +136,11 @@ impl<'a> Block<'a> {
     /// at or after (key, snapshot) in internal key order is that version if
     /// it belongs to `key`; if it belongs to a later key, there is none here.
     pub fn get(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Entry>> {
+        Ok(self.get_versioned(key, snapshot)?.map(|(_, e)| e))
+    }
+
+    /// `get`, plus the found version's sequence number.
+    pub fn get_versioned(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<(SeqNo, Entry)>> {
         for item in self.iter() {
             let (k, seq, v) = item?;
             if key::compare(k, seq, key, snapshot).is_lt() {
@@ -144,10 +149,11 @@ impl<'a> Block<'a> {
             if k != key {
                 break;
             }
-            return Ok(Some(match v {
+            let entry = match v {
                 Some(v) => Entry::Value(v.to_vec()),
                 None => Entry::Tombstone,
-            }));
+            };
+            return Ok(Some((seq, entry)));
         }
         Ok(None)
     }

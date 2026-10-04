@@ -22,5 +22,5 @@ pub mod sstable;
 mod test_util;
 pub mod wal;
 
-pub use db::{Db, DbIter, Options, Snapshot, Stats, SyncMode};
+pub use db::{Db, DbIter, Options, Snapshot, Stats, SyncMode, Transaction, WriteBatch};
 pub use error::{Error, Result};

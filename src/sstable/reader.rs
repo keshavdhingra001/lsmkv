@@ -115,6 +115,12 @@ impl SstReader {
     /// The newest version of `key` at or below `snapshot`. `None` = no such
     /// version in this table; `Some(Tombstone)` = deleted as of `snapshot`.
     pub fn get(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Entry>> {
+        Ok(self.get_versioned(key, snapshot)?.map(|(_, e)| e))
+    }
+
+    /// `get`, plus the found version's sequence number (what a transaction's
+    /// conflict check compares).
+    pub fn get_versioned(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<(SeqNo, Entry)>> {
         let Some(filter) = &self.filter else {
             return self.search(key, snapshot);
         };
@@ -130,7 +136,7 @@ impl SstReader {
     }
 
     /// The lookup without the filter: index, then one block.
-    fn search(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Entry>> {
+    fn search(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<(SeqNo, Entry)>> {
         // First block whose last entry is at or after (key, snapshot): the
         // only block that can hold the first entry at or after it, which is
         // the version this lookup wants if it belongs to `key`.
@@ -142,7 +148,7 @@ impl SstReader {
         };
         let raw = self.cached_block(entry)?;
         Block::from_verified(&raw)
-            .get(key, snapshot)
+            .get_versioned(key, snapshot)
             .map_err(|e| self.block_error(e, entry))
     }
 

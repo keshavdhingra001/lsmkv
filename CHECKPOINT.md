@@ -22,8 +22,11 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB *(Claude; `bench/` crate, RocksDB 11.8; writes even, lsmkv faster on single-threaded reads (unprofiled), RocksDB better compaction and tails)*
 - [x] **M12** DESIGN.md complete, README with results *(Claude; README rewrite with mermaid diagram + all results, DESIGN index + final pass, `examples/demo.rs`)*
 
-### Tier 3: Stretch (pick 2–3 later)
-MVCC, atomic batches, RESP server, compression, deterministic simulation testing, Raft.
+### Tier 3: Stretch (owner approved M13–M15 on 2026-10-05)
+- [x] **M13** Atomic write batches + optimistic transactions (snapshot isolation, `get_for_update`) *(Claude; 15 mutants, all caught)*
+- [ ] **M14** Redis-protocol (RESP) server: `redis-cli` talks to lsmkv
+- [ ] **M15** Deterministic simulation + power-loss testing (simulated disk behind an `Fs` trait)
+Not planned: compression, column families, Raft.
 
 ## ▶ RESUME HERE (handover 2026-10-05, after M12: Tier 2 complete)
 
@@ -191,6 +194,16 @@ Mistakes on the way: a non-terminating `shuffled` helper hung a benchmark for 44
 4. Why is `readmissing` so much faster than `readrandom` for both engines?
 5. With 4 readers and a writer, read throughput is equal but RocksDB has the better p99. What in lsmkv's write path could cause read tail latency?
 6. Why is `fillrandom` with fsync per write about 1,000 ops/s for both? What would make it faster without giving up durability?
+
+## M13 review questions (owner answers)
+1. Why is a whole batch ONE WAL record instead of one record per operation? What exactly does a torn tail do to each design?
+2. A reader takes a snapshot while a 10-key batch is being applied. Why can it never see 5 of the 10 keys updated?
+3. Why did batches force a format bump, and what would an M12 binary have done to a WAL containing a batch?
+4. Walk through `tx.commit()`: where does the conflict check run, which lock is held, and why can't a write sneak in between the check and the commit?
+5. Two transactions from the same snapshot both write key `k` and land in the same write group. How does the check catch the second one?
+6. What is write skew? Give the on-call example, and say how `get_for_update` prevents it.
+7. Optimistic vs pessimistic concurrency control: when does each win, and why did lsmkv choose optimistic?
+8. The batch decoder aborted the process on `count = u32::MAX`. Why, and what's the general rule it broke?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed

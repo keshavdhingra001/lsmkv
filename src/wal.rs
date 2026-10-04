@@ -10,10 +10,20 @@
 //! ```
 //!
 //! - `crc32` covers every byte AFTER the crc field (kind through value).
-//! - `kind`: 1 = Put, 2 = Delete (Delete has `val_len = 0`).
+//! - `kind`: 1 = Put, 2 = Delete (Delete has `val_len = 0`), 3 = Batch.
 //! - `seq`: the write's sequence number (DESIGN.md D18), so a replay rebuilds
 //!   the memtable with the same versions it had.
 //! - Header is 21 bytes.
+//!
+//! A batch (DESIGN.md D25) is ONE record, so one CRC covers all of it and a
+//! torn tail drops the whole batch, never part of it. Its header reuses the
+//! two length slots: `key_len` holds the number of operations and `val_len`
+//! the payload length. `seq` is the first operation's number; the rest follow
+//! consecutively. The payload is the operations back to back:
+//!
+//! ```text
+//! op = [kind u8][key_len u32][val_len u32][key][value]     (kind 1 or 2)
+//! ```
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
@@ -26,11 +36,29 @@ use crate::key::SeqNo;
 pub const HEADER_LEN: usize = 4 + 1 + 8 + 4 + 4;
 pub const KIND_PUT: u8 = 1;
 pub const KIND_DELETE: u8 = 2;
+pub const KIND_BATCH: u8 = 3;
+/// Header of one operation inside a batch payload.
+const OP_HEADER_LEN: usize = 1 + 4 + 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
     Put { key: Vec<u8>, value: Vec<u8> },
     Delete { key: Vec<u8> },
+}
+
+impl Record {
+    pub fn key(&self) -> &[u8] {
+        match self {
+            Record::Put { key, .. } | Record::Delete { key } => key,
+        }
+    }
+
+    pub fn value_len(&self) -> usize {
+        match self {
+            Record::Put { value, .. } => value.len(),
+            Record::Delete { .. } => 0,
+        }
+    }
 }
 
 /// Result of replaying a log file.
@@ -88,6 +116,44 @@ impl Wal {
         Ok(())
     }
 
+    /// Logs `ops`, numbered `first_seq`, `first_seq + 1`, ..., as one unit:
+    /// after a crash, replay returns all of them or none. A single operation
+    /// is logged as a plain record (the format before batches existed).
+    pub fn append_batch(&mut self, first_seq: SeqNo, ops: &[Record]) -> Result<()> {
+        match ops {
+            [] => Ok(()),
+            [op] => self.append(first_seq, op),
+            _ => {
+                let mut payload = Vec::new();
+                for op in ops {
+                    let (kind, key, value): (u8, &[u8], &[u8]) = match op {
+                        Record::Put { key, value } => (KIND_PUT, key, value),
+                        Record::Delete { key } => (KIND_DELETE, key, &[]),
+                    };
+                    payload.push(kind);
+                    payload.extend_from_slice(&len_u32(key, "key")?.to_le_bytes());
+                    payload.extend_from_slice(&len_u32(value, "value")?.to_le_bytes());
+                    payload.extend_from_slice(key);
+                    payload.extend_from_slice(value);
+                }
+                let count = u32::try_from(ops.len())
+                    .map_err(|_| Error::InvalidArgument("batch has over 4G operations".into()))?;
+                let payload_len = len_u32(&payload, "batch")?;
+
+                let mut body = Vec::with_capacity(HEADER_LEN - 4 + payload.len());
+                body.push(KIND_BATCH);
+                body.extend_from_slice(&first_seq.to_le_bytes());
+                body.extend_from_slice(&count.to_le_bytes());
+                body.extend_from_slice(&payload_len.to_le_bytes());
+                body.extend_from_slice(&payload);
+                let crc = crc32fast::hash(&body);
+                self.file.write_all(&crc.to_le_bytes())?;
+                self.file.write_all(&body)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Pushes buffered bytes to the OS without waiting for the disk. They
     /// survive this process crashing, but not the machine losing power.
     pub fn flush(&mut self) -> Result<()> {
@@ -134,8 +200,8 @@ impl Wal {
         let mut pos = 0;
         loop {
             match decode(&buf[pos..]) {
-                Decoded::Record(seq, rec, len) => {
-                    records.push((seq, rec));
+                Decoded::Records(recs, len) => {
+                    records.extend(recs);
                     pos += len;
                 }
                 Decoded::Incomplete => break,
@@ -160,8 +226,8 @@ impl Wal {
 }
 
 enum Decoded {
-    /// A valid record and its encoded length.
-    Record(SeqNo, Record, usize),
+    /// A valid record (several operations, for a batch) and its encoded length.
+    Records(Vec<(SeqNo, Record)>, usize),
     /// Not enough bytes for the header, or for the length the header claims.
     Incomplete,
     /// Complete per its header, but the checksum or contents are wrong.
@@ -180,11 +246,14 @@ fn decode(buf: &[u8]) -> Decoded {
     let key_len = read_u32(buf, 13) as usize;
     let val_len = read_u32(buf, 17) as usize;
 
+    // A batch's `key_len` slot is its operation count, not a length.
+    let body_len = if kind == KIND_BATCH {
+        Some(val_len)
+    } else {
+        key_len.checked_add(val_len)
+    };
     // Lengths come from disk and may be garbage, so guard the addition too.
-    let Some(total) = HEADER_LEN
-        .checked_add(key_len)
-        .and_then(|n| n.checked_add(val_len))
-    else {
+    let Some(total) = body_len.and_then(|n| n.checked_add(HEADER_LEN)) else {
         return Decoded::Incomplete;
     };
     if buf.len() < total {
@@ -194,16 +263,65 @@ fn decode(buf: &[u8]) -> Decoded {
         return Decoded::Bad(total);
     }
 
-    let key = buf[HEADER_LEN..HEADER_LEN + key_len].to_vec();
-    let rec = match kind {
-        KIND_PUT => Record::Put {
+    let body = &buf[HEADER_LEN..total];
+    if kind == KIND_BATCH {
+        // `key_len` is the operation count, `val_len` the payload length.
+        return match decode_batch(seq, key_len, body) {
+            Some(recs) => Decoded::Records(recs, total),
+            None => Decoded::Bad(total),
+        };
+    }
+    match decode_op(kind, &body[..key_len], &body[key_len..]) {
+        Some(rec) => Decoded::Records(vec![(seq, rec)], total),
+        None => Decoded::Bad(total),
+    }
+}
+
+fn decode_op(kind: u8, key: &[u8], value: &[u8]) -> Option<Record> {
+    let key = key.to_vec();
+    match kind {
+        KIND_PUT => Some(Record::Put {
             key,
-            value: buf[HEADER_LEN + key_len..total].to_vec(),
-        },
-        KIND_DELETE if val_len == 0 => Record::Delete { key },
-        _ => return Decoded::Bad(total),
-    };
-    Decoded::Record(seq, rec, total)
+            value: value.to_vec(),
+        }),
+        KIND_DELETE if value.is_empty() => Some(Record::Delete { key }),
+        _ => None,
+    }
+}
+
+/// The operations of a batch payload whose CRC already passed. `None` if it
+/// doesn't hold exactly `count` well-formed operations (a writer bug, since
+/// the checksum matched).
+fn decode_batch(
+    first_seq: SeqNo,
+    count: usize,
+    mut payload: &[u8],
+) -> Option<Vec<(SeqNo, Record)>> {
+    if count == 0 {
+        return None;
+    }
+    // `count` comes from disk: never allocate for more operations than the
+    // payload has room for (each takes at least its header).
+    let mut recs = Vec::with_capacity(count.min(payload.len() / OP_HEADER_LEN));
+    for seq in (first_seq..).take(count) {
+        if payload.len() < OP_HEADER_LEN {
+            return None;
+        }
+        let kind = payload[0];
+        let key_len = read_u32(payload, 1) as usize;
+        let val_len = read_u32(payload, 5) as usize;
+        let end = OP_HEADER_LEN.checked_add(key_len)?.checked_add(val_len)?;
+        if payload.len() < end {
+            return None;
+        }
+        let key = &payload[OP_HEADER_LEN..OP_HEADER_LEN + key_len];
+        recs.push((
+            seq,
+            decode_op(kind, key, &payload[OP_HEADER_LEN + key_len..end])?,
+        ));
+        payload = &payload[end..];
+    }
+    payload.is_empty().then_some(recs)
 }
 
 #[cfg(test)]
@@ -395,5 +513,126 @@ mod tests {
         let r = Wal::replay(&path).unwrap();
         assert!(r.records.is_empty());
         assert_eq!(r.valid_len, 0);
+    }
+
+    // ---- M13: batches ----
+
+    fn del(k: &str) -> Record {
+        Record::Delete { key: k.into() }
+    }
+
+    #[test]
+    fn batches_roundtrip_with_consecutive_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let batch = [put("a", "1"), del("b"), put("c", "")];
+        let mut wal = Wal::open(&path).unwrap();
+        wal.append(1, &put("x", "0")).unwrap();
+        wal.append_batch(2, &batch).unwrap();
+        wal.append_batch(5, &[put("y", "9")]).unwrap(); // one op: a plain record
+        wal.append_batch(6, &[]).unwrap(); // nothing at all
+        wal.sync().unwrap();
+
+        let r = Wal::replay(&path).unwrap();
+        let want = vec![
+            (1, put("x", "0")),
+            (2, put("a", "1")),
+            (3, del("b")),
+            (4, put("c", "")),
+            (5, put("y", "9")),
+        ];
+        assert_eq!(r.records, want);
+        assert_eq!(r.valid_len, fs::metadata(&path).unwrap().len());
+    }
+
+    /// A crash can cut a batch anywhere. Replay must drop the whole batch,
+    /// never return part of it.
+    #[test]
+    fn a_batch_torn_anywhere_disappears_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut wal = Wal::open(&path).unwrap();
+        wal.append(1, &put("before", "x")).unwrap();
+        wal.sync().unwrap();
+        let before = fs::metadata(&path).unwrap().len() as usize;
+        wal.append_batch(2, &[put("a", "1"), put("b", "2"), del("c")])
+            .unwrap();
+        wal.sync().unwrap();
+        let full = fs::read(&path).unwrap();
+
+        for cut in before..full.len() {
+            fs::write(&path, &full[..cut]).unwrap();
+            let r = Wal::replay(&path).unwrap();
+            assert_eq!(r.records, vec![(1, put("before", "x"))], "cut at {cut}");
+            assert_eq!(r.valid_len as usize, before, "cut at {cut}");
+        }
+        // Every flipped byte of a final batch drops it as a bad tail...
+        for i in before..full.len() {
+            let mut bytes = full.clone();
+            bytes[i] ^= 0x40;
+            fs::write(&path, &bytes).unwrap();
+            let r = Wal::replay(&path).unwrap();
+            assert_eq!(r.records.len(), 1, "flip at {i}");
+        }
+        // ...and with more records after it, it's corruption.
+        let mut bytes = full.clone();
+        bytes[before + 30] ^= 0x40;
+        bytes.extend_from_slice(&full[..before]);
+        fs::write(&path, &bytes).unwrap();
+        assert!(matches!(Wal::replay(&path), Err(Error::Corruption(_))));
+    }
+
+    /// A batch header and payload with a valid CRC but inconsistent contents
+    /// (only a writer bug could produce one) is rejected, not misread.
+    #[test]
+    fn malformed_batches_are_rejected() {
+        let op = |kind: u8, k: &[u8], v: &[u8]| {
+            let mut o = vec![kind];
+            o.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            o.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            o.extend_from_slice(k);
+            o.extend_from_slice(v);
+            o
+        };
+        let batch = |count: u32, payload: &[u8]| {
+            let mut body = vec![KIND_BATCH];
+            body.extend_from_slice(&1u64.to_le_bytes());
+            body.extend_from_slice(&count.to_le_bytes());
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            let mut rec = crc32fast::hash(&body).to_le_bytes().to_vec();
+            rec.extend_from_slice(&body);
+            rec
+        };
+        let two = [op(KIND_PUT, b"a", b"1"), op(KIND_DELETE, b"b", b"")].concat();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("count too high", batch(3, &two)),
+            ("count too low", batch(1, &two)),
+            ("count zero", batch(0, b"")),
+            ("huge count", batch(u32::MAX, &two)),
+            (
+                "op runs past the payload",
+                batch(1, &op(KIND_PUT, b"a", b"1")[..10]),
+            ),
+            (
+                "delete with a value",
+                batch(1, &op(KIND_DELETE, b"a", b"1")),
+            ),
+            ("nested batch kind", batch(1, &op(KIND_BATCH, b"a", b"1"))),
+        ];
+        for (why, rec) in cases {
+            fs::write(&path, &rec).unwrap();
+            let r = Wal::replay(&path).unwrap();
+            assert!(r.records.is_empty(), "{why}");
+            assert_eq!(r.valid_len, 0, "{why}");
+        }
+        fs::write(&path, batch(2, &two)).unwrap();
+        assert_eq!(
+            Wal::replay(&path).unwrap().records.len(),
+            2,
+            "the control case parses"
+        );
     }
 }

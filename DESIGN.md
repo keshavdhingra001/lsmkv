@@ -45,6 +45,8 @@ Later milestones changed some early decisions; those entries say so, and point a
 | D22 | Crash harness: many `kill -9`s, one directory, an exact checker | M10 |
 | D23 | Model-based fuzzing with proptest | M10 |
 | D24 | Benchmark methodology vs RocksDB | M11 |
+| D25 | Atomic write batches: one WAL record each; format 3 | M13 |
+| D26 | Optimistic transactions: snapshot isolation, first committer wins | M13 |
 
 ## Decisions
 
@@ -509,11 +511,36 @@ The owner approved the combined M9–M12 proposal in one "go".
   - **Not compared:** compression, prefix-compressed blocks, multiple background threads, column families, and RocksDB's tuning for large datasets that don't fit in memory. Here 129 MiB of tables sit mostly in the OS page cache.
 - **A benchmark bug on the way:** `shuffled(i, n)` cycle-walks a permutation of `0..2^k` until it lands below `n`. That only terminates when the input is already below `n`. Called with `i * 7 + 3`, it looped forever (a 44-minute hung run). `examples/scan.rs` had the same latent bug. Both now reduce the input mod `n` first.
 
+### M13: Atomic batches and transactions, approved 2026-10-05 (D25–D26)
+Tier 3, approved together with M14 and M15 in one "go".
+
+### D25: Atomic write batches (approved 2026-10-05)
+- **API:** `let mut b = WriteBatch::new(); b.put(k, v).delete(k2); db.write(b)?`. All the operations land or none do, and readers see all or none. Later operations on the same key win.
+- **One WAL record per batch** (LevelDB's approach): kind 3, the usual 21-byte header with its two length slots reused for the operation count and the payload length, then the operations back to back. One CRC covers the whole batch, so a torn tail drops all of it, never part of it (`a_batch_torn_anywhere_disappears_whole` cuts it at every byte offset).
+  - **Rejected alternative:** begin/end marker records around ordinary records. Recovery would need to buffer records until the end marker and handle a missing one, which is more states to get right for the same guarantee.
+  - **A single put stays a plain record,** so the common case pays nothing and old logs still read.
+- **Numbering and visibility:** the operations take consecutive sequence numbers. The group commit leader already publishes `last_seq` once per group, after applying all of it, so a reader's snapshot either includes the whole batch or none of it (`readers_never_see_half_a_batch`: 3 readers, snapshots and scans, 2,000 ten-key batches through flushes).
+- **Every write is a batch inside the engine:** the writer queue holds batches, and `put`/`delete` queue a batch of one. Group sizing counts a batch's bytes.
+- **Format 3.** An older build would read a batch record as a bad (torn) tail and truncate it: silent data loss. So the manifest format went to 3:
+  - New databases start at 3.
+  - Opening a format-2 database appends `Format(3)` to its manifest before anything new is written. A format-2 build accepts only one format record, first, so it now refuses the directory instead of misreading it (`format_2_is_upgraded_and_newer_formats_are_refused`).
+- **Untrusted counts:** the decoder first allocated `Vec::with_capacity(count)` from the on-disk count. A test with `count = u32::MAX` aborted the process (allocation failure), the same class of bug as D4's lengths. Capacity is now capped by what the payload can hold (each operation takes at least 9 bytes).
+
+### D26: Optimistic transactions (approved 2026-10-05)
+- **API:** `let mut tx = db.transaction(); tx.get(k)?; tx.put(k, v); tx.delete(k); tx.commit()?`. Reads see the snapshot taken at `transaction()`, plus the transaction's own buffered writes. Dropping it discards the writes.
+- **Commit, first committer wins:** the transaction's writes go into the writer queue as one batch carrying its snapshot number. The group leader checks each key it writes: if the key has any version (a value or a tombstone) newer than the snapshot, another writer committed to it first, and the commit fails with `Error::Conflict`, applying nothing. A conflict is safe to retry.
+- **Where the check runs:** in the leader, with the state lock released, against the SuperVersion as of the group's start. That's safe because only one write group is ever in flight (D11): no write can be applied between the check and the commit, and a flush that installs a new SuperVersion meanwhile only moves data. Entries earlier in the *same* group count as newer too (`conflicting_transactions_in_one_group_one_wins`, staged with the slow-WAL hook). A refused entry is never logged and takes no sequence numbers.
+- **Finding the newest version:** `SuperVersion::newest_seq` checks the memtables, then level 0 newest first, then one table per deeper level, like `get` but returning the version's number (`SstReader::get_versioned`). Bloom filters make the common no-such-key case cheap.
+- **Isolation level: snapshot isolation.** It prevents lost updates (`concurrent_transfers_conserve_money`: 4 threads moving money between 10 accounts with retries; an auditor checks every snapshot's total, and it survives a reopen). It allows **write skew**: two transactions that each read both keys and write *different* ones both commit. `write_skew_is_allowed_under_snapshot_isolation` pins this down with the on-call doctors example. Preventing it (serializable isolation) needs read-set tracking: checking that nothing a transaction *read* changed either, like PostgreSQL's SSI. Full serializability isn't built, but there's the targeted fix databases offer: **`get_for_update(key)`** (RocksDB's `GetForUpdate`, SQL's `SELECT ... FOR UPDATE`) reads a key *and* adds it to the commit's conflict check, so a transaction can protect the keys its decision rests on (`get_for_update_prevents_write_skew`). A transaction that only locked keys still runs the check at commit; that's what Redis's `WATCH` needs (M14).
+- **Rejected alternative: pessimistic locking** (lock each key on first write). That needs a lock table, deadlock detection or timeouts, and holds locks across user code. Optimistic is right when conflicts are rare, and it reuses the sequence numbers the engine already has. RocksDB offers both (`OptimisticTransactionDB` and `TransactionDB`).
+- **Verified by:** the tests named above, plus the crash harness (1 in 5 operations is a 2–4 key batch, and after every kill an in-flight batch must be entirely present or entirely absent) and the proptest model (batches, plus transactions with direct writes racing them that must conflict exactly when they share a key). **Mutation checks: 15 planted bugs, all caught:** same-group writes not counted, the conflict check skipping tables, refused entries logged or applied anyway, half a batch published to readers, a transaction ignoring its own writes, commit skipping the check, `>=` instead of `>`, batch operations replayed at one sequence number, a batch logged as separate records, no format upgrade, any format accepted, a malformed payload accepted, and two for `get_for_update`.
+- **Limits:** a transaction's `get` reads its snapshot plus its own writes, but there's no transactional `scan` yet (it would merge the write buffer into a `DbIter`). Long transactions hold a snapshot, so compaction keeps old versions for them (D18).
+
 ## Not done
 
 These were scoped as Tier 3 (stretch) and not built:
 - **Reverse iteration:** every source would need `prev`, and blocks would need restart points to walk backwards cheaply.
-- **Atomic write batches and transactions (MVCC):** sequence numbers (D18) are the groundwork. A batch would take consecutive numbers and publish them together, as a write group already does.
+- **Serializable transactions:** M13's transactions are snapshot isolation (D26); preventing write skew needs read-set validation.
 - **Compression and prefix-compressed blocks:** blocks store full keys and are searched linearly.
 - **Trivial moves out of level 0** (RocksDB's 1.00 write amplification on sequential keys, D24), and more than one background thread.
 - **A network server** (RESP, so `redis-cli` could talk to it).

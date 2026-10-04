@@ -3,14 +3,17 @@
 //!
 //! Each round, a child process (this same test binary, re-run with an
 //! environment variable set) opens the database and runs 4 writer threads.
-//! Each thread owns 2,000 keys and does random puts and deletes on them,
-//! printing `S` before an operation and `A` once it's acknowledged. The parent
+//! Each thread owns 2,000 keys and does random puts, deletes and atomic
+//! batches of 2-4 writes on them, printing `S` before an operation and `A`
+//! once it's acknowledged. The parent
 //! `kill -9`s the child at a random moment, reopens the database itself, and
 //! checks every key exactly:
 //!
 //! - it must hold the result of the last acknowledged operation on it,
 //! - or, if the thread's one unacknowledged operation was on this key, the
 //!   result of that operation (it may or may not have reached the log).
+//!   A batch must be there whole or not at all: every one of its keys
+//!   holding the new value, or every one holding the old.
 //!
 //! Anything else (a lost acknowledged write, an old value coming back, a key
 //! nobody wrote) fails the test. A full scan must agree with the point reads.
@@ -39,7 +42,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use lsmkv::{Db, Options, SyncMode};
+use lsmkv::{Db, Options, SyncMode, WriteBatch};
 
 const CHILD_DIR: &str = "LSMKV_KILL9_DIR";
 const CHILD_ROUND: &str = "LSMKV_KILL9_ROUND";
@@ -128,16 +131,43 @@ fn child_thread(db: &Db, round: u64, t: usize) {
         out.flush().unwrap();
     };
     for op in 0u64.. {
-        let k = key(t, rng.below(KEYS_PER_THREAD as u64) as usize);
-        if rng.below(4) == 0 {
-            print(format!("S {t} {op} {k} D"));
-            db.delete(k.as_bytes()).unwrap();
-            mine.remove(k.as_bytes());
+        // 1 in 5 operations is an atomic batch of 2-4 distinct keys.
+        let n = if rng.below(5) == 0 {
+            2 + rng.below(3)
         } else {
-            print(format!("S {t} {op} {k} P"));
-            let v = value(round, t, op);
-            db.put(k.as_bytes(), &v).unwrap();
-            mine.insert(k.into_bytes(), v);
+            1
+        };
+        let mut keys: Vec<String> = Vec::new();
+        while (keys.len() as u64) < n {
+            let k = key(t, rng.below(KEYS_PER_THREAD as u64) as usize);
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let v = value(round, t, op);
+        let writes: Vec<(String, bool)> =
+            keys.into_iter().map(|k| (k, rng.below(4) != 0)).collect();
+        // `S <thread> <op> (<key> <P|D>)+ ;` -- the `;` marks a whole line.
+        let mut line = format!("S {t} {op}");
+        for (k, is_put) in &writes {
+            line += &format!(" {k} {}", if *is_put { "P" } else { "D" });
+        }
+        print(line + " ;");
+        let mut batch = WriteBatch::new();
+        for (k, is_put) in &writes {
+            if *is_put {
+                batch.put(k.as_bytes(), &v);
+                mine.insert(k.clone().into_bytes(), v.clone());
+            } else {
+                batch.delete(k.as_bytes());
+                mine.remove(k.as_bytes());
+            }
+        }
+        match writes.as_slice() {
+            // Single writes go through put/delete, the common path.
+            [(k, true)] => db.put(k.as_bytes(), &v).unwrap(),
+            [(k, false)] => db.delete(k.as_bytes()).unwrap(),
+            _ => db.write(batch).unwrap(),
         }
         print(format!("A {t} {op}"));
 
@@ -158,11 +188,11 @@ fn child_thread(db: &Db, round: u64, t: usize) {
     }
 }
 
-/// One operation the child started, as the parent parsed it.
+/// One operation the child started, as the parent parsed it: one write, or
+/// an atomic batch of several.
 struct Op {
-    key: String,
-    /// `None` for a delete.
-    value: Option<Vec<u8>>,
+    /// (key, `Some(value)` for a put or `None` for a delete).
+    writes: Vec<(String, Option<Vec<u8>>)>,
     acked: bool,
 }
 
@@ -194,12 +224,15 @@ fn run_child(dir: &Path, round: u64, kill_after: Duration) -> Vec<Vec<Op>> {
     let handle = |line: String, ops: &mut Vec<Vec<Op>>| {
         let parts: Vec<&str> = line.split(' ').collect();
         match parts.as_slice() {
-            ["S", t, op, key, kind] => {
+            ["S", t, op, writes @ .., ";"] if !writes.is_empty() && writes.len() % 2 == 0 => {
                 let (t, op): (usize, u64) = (t.parse().unwrap(), op.parse().unwrap());
                 assert_eq!(ops[t].len() as u64, op, "thread {t} skipped an op");
+                let writes = writes
+                    .chunks(2)
+                    .map(|w| (w[0].to_string(), (w[1] == "P").then(|| value(round, t, op))))
+                    .collect();
                 ops[t].push(Op {
-                    key: key.to_string(),
-                    value: (*kind == "P").then(|| value(round, t, op)),
+                    writes,
                     acked: false,
                 });
             }
@@ -249,13 +282,16 @@ fn run_child(dir: &Path, round: u64, kill_after: Duration) -> Vec<Vec<Op>> {
 /// the last round) plus this round's operations, then updates `model` to
 /// what the database now holds.
 fn check(dir: &Path, round: u64, ops: &[Vec<Op>], model: &mut HashMap<String, Option<Vec<u8>>>) {
-    // What each key must hold, and the one other thing it may hold.
+    // What each key must hold if the in-flight operations didn't land...
     let mut must: HashMap<String, Option<Vec<u8>>> = model.clone();
-    let mut may: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    // ...and those operations (at most one per thread).
+    let mut in_flight: Vec<&Op> = Vec::new();
     for thread in ops {
         for (i, op) in thread.iter().enumerate() {
             if op.acked {
-                must.insert(op.key.clone(), op.value.clone());
+                for (k, v) in &op.writes {
+                    must.insert(k.clone(), v.clone());
+                }
             } else {
                 // Each thread waits for its acknowledgement before starting
                 // the next operation, so only its last can be unacknowledged.
@@ -264,29 +300,51 @@ fn check(dir: &Path, round: u64, ops: &[Vec<Op>], model: &mut HashMap<String, Op
                     thread.len(),
                     "round {round}: an op mid-stream wasn't acked"
                 );
-                may.insert(op.key.clone(), op.value.clone());
+                in_flight.push(op);
             }
         }
     }
 
     let db = Db::open_with(dir, options(round)).unwrap();
-    let mut live = BTreeMap::new();
-    for (k, want) in &must {
-        let got = db.get(k.as_bytes()).unwrap();
-        let ok = got == *want || may.get(k).is_some_and(|alt| got == *alt);
-        assert!(
-            ok,
-            "round {round}: key {k} holds {:?}, expected {:?} (or {:?})",
-            got.as_deref().map(String::from_utf8_lossy),
-            want.as_deref().map(String::from_utf8_lossy),
-            may.get(k)
-                .map(|v| v.as_deref().map(String::from_utf8_lossy)),
-        );
-        if let Some(v) = &got {
-            live.insert(k.clone().into_bytes(), v.clone());
-        }
-        model.insert(k.clone(), got);
+    let mut got: HashMap<String, Option<Vec<u8>>> = HashMap::new();
+    for k in must.keys() {
+        got.insert(k.clone(), db.get(k.as_bytes()).unwrap());
     }
+    let show = |v: &Option<Vec<u8>>| {
+        v.as_deref()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+    };
+    // An in-flight operation landed entirely, or not at all.
+    let mut covered = std::collections::HashSet::new();
+    for op in &in_flight {
+        let landed = op.writes.iter().all(|(k, v)| got[k] == *v);
+        let absent = op.writes.iter().all(|(k, _)| got[k] == must[k]);
+        assert!(
+            landed || absent,
+            "round {round}: in-flight operation half applied: {:?}",
+            op.writes
+                .iter()
+                .map(|(k, v)| (k, show(v), show(&must[k]), show(&got[k])))
+                .collect::<Vec<_>>()
+        );
+        covered.extend(op.writes.iter().map(|(k, _)| k.clone()));
+    }
+    // Every other key holds exactly its last acknowledged value.
+    for (k, want) in &must {
+        if !covered.contains(k) {
+            assert!(
+                got[k] == *want,
+                "round {round}: key {k} holds {:?}, expected {:?}",
+                show(&got[k]),
+                show(want)
+            );
+        }
+    }
+    let live: BTreeMap<Vec<u8>, Vec<u8>> = got
+        .iter()
+        .filter_map(|(k, v)| Some((k.clone().into_bytes(), v.clone()?)))
+        .collect();
+    model.extend(got);
     // The scan sees exactly the keys the point reads found, and nothing else.
     let scanned: BTreeMap<Vec<u8>, Vec<u8>> = db.iter().unwrap().map(|i| i.unwrap()).collect();
     assert!(

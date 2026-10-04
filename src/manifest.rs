@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! record = [crc32 u32][tag u8][value u64]      (13 bytes; CRC covers tag + value)
-//! tag 4        = Format(v): always the first record
+//! tag 4        = Format(v): the first record; later ones only upgrade
 //! tag 0x10 + L = AddTable(id) at level L (0 <= L < MAX_LEVELS)
 //! tag 2        = RemoveTable(id)
 //! tag 3        = SetLogNumber(n)
@@ -15,7 +15,11 @@
 //!   and tables. Format 2 (M8) added sequence numbers to WAL records and table
 //!   entries. Directories from before M8 have no format record and are
 //!   refused: misreading an old WAL as format 2 would look like a torn tail,
-//!   and truncating it would silently lose data.
+//!   and truncating it would silently lose data. Format 3 (M13) added batch
+//!   records to the WAL. A format-2 database is upgraded on open by appending
+//!   `Format(3)`; a format-2 build then refuses the directory (it accepts no
+//!   format record but the first), instead of misreading a batch record as a
+//!   torn tail and cutting it off.
 //! - Replaying every edit in order rebuilds the current `Version`.
 //! - `SetLogNumber(n)`: WALs numbered below `n` are already in tables, so
 //!   they're obsolete; WALs numbered `n` and above are live and get replayed.
@@ -43,8 +47,10 @@ const TAG_FORMAT: u8 = 4;
 const TAG_SET_LAST_SEQUENCE: u8 = 5;
 const TAG_ADD_TABLE_BASE: u8 = 0x10;
 
-/// The on-disk format this build reads and writes.
-pub const FORMAT_VERSION: u64 = 2;
+/// The on-disk format this build writes. It also reads (and upgrades)
+/// everything from `OLDEST_FORMAT` on.
+pub const FORMAT_VERSION: u64 = 3;
+pub const OLDEST_FORMAT: u64 = 2;
 
 /// Levels 0..MAX_LEVELS. Level MAX_LEVELS - 1 is the bottom.
 pub const MAX_LEVELS: usize = 7;
@@ -58,7 +64,8 @@ pub enum Edit {
     RemoveTable(u64),
     SetLogNumber(u64),
     SetLastSequence(u64),
-    /// Written once, first, by `Manifest::open` on a fresh database.
+    /// Written first by `Manifest::open` on a fresh database, and again
+    /// (with a higher number) when it upgrades an older one.
     Format(u64),
 }
 
@@ -71,6 +78,8 @@ pub struct Version {
     pub log_number: u64,
     /// Every write numbered at or below this is in a table.
     pub last_sequence: u64,
+    /// The on-disk format, from the newest `Format` record.
+    pub format: u64,
 }
 
 impl Version {
@@ -112,11 +121,15 @@ impl Version {
                 self.last_sequence = n;
             }
             Edit::Format(v) => {
-                if v != FORMAT_VERSION {
+                if !(OLDEST_FORMAT..=FORMAT_VERSION).contains(&v) {
                     return Err(format!(
-                        "format {v}, but this build reads format {FORMAT_VERSION} only"
+                        "format {v}, but this build reads formats {OLDEST_FORMAT} to {FORMAT_VERSION}"
                     ));
                 }
+                if v <= self.format {
+                    return Err(format!("format went from {} to {v}", self.format));
+                }
+                self.format = v;
             }
         }
         Ok(())
@@ -140,7 +153,7 @@ impl Manifest {
             Err(e) => return Err(e.into()),
         };
 
-        let (version, valid_len) = replay(&buf)?;
+        let (mut version, valid_len) = replay(&buf)?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         if valid_len < buf.len() as u64 {
             // Cut the torn tail so new edits aren't appended after garbage.
@@ -156,6 +169,12 @@ impl Manifest {
             // way nothing was ever committed, so start the history now.
             manifest.append(&[Edit::Format(FORMAT_VERSION)])?;
             sync_dir(dir)?;
+            version.format = FORMAT_VERSION;
+        } else if version.format < FORMAT_VERSION {
+            // Upgrade before anything new is written: from here on, an
+            // older build refuses this directory.
+            manifest.append(&[Edit::Format(FORMAT_VERSION)])?;
+            version.format = FORMAT_VERSION;
         }
         Ok((manifest, version))
     }
@@ -229,15 +248,12 @@ fn replay(buf: &[u8]) -> Result<(Version, u64)> {
         let rest = &buf[pos..];
         match decode(&rest[..RECORD_LEN]) {
             Some(edit) => {
-                let is_format = matches!(edit, Edit::Format(_));
-                if (pos == 0) != is_format {
-                    return Err(Error::Corruption(if pos == 0 {
+                if pos == 0 && !matches!(edit, Edit::Format(_)) {
+                    return Err(Error::Corruption(
                         "manifest has no format record: written by lsmkv before M8 \
                          (format 1), which this build can't read"
-                            .into()
-                    } else {
-                        format!("manifest offset {pos}: format record after the first")
-                    }));
+                            .into(),
+                    ));
                 }
                 version
                     .apply(edit)
@@ -274,15 +290,23 @@ mod tests {
         v.tables.keys().copied().collect()
     }
 
+    /// A new database's version: nothing live yet, current format.
+    fn fresh() -> Version {
+        Version {
+            format: FORMAT_VERSION,
+            ..Version::default()
+        }
+    }
+
     #[test]
     fn fresh_manifest_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let (_, v) = Manifest::open(dir.path()).unwrap();
-        assert_eq!(v, Version::default());
+        assert_eq!(v, fresh());
         let bytes = fs::read(dir.path().join(MANIFEST_FILE)).unwrap();
         assert_eq!(decode(&bytes), Some(Edit::Format(FORMAT_VERSION)));
         assert_eq!(bytes.len(), RECORD_LEN);
-        assert_eq!(reopen(dir.path()), Version::default());
+        assert_eq!(reopen(dir.path()), fresh());
     }
 
     #[test]
@@ -300,7 +324,7 @@ mod tests {
     fn empty_manifest_from_a_crash_at_creation_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(MANIFEST_FILE), b"").unwrap();
-        assert_eq!(reopen(dir.path()), Version::default());
+        assert_eq!(reopen(dir.path()), fresh());
         // ...and it now has its format record.
         let (mut m, _) = Manifest::open(dir.path()).unwrap();
         m.append(&[add(1)]).unwrap();
@@ -406,6 +430,35 @@ mod tests {
                 "{edits:?}"
             );
         }
+    }
+
+    #[test]
+    fn format_2_is_upgraded_and_newer_formats_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MANIFEST");
+        // A format-2 manifest, as M8–M12 wrote it.
+        let mut old = Vec::new();
+        encode(Edit::Format(2), &mut old);
+        encode(add(7), &mut old);
+        fs::write(&path, &old).unwrap();
+
+        let (_, v) = Manifest::open(dir.path()).unwrap();
+        assert_eq!((v.format, v.tables.len()), (FORMAT_VERSION, 1));
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..old.len()], &old[..], "history kept");
+        assert_eq!(decode(&bytes[old.len()..]), Some(Edit::Format(3)));
+        // Reopening doesn't upgrade again.
+        Manifest::open(dir.path()).unwrap();
+        assert_eq!(fs::read(&path).unwrap().len(), bytes.len());
+
+        // A format this build doesn't know is refused.
+        let mut newer = Vec::new();
+        encode(Edit::Format(FORMAT_VERSION + 1), &mut newer);
+        fs::write(&path, &newer).unwrap();
+        assert!(matches!(
+            Manifest::open(dir.path()),
+            Err(Error::Corruption(_))
+        ));
     }
 
     #[test]
