@@ -47,6 +47,7 @@ Later milestones changed some early decisions; those entries say so, and point a
 | D24 | Benchmark methodology vs RocksDB | M11 |
 | D25 | Atomic write batches: one WAL record each; format 3 | M13 |
 | D26 | Optimistic transactions: snapshot isolation, first committer wins | M13 |
+| D27 | Redis-protocol server: RESP2, thread per connection | M14 |
 
 ## Decisions
 
@@ -536,6 +537,25 @@ Tier 3, approved together with M14 and M15 in one "go".
 - **Verified by:** the tests named above, plus the crash harness (1 in 5 operations is a 2–4 key batch, and after every kill an in-flight batch must be entirely present or entirely absent) and the proptest model (batches, plus transactions with direct writes racing them that must conflict exactly when they share a key). **Mutation checks: 15 planted bugs, all caught:** same-group writes not counted, the conflict check skipping tables, refused entries logged or applied anyway, half a batch published to readers, a transaction ignoring its own writes, commit skipping the check, `>=` instead of `>`, batch operations replayed at one sequence number, a batch logged as separate records, no format upgrade, any format accepted, a malformed payload accepted, and two for `get_for_update`.
 - **Limits:** a transaction's `get` reads its snapshot plus its own writes, but there's no transactional `scan` yet (it would merge the write buffer into a `DbIter`). Long transactions hold a snapshot, so compaction keeps old versions for them (D18).
 
+### D27: Redis-protocol server (approved 2026-10-05)
+- **What:** `lsmkv-server` (`src/bin/lsmkv-server.rs`) speaks RESP2, Redis's wire protocol, so `redis-cli`, `valkey-cli` and `redis-benchmark` work unchanged. The protocol is in `src/resp.rs` and the commands in `src/server.rs`; both are in the library, so tests run them in-process.
+- **Commands,** each mapped onto an engine feature:
+  - `GET SET DEL EXISTS PING ECHO`: plain reads and writes.
+  - `MSET`: one atomic batch (D25). `MGET`: all keys read at **one snapshot**, which is stronger than Redis promises.
+  - `INCR INCRBY DECR`: a transaction with retry on conflict (D26). 8 clients × 200 concurrent `INCR`s always total exactly 1,600.
+  - `MULTI`/`EXEC`/`DISCARD`: the queued commands run in one transaction. Reads inside see earlier queued writes. A malformed queued command makes `EXEC` fail with `EXECABORT`, as in Redis.
+  - `WATCH`: starts the transaction at `WATCH` time and `get_for_update`s the watched keys. If another client writes one before `EXEC`, the commit conflicts and `EXEC` returns a null array, nothing applied. That's Redis's optimistic locking on top of lsmkv's.
+  - `SCAN`/`KEYS`/`DBSIZE` (key iteration), `RANGE start end [LIMIT n]` (lsmkv's own: a range scan returning pairs), `INFO` (engine stats).
+- **One thread per connection,** with std's `TcpListener` only. The engine is already thread-safe (group commit for writes, lock-free reads), so connections share an `Arc<Db>`. Connections are capped at 1,024 so a flood can't create unbounded threads.
+  - **Rejected alternative: async (tokio).** It's a large dependency, and it wins with tens of thousands of mostly idle connections. Here the bottleneck is the engine, not thread count.
+- **Pipelining:** a connection reads whatever has arrived, answers every complete command in it, then writes all the replies with one `write`. A command cut across two reads is kept for the next one (the test sends 400 KB in one burst, and a mutant that dropped the tail was caught once the burst was big enough to span reads).
+- **Untrusted input:** argument counts, bulk lengths and line lengths have limits (1M arguments, 64 MiB values, 64 KiB lines), and nothing is allocated from a count before the bytes arrive (D4 again). A malformed request gets an error and the connection is closed, since there's no reliable way to find the next command. The parser is fuzzed: random bytes never panic, and pipelined commands cut at random points parse back exactly.
+- **Glob patterns** (`KEYS`, `SCAN MATCH`): the first version was the obvious recursion, which is exponential on `*a*a*a*…b`. One command could pin a thread; Redis itself had this bug. It's now an iterative match with one backtrack point, O(pattern × key) (`glob_has_no_exponential_case`).
+- **`SCAN` cursors** are the number of keys already returned, because `redis-cli --scan` parses cursors as integers. Each call rescans from the start: O(cursor). Encoding the last key in the cursor would fix that, but it isn't done.
+- **Security:** no AUTH and no TLS, so it binds to 127.0.0.1 by default.
+- **Durability:** the server opens the database in `Periodic(100ms)` by default (`--sync always` for fsync per write). A SIGKILL of the server loses nothing acknowledged, which was checked by hand: write, `kill -9`, restart, read.
+- **Verified by:** 7 socket-level integration tests (`tests/server.rs`), 4 protocol unit tests + 2 proptest fuzz properties, 2 glob tests. **Mutation checks: 11 planted bugs, all caught** (one only after the pipelining test was enlarged, see above).
+
 ## Not done
 
 These were scoped as Tier 3 (stretch) and not built:
@@ -543,6 +563,5 @@ These were scoped as Tier 3 (stretch) and not built:
 - **Serializable transactions:** M13's transactions are snapshot isolation (D26); preventing write skew needs read-set validation.
 - **Compression and prefix-compressed blocks:** blocks store full keys and are searched linearly.
 - **Trivial moves out of level 0** (RocksDB's 1.00 write amplification on sequential keys, D24), and more than one background thread.
-- **A network server** (RESP, so `redis-cli` could talk to it).
 - **Deterministic simulation testing** (a simulated disk and clock, to replay every interleaving and crash point from a seed), and power-loss testing with a fault-injecting filesystem (D22).
 - **Replication (Raft).**

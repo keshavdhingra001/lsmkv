@@ -24,7 +24,7 @@ Single source of truth for "where are we". Update at the end of every session.
 
 ### Tier 3: Stretch (owner approved M13–M15 on 2026-10-05)
 - [x] **M13** Atomic write batches + optimistic transactions (snapshot isolation, `get_for_update`) *(Claude; 15 mutants, all caught)*
-- [ ] **M14** Redis-protocol (RESP) server: `redis-cli` talks to lsmkv
+- [x] **M14** Redis-protocol (RESP) server: `redis-cli` talks to lsmkv *(Claude; `lsmkv-server`, 11 mutants all caught)*
 - [ ] **M15** Deterministic simulation + power-loss testing (simulated disk behind an `Fs` trait)
 Not planned: compression, column families, Raft.
 
@@ -204,6 +204,16 @@ Mistakes on the way: a non-terminating `shuffled` helper hung a benchmark for 44
 6. What is write skew? Give the on-call example, and say how `get_for_update` prevents it.
 7. Optimistic vs pessimistic concurrency control: when does each win, and why did lsmkv choose optimistic?
 8. The batch decoder aborted the process on `count = u32::MAX`. Why, and what's the general rule it broke?
+
+## M14 review questions (owner answers)
+1. What's RESP? Encode `SET k v` as a client sends it, and the reply.
+2. What is pipelining, and why must the server keep the bytes of a command that's cut off at the end of a read?
+3. Why thread-per-connection instead of async? At what point would you switch?
+4. How does `WATCH` + `MULTI` + `EXEC` map onto lsmkv's transactions? What does `EXEC` return when a watched key changed?
+5. Why does `INCR` need a transaction with a retry loop? What would two clients incrementing at once lose without one?
+6. Why is a recursive glob matcher a denial-of-service risk, and how does the iterative one avoid it?
+7. Why does the server bind to 127.0.0.1 by default? What's missing before it could face a network?
+8. `MGET` here reads all keys at one snapshot. Does Redis promise that? Why is it free in lsmkv?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed

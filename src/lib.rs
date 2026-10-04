@@ -17,6 +17,8 @@ mod fsutil;
 pub mod key;
 pub mod manifest;
 pub mod memtable;
+pub mod resp;
+pub mod server;
 pub mod sstable;
 #[cfg(test)]
 mod test_util;
