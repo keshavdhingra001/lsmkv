@@ -2708,6 +2708,8 @@ mod tests {
         assert!(db.stats().compaction_bytes > 0, "{:?}", db.stats());
     }
 
+    type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+
     /// Random writes, snapshots taken and dropped, flushes and compactions;
     /// every live snapshot is checked against a copy of the model taken with it.
     #[test]
@@ -2722,7 +2724,8 @@ mod tests {
             };
             let db = Db::open_with(dir.path(), opts).unwrap();
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-            let mut snaps: Vec<(Snapshot, BTreeMap<Vec<u8>, Vec<u8>>)> = Vec::new();
+            // Each live snapshot, with the model as it was when it was taken.
+            let mut snaps: Vec<(Snapshot, Model)> = Vec::new();
             for step in 0..3000 {
                 let k = rng.key();
                 match rng.below(100) {
