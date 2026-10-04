@@ -349,3 +349,60 @@ The owner approved the whole proposal ("go"). Each entry is filled in as its sec
 - **The writer is 2–9x faster with readers running.** In M7 it competed with every reader for the state lock, and 8 readers cut it to 21k writes/s.
 - **The remaining write max (20–41 ms)** is the memtable switch (a new WAL, a directory fsync and the old WAL's fsync, under the state lock) plus level-0 stop stalls when the writer outruns compaction. In M7 it was a full inline flush, up to 130 ms.
 
+
+### M9: Range scans, approved 2026-10-04 (D19–D21)
+The owner approved the combined M9–M12 proposal in one "go".
+
+### D19: The scan API (approved 2026-10-04)
+- **What:** `db.scan(range)` and `snapshot.scan(range)` return a `DbIter`, an `Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>` of live keys in key order. `db.iter()` / `snapshot.iter()` scan everything. The range is any `RangeBounds<K>` with `K: AsRef<[u8]>`, so `db.scan("user:".."user;")`, byte-slice ranges and `Vec<u8>` ranges all work.
+  - A first attempt took `impl RangeBounds<[u8]>`. It compiled, but `&b"a"[..]..&b"m"[..]` didn't: std implements `RangeBounds<T> for Range<&T>` only for sized `T`. The generic `K` fixes that. A bare `..` can't infer `K`, hence `iter()`.
+- **Forward only.** Reverse iteration needs `prev` on every source (blocks would need restart points to walk backwards cheaply, the merge a max-heap mode). It's on the Tier 3 list.
+- **Owned items:** each pair is copied out. A borrowing iterator (`&[u8]` valid until the next call) saves a copy per key, but it's a lending iterator, which Rust's `Iterator` can't express.
+- **One point in time:** a scan reads at `last_seq` as of the call, so it sees every write acknowledged before it and none after, however long it runs. Snapshot isolation comes for free, because the scan holds an immutable SuperVersion (D21).
+- **Errors:** an I/O error or a bad checksum comes out as one `Err` item, and then the scan ends.
+
+### D20: Merging iterator and streaming sources (approved 2026-10-04)
+- **The merge:** a binary min-heap holding each source's next entry, in internal key order (key ascending, seq descending). `next` pops the smallest and refills from the same source: O(log k) per entry, with one entry per source in memory.
+- **Sources** (`SuperVersion::scan_sources`):
+  - the memtable and the immutable memtable;
+  - each level-0 table on its own (they overlap);
+  - one `LevelIter` per deeper level. A level's tables don't overlap and are sorted, so it reads them one after another and opens each table's iterator only when it gets there.
+  - Tables whose key range misses the scan are left out, so a narrow scan reads only the tables it needs.
+- **On top, `DbIter`** turns versions into answers: it skips versions above the snapshot, takes the first visible version of each key (the newest one, by the merge order), skips the key's older versions, and hides the key if that version is a tombstone. That's `get`'s rule, applied to a stream.
+- **Table iterator:** one block in memory at a time. A seek is the same index binary search `get` uses, then a walk within the block. Scan blocks come from the cache if they're there, but a scan never *adds* blocks to the cache: a full scan would flush out every hot block point reads use (the same reason compaction skipped the cache in D10). RocksDB makes this a per-read option (`fill_cache`).
+- **Memtable iterator:** a crossbeam `SkipMap` iterator borrows the map, so an iterator that owns its `Arc<MemTable>` can't also hold one without `unsafe` (a self-referential struct). Instead, it searches again from just past the last version it copied and copies the next 64: one O(log n) search per 64 entries. Versions written after the scan started may or may not show up in the copy, but they're above the snapshot, so `DbIter` skips them either way.
+- **Compaction uses the same merge.** It used to collect every input into a `BTreeMap`, so `compact_all` held the whole bottom level in memory. Now it streams with one block per input in memory.
+  - Measured (`examples/scan.rs`, 1M keys, `compact_all` rewriting 129 MiB of tables): **peak RSS 24 MiB, down from 265 MiB**, and 1.52 s instead of 2.00 s. The old number was measured by running the same example against the section 2 commit.
+
+### D21: What an open scan holds (approved 2026-10-04)
+- **No snapshot registration.** The handover notes said an open iterator must pin its sequence number like a `Snapshot`, or compaction could drop versions it's about to read. It doesn't need to:
+  - the scan holds `Arc`s of the memtables and of every table it might read (the SuperVersion as of its start);
+  - none of those ever change (D12: flush and compaction build new ones);
+  - a table file that compaction deletes stays readable through the descriptor the scan's reader holds open (POSIX).
+  - So everything the scan can see stays where it was. RocksDB iterators work the same way: they pin a SuperVersion (files), not a sequence number.
+- **`Snapshot::scan`** reads the *current* SuperVersion at the snapshot's number, like `Snapshot::get`. That works because the registered snapshot makes compaction keep its versions. Once the scan starts, it holds its own SuperVersion, so dropping the snapshot mid-scan is fine too.
+- **The cost:** an open scan holds deleted files' disk space and old memtables' memory until it's dropped, so don't keep scans open for a long time. RocksDB's docs give the same warning.
+- **`DbIter` borrows nothing**, so it's `'static + Send` and can outlive the `Db` handle.
+- **Verified by:**
+  - `iter_from_every_start_matches_entries` (every start key, between keys, before and after all, with a key's versions split across two blocks) and `iter_from_matches_the_map_across_batches` (refill edges inside one key's versions);
+  - `iter_from_sees_every_older_version_while_a_writer_inserts` (the memtable iterator under a concurrent writer);
+  - `scan_merges_every_source_and_honors_bounds`: every bound type, a deleted start key, empty ranges and start > end, with data in L1+, L0 and the memtable;
+  - `scan_is_one_point_in_time` and `scan_keeps_reading_tables_compaction_deleted`: a scan started before overwrites, deletes and `compact_all` (which deletes the files it's reading) still returns the old data;
+  - `scan_reads_the_immutable_memtable_during_a_flush`: staged, with the flush held in place by the test-only slow-disk hook;
+  - `concurrent_scans_see_a_prefix_of_ordered_writes`: 3 scanners against a writer adding `k0000`, `k0001`, ... through flushes and compactions; a scan must never see a key without every earlier one;
+  - `narrow_scan_skips_tables_outside_its_range`: every other table's block 0 damaged on disk, and a scan of one table's range still succeeds;
+  - `randomized_scans_match_a_model`: 10 seeds × 3,000 steps, scans with random bounds, now or at a random live snapshot.
+  - **Mutation checks:** 20 planted bugs. 19 caught, 1 equivalent:
+    - The equivalent one: removing the table iterator's "stop after an error". `load` clears the block before reading the next one, so a failed read already ends the iteration; the explicit stop only matters for a malformed entry inside a block whose checksum passed (a writer bug).
+    - "Ordering only by user key, then source" was caught only by the `MergeIter` unit test. In the database, sources are listed newest first, so source order happens to match seq order. The seq comparison doesn't depend on that, and the unit test pins it down.
+    - "Open every table regardless of range" survived at first. The test damaged the middle of each table, but a scan that steps into the next table only reads its block 0 before seeing it's past the end. It now damages block 0.
+
+### M9 results
+`cargo run --release --example scan` (1M keys of 16 B with 100 B values, after `compact_all`; one run):
+
+| operation | rate |
+|---|---:|
+| full scan | 5.8M keys/s |
+| short scans (seek + 100 keys) | 76k seeks/s (7.6M keys/s) |
+| point gets (for comparison) | 400k/s |
+| `compact_all` over 129 MiB | 1.52 s, peak RSS 24 MiB (was 2.00 s and 265 MiB with the `BTreeMap` merge) |

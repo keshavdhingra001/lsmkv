@@ -17,7 +17,7 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M6** Bloom filters per SSTable + LRU block cache *(Claude; 97/97 tests incl. measured filter/cache wins; owner review pending)*
 - [x] **M7** Durability modes: per-write fsync / group commit / periodic; measure each *(Claude; 109 unit tests + kill -9 test + benchmark; owner review pending)*
 - [x] **M8** Concurrency: snapshot reads that never block the writer *(Claude; 129 unit tests + kill -9 test + before/after benchmark vs M7; owner review pending)*
-- [ ] **M9** Range scans: merging iterator across memtable + levels
+- [x] **M9** Range scans: merging iterator across memtable + levels *(Claude; 145 unit tests; 20 mutants, 19 caught + 1 equivalent; owner review pending)*
 - [ ] **M10** Crash-injection harness (random kill -9, verify no acked write lost) + model-based fuzz test
 - [ ] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB
 - [ ] **M12** DESIGN.md complete, README with results
@@ -133,6 +133,12 @@ Found along the way: a `stats()` self-deadlock (two guards in one struct literal
 Mutation-checked: 38 planted bugs, all caught in the end (two survived at first and got new tests; see D14–D18).
 Semantics changed: any background failure poisons (M4's "retryable before commit" is gone), and pre-M8 data directories are refused (format 2).
 
+**2026-10-04: M9 done.** The owner approved the combined M9–M12 proposal in one "go". Built in 3 sections: (1) streaming table iterator + memtable range iterator; (2) `MergeIter` (heap k-way merge), `DbIter`, `Db::scan`/`iter`, `Snapshot::scan`/`iter`, REPL `scan`/`sscan`; (3) compaction switched to the streaming merge.
+Measured: compaction peak RSS 265 MiB → 24 MiB over a 129 MiB rewrite; full scan 5.8M keys/s, seek + 100 keys 76k/s.
+Corrected the handover note: an open scan does NOT need to register a snapshot (it holds an immutable SuperVersion; see D21).
+Found along the way: `impl RangeBounds<[u8]>` doesn't accept `&[u8]` ranges (std's impl needs sized T), so the API takes `RangeBounds<K: AsRef<[u8]>>`; a mutation survivor showed the narrow-scan test damaged bytes the scan never reads.
+Environment: another session's `cargo add` held the shared package-cache lock for minutes, so the mutation runner now builds with `cargo test --no-run` before the timed run (a lock wait can't be scored as "caught").
+
 **Next step:**
 1. Owner works through the review questions (M1–M8, below).
 2. M9 (range scans) needs a design consult; see RESUME HERE.
@@ -202,6 +208,16 @@ Semantics changed: any background failure poisons (M4's "retryable before commit
 10. Why does a background failure poison the database instead of returning an error? What did that change from M4?
 11. Per-writer condition variables cut context switches 20–30% but left throughput flat. What is the bottleneck, and how does RocksDB attack it?
 12. Why did `stats()` deadlock when it called `lock(&self.view)` twice inside one struct literal?
+
+## M9 review questions (owner answers)
+1. Walk through `db.scan("b".."d")` with "b" in an L0 table, a newer "b" in the memtable, and a tombstone for "c" in L2 over a "c" in L3. Which sources exist, what does the heap pop in order, and what does `DbIter` return?
+2. Why does each level-0 table get its own source, while a whole deeper level is one `LevelIter`?
+3. An open scan holds no snapshot registration. Why can't compaction drop a version it's about to read? What does it cost to keep a scan open for an hour?
+4. Why does the memtable iterator copy 64 entries at a time instead of holding a skiplist iterator? What happens to a write that lands between two refills?
+5. Why do scans read from the block cache but never add to it? What would a full scan do to `get`'s hit rate otherwise?
+6. Compaction's peak memory went from 265 MiB to 24 MiB. What was holding the memory before, and what bounds it now?
+7. `DbIter` skips versions with `seq > snapshot` *without* marking the key as done. Why would marking it done be a bug?
+8. Why can't `DbIter` be a lending iterator handing out `&[u8]`, and what does the owned version cost?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed

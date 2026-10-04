@@ -3051,18 +3051,17 @@ mod tests {
         let (current, _) = read_view(&db);
         let level = current.levels.iter().rfind(|l| !l.is_empty()).unwrap();
         assert!(level.len() > 4, "{} tables", level.len());
-        // Damage every table except the first, mid-file: past block 0, which
-        // open already read.
-        let mut damaged = 0;
-        for t in level[1..].iter().filter(|t| t.reader.block_count() >= 3) {
-            damaged += 1;
+        // Damage block 0 of every table except the first. Open already read
+        // it (for the smallest key) but kept nothing, and the cache is off,
+        // so any scan that opens one of these tables reads the bad bytes.
+        // (Damage further in would go unnoticed by a scan that only opens
+        // the next table to peek at its first key.)
+        for t in &level[1..] {
             let path = table_path(dir.path(), t.id);
             let mut bytes = fs::read(&path).unwrap();
-            let mid = bytes.len() / 2;
-            bytes[mid] ^= 0xff;
+            bytes[20] ^= 0xff;
             fs::write(&path, &bytes).unwrap();
         }
-        assert!(damaged >= 3, "{damaged} tables damaged");
         let first = &level[0];
         let (lo, hi) = (first.smallest().to_vec(), first.largest().to_vec());
         let got = collect(db.scan(&lo[..]..=&hi[..]).unwrap());
