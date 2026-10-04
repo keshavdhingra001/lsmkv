@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::memtable::Entry;
+use crate::test_util::Rng;
 use std::path::{Path, PathBuf};
 
 fn val(s: &str) -> Entry {
@@ -291,41 +292,11 @@ fn non_sstable_files_are_rejected() {
     }
 }
 
-/// xorshift64: tiny deterministic PRNG, so failures are reproducible by seed.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-
-    /// Short keys over a 4-letter alphabet: lots of shared prefixes, empty
-    /// keys and near-misses, which is where off-by-one bugs live.
-    fn key(&mut self) -> Vec<u8> {
-        let len = self.below(9);
-        (0..len).map(|_| b'a' + self.below(4) as u8).collect()
-    }
-
-    fn value(&mut self) -> Vec<u8> {
-        let len = self.below(65);
-        (0..len).map(|_| self.next() as u8).collect()
-    }
-}
-
 #[test]
 fn randomized_tables_match_a_btreemap() {
     let dir = tempfile::tempdir().unwrap();
     for seed in 1..=40u64 {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut rng = Rng::new(seed);
         let mut model = std::collections::BTreeMap::new();
         for _ in 0..rng.below(1500) {
             let e = if rng.below(5) == 0 {

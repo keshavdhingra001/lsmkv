@@ -1,7 +1,8 @@
 //! lsmkv: an LSM-tree key-value storage engine.
 //!
-//! Write path: `Db::put` -> WAL append + fsync -> memtable insert.
-//! Read path:  `Db::get` -> memtable (SSTables are wired in at M4).
+//! Write path: `Db::put` -> WAL append + fsync -> memtable insert
+//!             -> (memtable full) flush to a new SSTable + manifest edit.
+//! Read path:  `Db::get` -> memtable -> SSTables newest to oldest; first hit wins.
 
 mod codec;
 pub mod db;
@@ -10,7 +11,9 @@ mod fsutil;
 pub mod manifest;
 pub mod memtable;
 pub mod sstable;
+#[cfg(test)]
+mod test_util;
 pub mod wal;
 
-pub use db::Db;
+pub use db::{Db, Options, Stats};
 pub use error::{Error, Result};
