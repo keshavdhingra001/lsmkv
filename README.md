@@ -31,5 +31,6 @@ OK
 - **Memtable** (sorted) with tombstones.
 - **SSTables**: 4 KiB checksummed blocks, an in-memory block index, and a checksummed footer. Published atomically (tmp + fsync + rename + dir fsync).
 - **Flush and recovery**: the memtable flushes to an SSTable at 4 MiB. A manifest records live files, with a single commit point per flush. Crash leftovers are cleaned up on open.
+- **Leveled compaction**: L0 to L6 with a 10x size ratio, tombstones dropped only at the safe level, trivial moves, and write-amplification stats.
 - **Failure handling**: a failed WAL or manifest write makes the database read-only until it's reopened (the fsyncgate lesson).
-- **Tests**: 59, including crash injection at every flush step, every-byte corruption checks, and randomized operations checked against a `BTreeMap`.
+- **Tests**: 71, including crash injection at every flush and compaction step, mutation-checked, every-byte corruption checks, and randomized operations checked against a `BTreeMap`.

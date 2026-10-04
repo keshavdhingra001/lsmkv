@@ -10,10 +10,10 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M2** WAL: `append` / `replay`, CRC32 per record, torn-tail handling *(Claude; 18/18 tests + manual kill -9 recovery check; owner review pending)*
 - [x] **M3** SSTable writer + reader: data blocks, index block, footer *(Claude; 43/43 tests incl. corruption + randomized; owner review pending)*
 - [x] **M4** Flush memtable -> SSTable at size threshold; read path checks memtable then SSTables newest-first; manifest *(Claude; 59/59 tests incl. crash injection at every flush step; owner review pending)*
-- [ ] **Gate:** Tier 1 done -> make the GitHub repo public *(Tier 1 complete 2026-10-04; waiting for owner OK)*
+- [ ] **Gate:** Tier 1 done -> make the GitHub repo public *(Tier 1 complete 2026-10-04; owner said not yet)*
 
 ### Tier 2: Strong (target)
-- [ ] **M5** Compaction (decide: leveled vs size-tiered), drop tombstones safely
+- [x] **M5** Compaction: leveled, tombstones dropped safely *(Claude; 71/71 tests incl. compaction crash injection; owner review pending)*
 - [ ] **M6** Bloom filters per SSTable + LRU block cache
 - [ ] **M7** Durability modes: per-write fsync / group commit / periodic; measure each
 - [ ] **M8** Concurrency: snapshot reads that never block the writer
@@ -32,14 +32,13 @@ MVCC, atomic batches, RESP server, compression, deterministic simulation testing
 **2026-10-04: Mode switched.** Claude now writes each milestone; owner studies and answers questions before the next one (see CLAUDE.md).
 M1 done: 7/7 memtable tests pass, clippy clean. Rust 1.99.0 installed (via TUNA mirror; Fastly route from the hotspot is slow).
 
-**2026-10-04: M4 done. Tier 1 is complete.** Built in 3 sections: manifest, Db flush/recovery, crash tests + poisoning + REPL.
-59/59 tests, clippy clean. Mutation-checked: removing the poisoning and replaying only the newest log were both caught.
-Found and fixed while writing the crash tests: an fsync failure at the commit point could make later writes go to an obsolete WAL. The fix is poisoning (D7).
+**2026-10-04: M5 done.** Built in 4 sections: manifest levels + table key ranges, level read path, compaction, crash tests + REPL.
+71/71 tests, clippy clean. Mutation-checked: always dropping tombstones, compacting only the newest L0 table, the oldest version winning the merge, and deleting inputs before the commit were all caught.
+The owner chose to keep the repo private for now (2026-10-04).
 
 **Next step:**
-1. Owner decides on making the repo public (the Tier 1 gate).
-2. Owner works through the review questions (M1-M4, below).
-3. M5 compaction needs a design consult: leveled vs size-tiered, when to trigger, and when tombstones can be dropped.
+1. Owner works through the review questions (M1-M5, below).
+2. M6 (bloom filters + block cache) needs a design consult: bits per key, filter granularity (per table vs per block), cache size and eviction.
 
 ## M1 review questions (owner answers)
 1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?
@@ -65,6 +64,14 @@ Found and fixed while writing the crash tests: an fsync failure at the commit po
 3. Why does `get` stop at the first tombstone instead of continuing to older tables?
 4. What is fsyncgate, and why does a failed manifest fsync *poison* the database instead of just returning an error?
 5. Why do logs and tables share one file-number counter?
+
+## M5 review questions (owner answers)
+1. Why does a level-0 compaction take ALL level-0 tables, while level n takes just one?
+2. A tombstone for "a" is being compacted into L2. When is it safe to drop, and what goes wrong if it's dropped too early?
+3. Leveled vs size-tiered: which has higher write amplification, which has worse reads, and why?
+4. What is a trivial move, and why is it safe?
+5. Compaction deletes its input files only after the manifest commit. What happens on reopen if it deleted them first and then crashed?
+6. Write amplification: what does `stats` report after a big write workload, and where do the extra bytes come from?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed

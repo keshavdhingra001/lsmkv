@@ -971,6 +971,44 @@ mod tests {
     }
 
     #[test]
+    fn crash_at_every_compaction_step_loses_nothing() {
+        for fp in [
+            "compact:after_tables",
+            "compact:manifest",
+            "compact:after_manifest",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+            // Let a few compactions succeed first, so deeper levels exist.
+            for i in 0..500 {
+                db.put(&key(i), &key(i)).unwrap();
+            }
+            assert!(db.stats().level_files[2] > 0, "{fp}: {:?}", db.stats());
+            let start = 500;
+            db.fail_at = Some(fp);
+            let mut n = start;
+            while db.put(&key(n), &key(n)).is_ok() {
+                n += 1;
+            }
+            let n = n + 1; // the failing put's WAL record is durable
+            drop(db);
+
+            let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+            assert_keys(&db, 0..n, fp);
+            assert_no_orphans(dir.path(), &db, fp);
+
+            for i in n..n + 1000 {
+                db.put(&key(i), &key(i)).unwrap();
+            }
+            db.compact_all().unwrap();
+            drop(db);
+            let db = Db::open_with(dir.path(), tiny()).unwrap();
+            assert_keys(&db, 0..n + 1000, &format!("{fp}, after more writes"));
+            assert_no_orphans(dir.path(), &db, fp);
+        }
+    }
+
+    #[test]
     fn failure_before_commit_is_retryable_without_reopen() {
         for fp in ["flush:after_table", "flush:after_new_log"] {
             let dir = tempfile::tempdir().unwrap();
