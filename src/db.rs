@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
-use crate::manifest::{Edit, Manifest, Version};
+use crate::manifest::{Edit, Manifest, Version, MAX_LEVELS};
 use crate::memtable::{Entry, MemTable};
 use crate::sstable::{SstReader, SstWriter};
 use crate::wal::{Record, Wal};
@@ -38,8 +38,29 @@ impl Default for Options {
 pub struct Stats {
     pub memtable_entries: usize,
     pub memtable_bytes: usize,
+    /// Total live tables across all levels.
     pub tables: usize,
+    /// Tables per level, index = level.
+    pub level_files: Vec<usize>,
+    /// Bytes per level, index = level.
+    pub level_bytes: Vec<u64>,
     pub log_number: u64,
+}
+
+/// A live table: its file number plus an open reader.
+struct Table {
+    id: u64,
+    reader: SstReader,
+}
+
+impl Table {
+    fn smallest(&self) -> &[u8] {
+        self.reader.smallest_key().unwrap_or_default()
+    }
+
+    fn largest(&self) -> &[u8] {
+        self.reader.largest_key().unwrap_or_default()
+    }
 }
 
 pub struct Db {
@@ -50,8 +71,9 @@ pub struct Db {
     wal_number: u64,
     manifest: Manifest,
     version: Version,
-    /// Readers for live tables, newest first (the order reads check them in).
-    tables: Vec<SstReader>,
+    /// Live tables by level. Level 0: newest first, ranges may overlap.
+    /// Levels 1+: sorted by key, ranges never overlap.
+    levels: Vec<Vec<Table>>,
     /// Next unused file number, for both logs and tables.
     next_file: u64,
     /// Set after a WAL or manifest write fails; see `Error::Poisoned`.
@@ -93,12 +115,7 @@ impl Db {
             .max()
             .unwrap_or(0);
 
-        let tables = version
-            .tables
-            .keys()
-            .rev()
-            .map(|&id| open_table(&dir, id))
-            .collect::<Result<Vec<_>>>()?;
+        let levels = open_levels(&dir, &version)?;
 
         let mut memtable = MemTable::new();
         for (i, &n) in live_logs.iter().enumerate() {
@@ -141,7 +158,7 @@ impl Db {
             wal_number,
             manifest,
             version,
-            tables,
+            levels,
             next_file,
             poisoned: None,
             #[cfg(test)]
@@ -163,16 +180,21 @@ impl Db {
         self.write(Record::Delete { key: key.to_vec() })
     }
 
-    /// Memtable first, then tables newest to oldest. The first hit wins, and
-    /// a tombstone hit means "deleted": older tables are not consulted.
+    /// Newest data first: memtable, then every level-0 table (newest first),
+    /// then at most one table per deeper level. The first hit wins, and a
+    /// tombstone hit means "deleted": older data is not consulted.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.memtable.get(key) {
             Some(Entry::Value(v)) => return Ok(Some(v.clone())),
             Some(Entry::Tombstone) => return Ok(None),
             None => {}
         }
-        for table in &self.tables {
-            match table.get(key)? {
+        let level0 = self.levels[0].iter();
+        let deeper = self.levels[1..]
+            .iter()
+            .filter_map(|level| table_for_key(level, key));
+        for table in level0.chain(deeper) {
+            match table.reader.get(key)? {
                 Some(Entry::Value(v)) => return Ok(Some(v)),
                 Some(Entry::Tombstone) => return Ok(None),
                 None => {}
@@ -240,7 +262,13 @@ impl Db {
             self.version.apply(edit).map_err(Error::Corruption)?;
         }
 
-        self.tables.insert(0, reader);
+        self.levels[0].insert(
+            0,
+            Table {
+                id: table_id,
+                reader,
+            },
+        );
         self.memtable = MemTable::new();
         self.wal = new_wal;
         self.wal_number = log_id;
@@ -252,7 +280,13 @@ impl Db {
         Stats {
             memtable_entries: self.memtable.len(),
             memtable_bytes: self.memtable.approx_size(),
-            tables: self.tables.len(),
+            tables: self.levels.iter().map(Vec::len).sum(),
+            level_files: self.levels.iter().map(Vec::len).collect(),
+            level_bytes: self
+                .levels
+                .iter()
+                .map(|l| l.iter().map(|t| t.reader.file_size()).sum())
+                .collect(),
             log_number: self.wal_number,
         }
     }
@@ -318,6 +352,41 @@ fn log_path(dir: &Path, n: u64) -> PathBuf {
 
 fn table_path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("{id:06}.sst"))
+}
+
+/// In a level >= 1 (sorted, non-overlapping), the only table that can hold `key`.
+fn table_for_key<'a>(level: &'a [Table], key: &[u8]) -> Option<&'a Table> {
+    let i = level.partition_point(|t| t.largest() < key);
+    level.get(i).filter(|t| t.smallest() <= key)
+}
+
+/// Opens every live table and arranges them by level, checking that levels
+/// 1+ are non-overlapping (the invariant `table_for_key` relies on).
+fn open_levels(dir: &Path, version: &Version) -> Result<Vec<Vec<Table>>> {
+    let mut levels: Vec<Vec<Table>> = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
+    for (&id, &level) in &version.tables {
+        let reader = open_table(dir, id)?;
+        levels[level as usize].push(Table { id, reader });
+    }
+    levels[0].sort_by_key(|t| std::cmp::Reverse(t.id));
+    for (n, level) in levels.iter_mut().enumerate().skip(1) {
+        if let Some(t) = level.iter().find(|t| t.reader.entry_count() == 0) {
+            return Err(Error::Corruption(format!(
+                "table {} at level {n} is empty",
+                t.id
+            )));
+        }
+        level.sort_by(|a, b| a.smallest().cmp(b.smallest()));
+        for pair in level.windows(2) {
+            if pair[0].largest() >= pair[1].smallest() {
+                return Err(Error::Corruption(format!(
+                    "tables {} and {} overlap at level {n}",
+                    pair[0].id, pair[1].id
+                )));
+            }
+        }
+    }
+    Ok(levels)
 }
 
 fn open_table(dir: &Path, id: u64) -> Result<SstReader> {
@@ -576,6 +645,73 @@ mod tests {
         fs::remove_file(dir.path().join("000002.sst")).unwrap();
         match Db::open(dir.path()) {
             Err(Error::Corruption(msg)) => assert!(msg.contains("000002.sst"), "{msg}"),
+            other => panic!("expected Corruption, got {:?}", other.err()),
+        }
+    }
+
+    /// Writes a table file directly and registers it at `level`, bypassing
+    /// flush/compaction, so tests can set up exact level layouts.
+    fn place_table(dir: &Path, id: u64, level: u8, entries: &[(&str, Option<&str>)]) {
+        let mut w = SstWriter::create(&table_path(dir, id)).unwrap();
+        for (k, v) in entries {
+            let e = match v {
+                Some(v) => Entry::Value(v.as_bytes().to_vec()),
+                None => Entry::Tombstone,
+            };
+            w.add(k.as_bytes(), &e).unwrap();
+        }
+        w.finish().unwrap();
+        let (mut m, _) = Manifest::open(dir).unwrap();
+        m.append(&[Edit::AddTable { id, level }]).unwrap();
+    }
+
+    #[test]
+    fn reads_walk_levels_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        // Oldest data at the bottom; each level up overrides some keys.
+        place_table(
+            d,
+            10,
+            3,
+            &[
+                ("a", Some("L3")),
+                ("b", Some("L3")),
+                ("c", Some("L3")),
+                ("z", Some("L3")),
+            ],
+        );
+        place_table(d, 11, 2, &[("b", Some("L2")), ("d", Some("L2"))]);
+        place_table(d, 12, 2, &[("m", None), ("n", Some("L2"))]);
+        place_table(d, 13, 1, &[("c", None), ("m", Some("L1"))]);
+        place_table(d, 14, 0, &[("a", Some("L0-old")), ("d", Some("L0-old"))]);
+        place_table(d, 15, 0, &[("a", Some("L0-new"))]);
+
+        let mut db = Db::open(d).unwrap();
+        db.put(b"z", b"mem").unwrap();
+        let get = |db: &Db, k: &str| {
+            db.get(k.as_bytes())
+                .unwrap()
+                .map(|v| String::from_utf8(v).unwrap())
+        };
+        assert_eq!(get(&db, "a").as_deref(), Some("L0-new"), "newest L0 wins");
+        assert_eq!(get(&db, "b").as_deref(), Some("L2"), "L2 over L3");
+        assert_eq!(get(&db, "c"), None, "L1 tombstone hides L3");
+        assert_eq!(get(&db, "d").as_deref(), Some("L0-old"), "L0 over L2");
+        assert_eq!(get(&db, "m").as_deref(), Some("L1"), "L1 over L2 tombstone");
+        assert_eq!(get(&db, "n").as_deref(), Some("L2"));
+        assert_eq!(get(&db, "z").as_deref(), Some("mem"), "memtable over all");
+        assert_eq!(get(&db, "e"), None);
+        assert_eq!(db.stats().level_files, vec![2, 1, 2, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn overlapping_tables_in_a_deep_level_are_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        place_table(dir.path(), 10, 1, &[("a", Some("1")), ("m", Some("1"))]);
+        place_table(dir.path(), 11, 1, &[("k", Some("2")), ("z", Some("2"))]);
+        match Db::open(dir.path()) {
+            Err(Error::Corruption(msg)) => assert!(msg.contains("overlap at level 1"), "{msg}"),
             other => panic!("expected Corruption, got {:?}", other.err()),
         }
     }

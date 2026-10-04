@@ -37,9 +37,15 @@ fn main() -> lsmkv::Result<()> {
             ["stats"] => {
                 let s = db.stats();
                 println!(
-                    "memtable: {} entries, ~{} bytes | tables: {} | log: {:06}.log",
-                    s.memtable_entries, s.memtable_bytes, s.tables, s.log_number
+                    "memtable: {} entries, ~{} bytes | log: {:06}.log",
+                    s.memtable_entries, s.memtable_bytes, s.log_number
                 );
+                for (level, (files, bytes)) in s.level_files.iter().zip(&s.level_bytes).enumerate()
+                {
+                    if *files > 0 {
+                        println!("  L{level}: {files} tables, {bytes} bytes");
+                    }
+                }
             }
             ["quit"] | ["exit"] => break,
             [""] => {}
