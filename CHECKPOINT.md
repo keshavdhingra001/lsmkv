@@ -18,7 +18,7 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M7** Durability modes: per-write fsync / group commit / periodic; measure each *(Claude; 109 unit tests + kill -9 test + benchmark; owner review pending)*
 - [x] **M8** Concurrency: snapshot reads that never block the writer *(Claude; 129 unit tests + kill -9 test + before/after benchmark vs M7; owner review pending)*
 - [x] **M9** Range scans: merging iterator across memtable + levels *(Claude; 145 unit tests; 20 mutants, 19 caught + 1 equivalent; owner review pending)*
-- [ ] **M10** Crash-injection harness (random kill -9, verify no acked write lost) + model-based fuzz test
+- [x] **M10** Crash-injection harness (random kill -9, verify no acked write lost) + model-based fuzz test *(Claude; 300-round soak: 1.02M acked ops, none lost; 5,000 fuzz cases; harness and fuzzer each mutation-checked; owner review pending)*
 - [ ] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB
 - [ ] **M12** DESIGN.md complete, README with results
 
@@ -139,6 +139,11 @@ Corrected the handover note: an open scan does NOT need to register a snapshot (
 Found along the way: `impl RangeBounds<[u8]>` doesn't accept `&[u8]` ranges (std's impl needs sized T), so the API takes `RangeBounds<K: AsRef<[u8]>>`; a mutation survivor showed the narrow-scan test damaged bytes the scan never reads.
 Environment: another session's `cargo add` held the shared package-cache lock for minutes, so the mutation runner now builds with `cargo test --no-run` before the timed run (a lock wait can't be scored as "caught").
 
+**2026-10-04: M10 done.** `tests/kill9.rs` rewritten as a multi-round crash harness (one directory, random kill times, both sync modes, an exact checker, the child self-checking with scans). `tests/model.rs`: a proptest model test over every public operation, including reopen. proptest is the only new dependency (dev only).
+Measured: a 300-round soak checked 1,022,073 acknowledged operations with none lost; 5,000 fuzz cases passed.
+Mutation-checked separately: the harness alone catches 3 of 5 crash-only bugs (the other 2 can't show under `kill -9` and are caught by unit tests); the fuzzer alone catches 7 of 7 planted bugs from earlier milestones after a gap it exposed (no snapshot `get`s) was fixed.
+Harness bug found: libtest's unterminated `test <name> ... ` line swallowed the child's first output line.
+
 **Next step:**
 1. Owner works through the review questions (M1–M8, below).
 2. M9 (range scans) needs a design consult; see RESUME HERE.
@@ -218,6 +223,15 @@ Environment: another session's `cargo add` held the shared package-cache lock fo
 6. Compaction's peak memory went from 265 MiB to 24 MiB. What was holding the memory before, and what bounds it now?
 7. `DbIter` skips versions with `seq > snapshot` *without* marking the key as done. Why would marking it done be a bug?
 8. Why can't `DbIter` be a lending iterator handing out `&[u8]`, and what does the owned version cost?
+
+## M10 review questions (owner answers)
+1. The crash checker allows each key either its last acknowledged value or the in-flight operation's result. Why can at most one operation per thread be in flight, and why does each value name the operation that wrote it?
+2. Why does every round reuse the same directory instead of a fresh one? Name a bug only that catches.
+3. `kill -9` couldn't catch a torn-tail bug. Why can't a process kill tear a WAL write, and what kind of failure can?
+4. What does proptest's shrinking give you that a seeded random loop doesn't? What does the regressions file do?
+5. Why do the fuzz test's keys come from 3 letters instead of random bytes?
+6. A planted bug survived the fuzzer until snapshot `get`s were added. What does that say about how much a model test can be trusted, and how did the mutation run expose it?
+7. How would you test power-loss durability for real? What would LazyFS or dm-log-writes let you check that `kill -9` can't?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed
