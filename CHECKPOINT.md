@@ -16,7 +16,7 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M5** Compaction: leveled, tombstones dropped safely *(Claude; 71/71 tests incl. compaction crash injection; owner review pending)*
 - [x] **M6** Bloom filters per SSTable + LRU block cache *(Claude; 97/97 tests incl. measured filter/cache wins; owner review pending)*
 - [x] **M7** Durability modes: per-write fsync / group commit / periodic; measure each *(Claude; 109 unit tests + kill -9 test + benchmark; owner review pending)*
-- [ ] **M8** Concurrency: snapshot reads that never block the writer
+- [x] **M8** Concurrency: snapshot reads that never block the writer *(Claude; 129 unit tests + kill -9 test + before/after benchmark vs M7; owner review pending)*
 - [ ] **M9** Range scans: merging iterator across memtable + levels
 - [ ] **M10** Crash-injection harness (random kill -9, verify no acked write lost) + model-based fuzz test
 - [ ] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB
@@ -25,34 +25,36 @@ Single source of truth for "where are we". Update at the end of every session.
 ### Tier 3: Stretch (pick 2–3 later)
 MVCC, atomic batches, RESP server, compression, deterministic simulation testing, Raft.
 
-## ▶ RESUME HERE (handover 2026-10-04, after M7)
+## ▶ RESUME HERE (handover 2026-10-04, after M8)
 
-**State:** M0–M7 are done. 109 unit tests + the kill -9 integration test pass, clippy clean, everything pushed to `main`
+**State:** M0–M8 are done. 129 unit tests + the kill -9 integration test pass, clippy clean, everything pushed to `main`
 at https://github.com/keshavdhingra001/lsmkv (private; owner said keep it private "not yet").
 
-**Progress:** 8 of 13 milestones (M0–M7). By effort it's about 55%: M8 is the biggest one left; M9–M11 are medium, M12 is small.
+**Progress:** 9 of 13 milestones (M0–M8). By effort, about 70%: M8 was the biggest; M9–M11 are medium, M12 is small.
 
 **Open with the owner (not blocking, but raise them):**
-- 40 review questions (M1–M7, below) are unanswered. CLAUDE.md says to answer them before the next milestone; the owner has said "go" each time anyway. Offer to quiz them.
+- 52 review questions (M1–M8, below) are unanswered. CLAUDE.md says to answer them before the next milestone; the owner has said "go" each time anyway. Offer to quiz them, M8 and M7 first.
 - The repo stays private until the owner says otherwise.
 
 **Commands:**
-- Everything: `cargo fmt && cargo clippy --all-targets && cargo test` (about 2 s; includes `tests/kill9.rs`).
-- Benchmark: `cargo run --release --example durability` (about 20 s; writes under `target/`).
-- REPL: `cargo run -- ./data`, then `stats` shows writes/groups/fsyncs, reads, cache and bloom counters.
+- Everything: `cargo fmt && cargo clippy --all-targets && cargo test` (about 4 s; includes `tests/kill9.rs`).
+- Benchmarks (release, on the real disk under `target/`):
+  - `cargo run --release --example concurrency`: readers + one writer (about 15 s).
+  - `cargo run --release --example durability -- [dir] [secs] [Always|Periodic] [threads]`: write modes (about 20 s for all rows).
+  - Before/after against an old commit: `git archive <commit> | tar -x -C target/old`, copy the example in, build with its own `CARGO_TARGET_DIR`. Both examples use only API that M7 had.
+- REPL: `cargo run -- ./data`. `stats` shows writes/groups/fsyncs, backpressure, snapshots, reads, cache and bloom counters; `snap` / `sget k` / `unsnap` try a snapshot.
 
-**Next action:** M8 (concurrency, the read side). It needs a design consult before any code. Propose these as a table with a recommendation, then wait for "go":
-- **Reads without the state lock:** today `get` holds the state lock for its whole lookup, including disk reads. RocksDB's "SuperVersion" approach: an `Arc` snapshot of (memtable, immutable memtables, table levels), grabbed under a brief lock, then read with no lock held.
-- **Immutable memtable + background flush:** swap a full memtable out instead of flushing inline, so writers don't stall (D11's max latency is 140–570 ms). Reads must then check the active memtable, then the immutable ones, then the tables.
-- **Background compaction thread**, plus L0 write slowdown/stop triggers (LevelDB: 8 / 12 files), since compaction can now fall behind.
-- **Memtable structure:** while it's being written it must be readable without the state lock: a concurrent skiplist (`crossbeam-skiplist`) vs a `BTreeMap` behind an `RwLock`.
-- **Snapshots (`db.snapshot()`, point-in-time reads):** these need sequence numbers inside keys, a format change to the memtable, WAL and SSTables (internal key = user key + seq + kind). Decide: do it in M8, or keep M8 to "reads never block writers" and push MVCC to Tier 3.
-- **Writer wakeups:** per-writer condition variables instead of `notify_all` (D11: `Periodic` throughput falls from 335k to 220k ops/s as threads go 1 to 16).
-- **Proof:** max write latency during flushes, and reader throughput under a concurrent write load, before and after.
+**Next action:** M9 (range scans). It needs a design consult before any code. Propose these as a table with a recommendation, then wait for "go":
+- **API:** `db.scan(range)` and `snapshot.scan(range)` returning an iterator of `(key, value)`. Forward only, or reverse too? Owned or borrowed results?
+- **Merging iterator:** a heap (k-way merge) over the memtable range, the immutable memtable, each L0 table, and one "level iterator" per deeper level (it walks that level's tables in order). Newest source wins per user key; hide versions above the snapshot, shadowed versions and tombstones.
+- **Streaming table iterator:** `SstReader::entries()` loads a whole table. Replace it with a block-at-a-time iterator (through the cache or not?), and decide whether compaction switches to the same streaming merge too: it currently builds a `BTreeMap` of all inputs, i.e. the whole bottom level in memory during `compact_all`.
+- **Lifetime:** the iterator holds an `Arc<SuperVersion>` (tables stay open, as for `get`) plus a snapshot number. Does an open iterator pin versions like a `Snapshot` (it must, or compaction could drop what it's about to read)?
+- **Skiplist range:** `crossbeam_skiplist::SkipMap::range` over internal keys.
+- **Proof:** a model-based randomized test (scans at random snapshots vs a `BTreeMap`), plus scan throughput.
 
 **Working agreement (see CLAUDE.md):** Claude writes each milestone in sections, tests it (including
 mutation checks that the tests can fail), commits `M<n>: ...` and pushes, explains it, and asks review questions.
-Consult the owner on design decisions before coding, and record them in DESIGN.md as D12+.
+Consult the owner on design decisions before coding, and record them in DESIGN.md as D19+.
 
 **Environment gotchas:**
 - Pushing over SSH from Claude's shell: `SSH_AUTH_SOCK=$(ls ~/.ssh/agent/s.* | head -1) git push`.
@@ -60,14 +62,19 @@ Consult the owner on design decisions before coding, and record them in DESIGN.m
 - Rust 1.99.0 is installed. If rustup is slow (the hotspot's route to the Fastly CDN), prefix the command with
   `RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup`. crates.io downloads work fine.
 - Mutation checks: a mutation can turn a test into an infinite loop. Run them under `timeout 120 cargo test`, and check for an abort (no "test result" line) as well as FAILED.
-- `/tmp` is tmpfs: fine for tests, but run benchmarks on the real disk (`target/bench-*`, the default for `examples/durability.rs`).
-- `ptrace` is restricted (gdb/eu-stack can't attach), so to find a hung test, look for libtest's "has been running for over 60 seconds".
+- **After restoring a mutated file, `touch` it.** A backup made before the mutant's build carries an older mtime, so cargo treats the restored source as unchanged and keeps running the *mutant* binary. In M8 this showed up as "every concurrent-writer test hangs" right after the D17 mutation run; the engine was fine. The scratchpad runner (`mutate.py`) now calls `os.utime` after each restore.
+- **A killed test leaves its tempdirs in `/tmp` (tmpfs).** A mutant that loops on flushing wrote 1.3 GB each and filled `/tmp` (7.7 GB) in M8. After killing tests, delete `/tmp/.tmp*` dirs that hold lsmkv files (a `MANIFEST`, `.log`, `.sst`); the scratchpad mutation runner now does this after every mutant.
+- **Aborting test binaries trigger Omarchy's crash notifier,** which opens a separate "diagnose-crash" Claude session per SIGABRT of `lsmkv-*`. During mutation runs those are expected; tell the owner they can close them.
+- `/tmp` is tmpfs: fine for tests, but run benchmarks on the real disk (`target/bench-*`, the default for both examples).
+- `ptrace` is restricted (gdb/eu-stack can't attach) and there's no `perf` or `/usr/bin/time`. To find a hung test, look for libtest's "has been running for over 60 seconds", or run tests one at a time under `timeout`. For context switches and CPU time, use Python's `resource.getrusage(RUSAGE_CHILDREN)` around a child process.
 - Don't `pkill -f <pattern>` where the pattern appears in the same command line: it kills the shell running it.
 
-**Code map:** `src/wal.rs` (log), `src/memtable.rs`, `src/sstable/{block,writer,reader,filter,cache,mod}.rs`,
-`src/manifest.rs`, `src/db.rs` (`Db` handle + writer queue + periodic sync thread; `State` = open/recovery/flush/read path/poisoning; most tests),
-`src/db/compaction.rs`, `src/codec.rs`, `src/fsutil.rs`, `src/test_util.rs` (Rng), `src/main.rs` (REPL),
-`tests/kill9.rs` (real-process crash test), `examples/durability.rs` (benchmark).
+**Code map:** `src/wal.rs` (log), `src/key.rs` (sequence numbers, internal key order, `Shadowed` garbage rule), `src/memtable.rs` (skiplist),
+`src/sstable/{block,writer,reader,filter,cache,mod}.rs`, `src/manifest.rs` (format record, last sequence),
+`src/db.rs` (`Db` handle, writer queue with per-writer condvars, `make_room` + memtable switch, `SuperVersion` + `ReadView`, recovery, most tests),
+`src/db/background.rs` (background thread, flush job), `src/db/compaction.rs` (pick / start / run unlocked / finish),
+`src/db/snapshot.rs` (`Snapshot`), `src/codec.rs`, `src/fsutil.rs`, `src/test_util.rs` (Rng), `src/main.rs` (REPL),
+`tests/kill9.rs` (real-process crash test), `examples/{durability,concurrency}.rs` (benchmarks).
 
 ## Current status
 
@@ -88,9 +95,19 @@ The owner went ahead without answering the M1–M5 review questions (CLAUDE.md s
 Found and fixed along the way: a lost-wakeup hang in the periodic thread's shutdown, the periodic interval stretching to 177 ms during compactions, and the sync thread blocking at startup on the state lock.
 Measured: group commit gives 16 writers 5–9.5x single-writer throughput (about 10 writes per fsync); `Periodic` runs about 335k writes/s vs 1.3k for `Always`. Max latency of 140–570 ms comes from inline flush/compaction (M8). Mutation-checked: 11 planted bugs, all caught (see D11).
 
+**2026-10-04: M8 done.** The owner approved the whole proposal ("go"). Built in 5 sections, each committed and pushed:
+(1) sequence numbers in every version, with a format version (D18); (2) lock-free reads: skiplist memtable + SuperVersion read view (D12, D13);
+(3) immutable memtable, background flush + compaction thread, L0 slowdown/stop, background errors poison (D14–D16); (4) `Db::snapshot()` (D18);
+(5) per-writer condition variables (D17) and the before/after benchmark.
+Measured against M7 on the same machine: 4 readers 439k → 0.93–1.11M reads/s; with a writer running, read max 120–130 ms → under 7 ms, and the writer 21–171k → 153–390k writes/s.
+D17 cut context switches 20–30% but not throughput: a negative result, documented (the bottleneck is the serial leader path).
+Found along the way: a `stats()` self-deadlock (two guards in one struct literal); `compact_all` never compacting the bottom level, so versions snapshots had pinned there stayed after the snapshot was released; a staged test that probed through the state lock and so only caught a lock-holding mutant indirectly.
+Mutation-checked: 38 planted bugs, all caught in the end (two survived at first and got new tests; see D14–D18).
+Semantics changed: any background failure poisons (M4's "retryable before commit" is gone), and pre-M8 data directories are refused (format 2).
+
 **Next step:**
-1. Owner works through the review questions (M1–M7, below).
-2. M8 (read-side concurrency) needs a design consult; see RESUME HERE.
+1. Owner works through the review questions (M1–M8, below).
+2. M9 (range scans) needs a design consult; see RESUME HERE.
 
 ## M1 review questions (owner answers)
 1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?
@@ -143,6 +160,20 @@ Measured: group commit gives 16 writers 5–9.5x single-writer throughput (about
 6. What is a lost wakeup, and why does `wait_timeout_while` fix the one we hit in the periodic thread?
 7. The periodic thread fsyncs a *cloned* file handle without holding the WAL lock. Why is that still correct?
 8. In the benchmark, why do 16 `Always` writers get ~10x the throughput of 1, while 16 `Periodic` writers get *less* than 1?
+
+## M8 review questions (owner answers)
+1. A `get` runs while a flush installs its table. What does the reader hold, and why can't it miss a key that's moving from the immutable memtable into the table?
+2. Why are `last_seq` and the SuperVersion read under one lock? Describe the interleaving that misses an acknowledged write if they were two atomics loaded in the wrong order.
+3. Compaction deletes a table file that a reader is still searching. Why is that safe on Linux, and what would break on Windows?
+4. Why is the sequence number compared as a separate field instead of appended to the key bytes? Give two keys that sort wrong the other way.
+5. Why must a flush write `SetLastSequence` to the manifest? What goes wrong after a reopen without it?
+6. A snapshot at 100 is the oldest. Key k has versions 150, 120, 90 and 40. Which can compaction drop, and why? And if the oldest snapshot is 130?
+7. Why may a compaction output table end only between user keys, never inside one key's versions?
+8. Why does the memtable switch fsync the old WAL, even in `Periodic` mode? Exactly what could a power cut lose without it?
+9. Why have both a slowdown and a stop trigger? Why must compaction <= slowdown <= stop hold?
+10. Why does a background failure poison the database instead of returning an error? What did that change from M4?
+11. Per-writer condition variables cut context switches 20–30% but left throughput flat. What is the bottleneck, and how does RocksDB attack it?
+12. Why did `stats()` deadlock when it called `lock(&self.view)` twice inside one struct literal?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed

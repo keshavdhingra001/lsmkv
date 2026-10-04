@@ -1,6 +1,8 @@
 //! Write throughput and latency for each sync mode and writer-thread count.
 //!
-//! Usage: cargo run --release --example durability -- [dir] [seconds]
+//! Usage: cargo run --release --example durability -- [dir] [seconds] [mode] [threads]
+//!
+//! `mode` (`Always` or `Periodic`) and `threads` run just that one row.
 //!
 //! `dir` must be on a real disk. On tmpfs (often `/tmp`) fsync costs nothing,
 //! and `Always` would look as fast as `Periodic`. The default is
@@ -18,6 +20,8 @@ fn main() -> lsmkv::Result<()> {
             .unwrap_or_else(|| "target/bench-durability".into()),
     );
     let secs: u64 = args.next().map_or(3, |s| s.parse().expect("seconds"));
+    let only_mode = args.next();
+    let only_threads: Option<usize> = args.next().map(|s| s.parse().expect("threads"));
     let value = [b'v'; 100];
 
     println!(
@@ -35,7 +39,13 @@ fn main() -> lsmkv::Result<()> {
         ),
     ];
     for (name, mode) in modes {
+        if only_mode.as_deref().is_some_and(|m| !name.starts_with(m)) {
+            continue;
+        }
         for threads in [1, 4, 16] {
+            if only_threads.is_some_and(|t| t != threads) {
+                continue;
+            }
             let dir = root.join(format!("{name}-{threads}"));
             let _ = std::fs::remove_dir_all(&dir);
             let opts = Options {

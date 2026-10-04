@@ -283,6 +283,26 @@ The owner approved the whole proposal ("go"). Each entry is filled in as its sec
   - the switch forgetting the immutable memtable's last sequence number
 - **Early numbers** (D11's benchmark, same machine): max write latency fell from 140/450/570 ms to 22/140/199 ms for `Periodic` with 1/4/16 threads, and from 28–51 ms to 27–30 ms for `Always`. `Periodic` throughput rose to 422k/329k/246k ops/s (from 335k/230k/220k). The proper before/after measurement is section 5.
 
+### D17: One condition variable per writer (approved 2026-10-04)
+- **What:** each queued write carries its own `Arc<Condvar>` (LevelDB gives each `Writer` its own `port::CondVar`). A leader wakes exactly the writers whose state it changed: its followers (their result is in), and the new front of the queue (the next leader). Before, it called `notify_all` on one shared condition variable, which woke every queued writer, including ones that only went back to sleep.
+- **Why not a thread-local condition variable** (to save the allocation): std documents that a `Condvar` may panic if used with more than one mutex over time, and one thread can write to several `Db`s.
+- **The shared `turn` condition variable stays** for `flush` / `compact_all` callers and stalled leaders, which wait on conditions no single writer owns.
+- **No lost wakeups:** a writer checks "am I done / am I the leader" under the state lock before sleeping, and a leader changes that state under the same lock before it notifies. So a notify can't fall between a writer's check and its wait.
+- **Measured** (`durability -- target/bench Periodic 16`, 3 alternating runs of each build, context switches from `getrusage(RUSAGE_CHILDREN)`):
+
+  | 16 `Periodic` writers | `notify_all` | per-writer |
+  |---|---:|---:|
+  | voluntary context switches per write | 1.33–1.49 | 1.09–1.10 |
+  | involuntary context switches (3 s run) | 38–40k | 11–15k |
+  | CPU per write | 9.5–11.6 µs | 8.5–11.0 µs |
+  | writes/sec | 267–308k | 251–309k |
+
+- **A negative result:** wasted wakeups dropped 20–30% and CPU per write a little, but throughput didn't change. D11 guessed that `notify_all` was why `Periodic` slows from 1 to 16 threads, and that was wrong.
+  - **What it actually is:** the serial leader path. One thread at a time takes the lock, writes the group with one syscall, applies it, and then wakes each follower with its own futex syscall. Every writer still sleeps about once per write.
+  - **How RocksDB attacks it:** adaptive spinning before sleeping (`enable_write_thread_adaptive_yield`), and followers inserting into the memtable themselves, in parallel (`allow_concurrent_memtable_write`). Not done here.
+- **Kept anyway:** it's cheaper and not slower, and it's the design LevelDB uses.
+- **Verified by:** the whole suite, including the M7 staged group tests. Mutations: the leader not waking the next leader (everything behind it hangs), or not waking its followers. Both caught.
+
 ### D18: Sequence numbers and the internal key order (approved 2026-10-04)
 - **What:** every write gets the next sequence number (`SeqNo`, a `u64`; 0 means "before any write"). Every stored version carries it: WAL records, memtable keys and table entries. A read picks a snapshot number and sees, per key, the newest version at or below it.
 - **Order:** versions sort by user key ascending, then by seq **descending**, so a key's newest version comes first and a lookup stops at the first version it may see (LevelDB's internal key order).
@@ -313,4 +333,19 @@ The owner approved the whole proposal ("go"). Each entry is filled in as its sec
     - a randomized test (10 seeds × 3,000 steps) checking random live snapshots against copies of a model taken with them, through flushes and compactions.
     - Mutation checks, each caught: `oldest_snapshot` ignoring snapshots or using the newest one; a snapshot reading the latest data; a dropped snapshot staying registered; a tombstone dropped though a snapshot sees past it; a key split across tables; `compact_all` skipping the bottom level.
   - **A bug found on the way:** `State::stats` called `lock(&self.view)` twice inside one struct literal. A temporary's guard lives until the end of the whole statement, so the second call deadlocked on the first (std's `Mutex` isn't reentrant). Three tests hung, and the fix was to take the lock once beforehand.
+
+### M8 results: before and after
+`cargo run --release --example concurrency`: 200,000 preloaded keys (100-byte values), reader threads doing random gets while one writer writes new keys as fast as it can (`Periodic(100ms)`, so a memtable fills about every 0.1 s and flushes and compactions run throughout). The same benchmark file was run against M7's code (commit `6f566a3`) on the same machine and disk. M8 ranges are over 2 runs (the second was slower across the board).
+
+| readers + writer | reads/sec M7 → M8 | read max M7 → M8 | writes/sec M7 → M8 | write p99.9 M7 → M8 | write max M7 → M8 |
+|---|---:|---:|---:|---:|---:|
+| 4, no writer | 439k → 0.93–1.11M | 3.3 ms → 0.5–0.6 ms | – | – | – |
+| 1 + writer | 401k → 344–413k | 120.6 ms → 0.15 ms | 171k → 317–390k | 26 µs → 11 µs | 120.6 ms → 20–38 ms |
+| 4 + writer | 368k → 685–885k | 15.2 ms → 1.8–2.4 ms | 42k → 217–266k | 149 µs → 13–17 µs | 15.0 ms → 36–41 ms |
+| 8 + writer | 366k → 620–803k | 130.4 ms → 4.9–6.2 ms | 21k → 153–196k | 262 µs → 34–46 µs | 130.3 ms → 27–33 ms |
+
+- **Reads scale with threads now.** In M7, every `get` took the state lock, so 4 readers maxed out at one reader's worth; now they run in parallel (2–2.5x).
+- **Reads no longer stall** behind inline flushes and compactions: read max went from 120–130 ms to under 7 ms.
+- **The writer is 2–9x faster with readers running.** In M7 it competed with every reader for the state lock, and 8 readers cut it to 21k writes/s.
+- **The remaining write max (20–41 ms)** is the memtable switch (a new WAL, a directory fsync and the old WAL's fsync, under the state lock) plus level-0 stop stalls when the writer outruns compaction. In M7 it was a full inline flush, up to 130 ms.
 

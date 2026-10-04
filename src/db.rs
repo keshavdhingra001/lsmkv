@@ -257,9 +257,9 @@ struct Shared {
     /// number, so a reader never waits behind a write, flush or compaction.
     view: Arc<Mutex<ReadView>>,
     /// Notified whenever a write group or a background job finishes, or the
-    /// database is poisoned. Writers wait here for their turn to lead or for
-    /// their leader to finish their write; stalled leaders and `flush` /
-    /// `compact_all` callers wait here for the background thread.
+    /// database is poisoned. Stalled leaders and `flush` / `compact_all`
+    /// callers wait here. Queued writers don't: each sleeps on its own
+    /// condition variable, in the queue (D17).
     turn: Condvar,
     /// Wakes the background thread: a memtable was switched, a manual
     /// compaction was requested, or the `Db` is closing.
@@ -314,7 +314,8 @@ struct State {
     /// successive compactions rotate through the key space.
     compact_pointer: Vec<Option<Vec<u8>>>,
     /// Writes waiting to be logged, oldest first, tagged with a ticket.
-    queue: VecDeque<(u64, Record)>,
+    /// Each with the condition variable its writer sleeps on (D17).
+    queue: VecDeque<(u64, Record, Arc<Condvar>)>,
     next_ticket: u64,
     /// A leader is logging a group right now (with the state lock released).
     writing: bool,
@@ -591,21 +592,24 @@ impl Db {
         st.check_writable()?;
         let ticket = st.next_ticket;
         st.next_ticket += 1;
-        st.queue.push_back((ticket, rec));
+        // Its own condition variable, so a leader wakes exactly the writers
+        // whose state it changed, not every waiter (DESIGN.md D17).
+        let wake = Arc::new(Condvar::new());
+        st.queue.push_back((ticket, rec, Arc::clone(&wake)));
         loop {
             // A leader already logged this write (or failed to).
             if let Some(result) = st.finished.remove(&ticket) {
                 return result;
             }
             // First in line with no group in flight: this writer leads.
-            if !st.writing && st.queue.front().map(|(t, _)| *t) == Some(ticket) {
+            if !st.writing && st.queue.front().map(|q| q.0) == Some(ticket) {
                 break;
             }
-            st = self.wait(st);
+            st = wake.wait(st).expect("db lock poisoned");
         }
 
         let (mut st, room) = self.make_room(st);
-        let group = st.take_group();
+        let (group, followers) = st.take_group();
         // Numbered in queue order. Only one group is ever in flight, so the
         // numbers right after the last applied write are free.
         let first_seq = st.last_seq + 1;
@@ -647,7 +651,14 @@ impl Db {
             st.wal_syncs += synced;
         }
         let result = st.finish_group(group, first_seq, logged.map(drop));
+        // Whoever is first in line now leads the next group: it waited
+        // because this group was in flight.
+        let next = st.queue.front().map(|q| Arc::clone(&q.2));
         drop(st);
+        for writer in followers.iter().chain(&next) {
+            writer.notify_one();
+        }
+        // `flush` callers wait for no group to be in flight.
         self.shared.turn.notify_all();
         result
     }
@@ -801,18 +812,25 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 impl State {
     /// Takes the next write group off the front of the queue: at least one
     /// record, then more while the group stays under `MAX_GROUP_BYTES`.
-    fn take_group(&mut self) -> Vec<(u64, Record)> {
+    /// Returns it with its followers' condition variables (all but the
+    /// leader's, which is first).
+    fn take_group(&mut self) -> (Vec<(u64, Record)>, Vec<Arc<Condvar>>) {
         let mut group = Vec::new();
+        let mut followers = Vec::new();
         let mut bytes = 0;
-        while let Some((_, rec)) = self.queue.front() {
+        while let Some((_, rec, _)) = self.queue.front() {
             let size = record_len(rec);
             if !group.is_empty() && bytes + size > MAX_GROUP_BYTES {
                 break;
             }
             bytes += size;
-            group.push(self.queue.pop_front().expect("front exists"));
+            let (ticket, rec, wake) = self.queue.pop_front().expect("front exists");
+            if !group.is_empty() {
+                followers.push(wake);
+            }
+            group.push((ticket, rec));
         }
-        group
+        (group, followers)
     }
 
     /// After the leader logged a group: apply it to the memtable in queue
