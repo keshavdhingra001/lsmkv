@@ -17,6 +17,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 
+use crate::codec::{len_u32, read_u32};
 use crate::error::{Error, Result};
 
 pub const HEADER_LEN: usize = 4 + 1 + 4 + 4;
@@ -174,19 +175,6 @@ fn decode(buf: &[u8]) -> Decoded {
         _ => return Decoded::Bad(total),
     };
     Decoded::Record(rec, total)
-}
-
-fn read_u32(buf: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(buf[at..at + 4].try_into().expect("4-byte slice"))
-}
-
-fn len_u32(bytes: &[u8], what: &str) -> Result<u32> {
-    u32::try_from(bytes.len()).map_err(|_| {
-        Error::Io(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("{what} too large: {} bytes (max {})", bytes.len(), u32::MAX),
-        ))
-    })
 }
 
 #[cfg(test)]

@@ -5,6 +5,9 @@ pub enum Error {
 
     #[error("corruption: {0}")]
     Corruption(String),
+
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
