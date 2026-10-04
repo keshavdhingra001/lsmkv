@@ -15,5 +15,5 @@ pub mod sstable;
 mod test_util;
 pub mod wal;
 
-pub use db::{Db, Options, Stats};
+pub use db::{Db, Options, Stats, SyncMode};
 pub use error::{Error, Result};

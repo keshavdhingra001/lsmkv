@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use super::{open_table, remove_obsolete_files, table_for_key, table_path, Db, Table};
+use super::{open_table, remove_obsolete_files, table_for_key, table_path, State, Table};
 use crate::error::Result;
 use crate::manifest::{Edit, MAX_LEVELS};
 use crate::memtable::Entry;
@@ -28,7 +28,7 @@ struct Compaction {
     next: Vec<u64>,
 }
 
-impl Db {
+impl State {
     /// Runs compactions until no level is over its limit.
     pub(super) fn maybe_compact(&mut self) -> Result<()> {
         while let Some(level) = self.pick_level() {
@@ -41,7 +41,7 @@ impl Db {
     /// Flushes, then pushes every table down to the bottom level, which drops
     /// every overwritten value and every tombstone. Like RocksDB's
     /// `CompactRange` over the whole key space.
-    pub fn compact_all(&mut self) -> Result<()> {
+    pub(super) fn compact_all(&mut self) -> Result<()> {
         self.flush_memtable()?;
         for level in 0..MAX_LEVELS - 1 {
             while !self.levels[level].is_empty() {

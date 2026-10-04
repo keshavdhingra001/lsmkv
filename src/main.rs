@@ -5,7 +5,7 @@ use std::io::{self, BufRead, Write};
 
 fn main() -> lsmkv::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "./data".into());
-    let mut db = lsmkv::Db::open(&dir)?;
+    let db = lsmkv::Db::open(&dir)?;
     println!("lsmkv @ {dir}  (put <k> <v> | get <k> | del <k> | flush | compact | stats | quit)");
 
     let stdin = io::stdin();
@@ -43,6 +43,10 @@ fn main() -> lsmkv::Result<()> {
                 println!(
                     "memtable: {} entries, ~{} bytes | log: {:06}.log",
                     s.memtable_entries, s.memtable_bytes, s.log_number
+                );
+                println!(
+                    "  writes: {} in {} groups, {} WAL fsyncs",
+                    s.writes, s.write_groups, s.wal_syncs
                 );
                 println!(
                     "  write amplification: {:.2} ({} user bytes -> {} flushed + {} compacted)",

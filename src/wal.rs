@@ -43,6 +43,8 @@ pub struct Replay {
 
 pub struct Wal {
     file: BufWriter<File>,
+    /// Successful `sync` calls, so callers can report real fsyncs.
+    syncs: u64,
 }
 
 impl Wal {
@@ -51,6 +53,7 @@ impl Wal {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             file: BufWriter::new(file),
+            syncs: 0,
         })
     }
 
@@ -80,11 +83,23 @@ impl Wal {
         Ok(())
     }
 
+    /// Pushes buffered bytes to the OS without waiting for the disk. They
+    /// survive this process crashing, but not the machine losing power.
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.flush()?;
+        Ok(())
+    }
+
     /// Pushes buffered bytes to the OS, then forces them to the disk.
     pub fn sync(&mut self) -> Result<()> {
         self.file.flush()?;
         self.file.get_ref().sync_data()?;
+        self.syncs += 1;
         Ok(())
+    }
+
+    pub fn sync_count(&self) -> u64 {
+        self.syncs
     }
 
     /// Reads the whole log and decodes records front to back.

@@ -9,9 +9,12 @@
 //! both. Anything else the engine owns (orphans from a crash mid-flush, `.tmp`
 //! files) is deleted on open. Unrecognized files are left alone.
 
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
@@ -43,6 +46,20 @@ pub struct Options {
     pub bloom_bits_per_key: usize,
     /// Block cache size, shared by all tables; 0 turns it off.
     pub block_cache_bytes: usize,
+    /// When a write counts as durable (DESIGN.md D11).
+    pub sync_mode: SyncMode,
+}
+
+/// When `put`/`delete` return, relative to the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// fsync the WAL before acknowledging. Survives power loss. Concurrent
+    /// writers share one fsync (group commit).
+    Always,
+    /// Acknowledge once the WAL bytes reach the OS; a background thread
+    /// fsyncs every interval. Survives a crash of this process, but a power
+    /// cut or kernel crash can lose up to one interval of acknowledged writes.
+    Periodic(Duration),
 }
 
 impl Default for Options {
@@ -55,6 +72,7 @@ impl Default for Options {
             target_file_size: 2 << 20,
             bloom_bits_per_key: DEFAULT_BITS_PER_KEY,
             block_cache_bytes: 8 << 20,
+            sync_mode: SyncMode::Always,
         }
     }
 }
@@ -71,6 +89,13 @@ pub struct Stats {
     /// Bytes per level, index = level.
     pub level_bytes: Vec<u64>,
     pub log_number: u64,
+    /// Writes (puts and deletes) acknowledged since open.
+    pub writes: u64,
+    /// WAL write groups since open: each one a single append-and-sync for
+    /// one or more writes.
+    pub write_groups: u64,
+    /// WAL fsyncs since open (by write groups, or by the periodic thread).
+    pub wal_syncs: u64,
     /// Key + value bytes written by callers since open.
     pub user_bytes: u64,
     /// SSTable bytes written by flushes since open.
@@ -115,11 +140,48 @@ impl Table {
     }
 }
 
+/// A write group is cut off at this many bytes of records, so one writer's
+/// latency isn't stretched by an unbounded pile of others (LevelDB: 1 MiB).
+const MAX_GROUP_BYTES: usize = 1 << 20;
+
+/// A thread-safe handle: share it between threads as `Arc<Db>`.
+///
+/// Writes go through a queue (group commit). The writer at the front of the
+/// queue becomes the *leader*: it takes every queued record (up to
+/// `MAX_GROUP_BYTES`), appends them all to the WAL and syncs once, with the
+/// state lock released, then applies them to the memtable and wakes the
+/// others (the *followers*), whose writes are now done. Writers that arrive
+/// meanwhile queue up and form the next group. See DESIGN.md D11.
+///
+/// Lock order: `state`, then the WAL. Nothing takes `state` while holding the
+/// WAL, so the two can't deadlock.
 pub struct Db {
+    shared: Arc<Shared>,
+    /// The background fsync thread in `SyncMode::Periodic`.
+    syncer: Option<JoinHandle<()>>,
+}
+
+struct Shared {
+    dir: PathBuf,
+    state: Mutex<State>,
+    /// Writers wait here for their turn to lead or for their leader to finish
+    /// their write; flush and compaction wait here for a group to finish.
+    turn: Condvar,
+    /// Set when the `Db` is dropped, to stop the periodic sync thread.
+    stop: Mutex<bool>,
+    stop_signal: Condvar,
+}
+
+/// Everything behind the state lock: the engine as it was before M7, plus the
+/// writer queue.
+struct State {
     dir: PathBuf,
     opts: Options,
     memtable: MemTable,
-    wal: Wal,
+    /// The active log. Its own lock, so a leader can append and fsync while
+    /// readers and queueing writers use `State`. Only a leader (with `writing`
+    /// set) or a holder of the state lock with no group in flight touches it.
+    wal: Arc<Mutex<Wal>>,
     wal_number: u64,
     manifest: Manifest,
     version: Version,
@@ -135,12 +197,26 @@ pub struct Db {
     /// Per level: largest key of the last table compacted out of it, so
     /// successive compactions rotate through the key space.
     compact_pointer: Vec<Option<Vec<u8>>>,
+    /// Writes waiting to be logged, oldest first, tagged with a ticket.
+    queue: VecDeque<(u64, Record)>,
+    next_ticket: u64,
+    /// A leader is logging a group right now (with the state lock released).
+    writing: bool,
+    /// Outcomes a leader left for its followers, by ticket.
+    finished: HashMap<u64, Result<()>>,
+    writes: u64,
+    write_groups: u64,
+    wal_syncs: u64,
     user_bytes: u64,
     flush_bytes: u64,
     compaction_bytes: u64,
     /// Test-only crash injection: the named failpoint returns an error.
     #[cfg(test)]
     fail_at: Option<&'static str>,
+    /// Test-only slow disk: the leader sleeps this long while it holds the
+    /// WAL, so concurrent writers reliably pile up into groups.
+    #[cfg(test)]
+    slow_wal: Duration,
 }
 
 impl Db {
@@ -211,11 +287,11 @@ impl Db {
         let wal = Wal::open(&log_path(&dir, wal_number))?;
         sync_dir(&dir)?;
 
-        Ok(Self {
-            dir,
-            opts,
+        let state = State {
+            dir: dir.clone(),
+            opts: opts.clone(),
             memtable,
-            wal,
+            wal: Arc::new(Mutex::new(wal)),
             wal_number,
             manifest,
             version,
@@ -224,25 +300,49 @@ impl Db {
             read_ctx,
             poisoned: None,
             compact_pointer: vec![None; MAX_LEVELS],
+            queue: VecDeque::new(),
+            next_ticket: 0,
+            writing: false,
+            finished: HashMap::new(),
+            writes: 0,
+            write_groups: 0,
+            wal_syncs: 0,
             user_bytes: 0,
             flush_bytes: 0,
             compaction_bytes: 0,
             #[cfg(test)]
             fail_at: None,
-        })
+            #[cfg(test)]
+            slow_wal: Duration::ZERO,
+        };
+        let shared = Arc::new(Shared {
+            dir,
+            state: Mutex::new(state),
+            turn: Condvar::new(),
+            stop: Mutex::new(false),
+            stop_signal: Condvar::new(),
+        });
+        let syncer = match opts.sync_mode {
+            SyncMode::Always => None,
+            SyncMode::Periodic(every) => {
+                let shared = Arc::clone(&shared);
+                Some(thread::spawn(move || sync_periodically(&shared, every)))
+            }
+        };
+        Ok(Self { shared, syncer })
     }
 
-    /// Durably writes `key = value`. If this write fills the memtable, it also
-    /// flushes. An `Err` from that flush still leaves the write itself durable
-    /// in the WAL.
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+    /// Writes `key = value`. Returns once the write is as durable as the
+    /// `SyncMode` promises. If this write fills the memtable, it also
+    /// flushes; an `Err` from that flush still leaves the write itself logged.
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.write(Record::Put {
             key: key.to_vec(),
             value: value.to_vec(),
         })
     }
 
-    pub fn delete(&mut self, key: &[u8]) -> Result<()> {
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
         self.write(Record::Delete { key: key.to_vec() })
     }
 
@@ -250,6 +350,175 @@ impl Db {
     /// then at most one table per deeper level. The first hit wins, and a
     /// tombstone hit means "deleted": older data is not consulted.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.lock().get(key)
+    }
+
+    /// Flushes the memtable, then compacts until no level is over its limit.
+    pub fn flush(&self) -> Result<()> {
+        self.exclusive().flush()
+    }
+
+    /// Flushes, then pushes every table down to the bottom level, which drops
+    /// every overwritten value and every tombstone.
+    pub fn compact_all(&self) -> Result<()> {
+        self.exclusive().compact_all()
+    }
+
+    pub fn stats(&self) -> Stats {
+        self.lock().stats()
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.shared.dir
+    }
+
+    fn write(&self, rec: Record) -> Result<()> {
+        let mut st = self.lock();
+        st.check_writable()?;
+        let ticket = st.next_ticket;
+        st.next_ticket += 1;
+        st.queue.push_back((ticket, rec));
+        loop {
+            // A leader already logged this write (or failed to).
+            if let Some(result) = st.finished.remove(&ticket) {
+                return result;
+            }
+            // First in line with no group in flight: this writer leads.
+            if !st.writing && st.queue.front().map(|(t, _)| *t) == Some(ticket) {
+                break;
+            }
+            st = self.wait(st);
+        }
+
+        let group = st.take_group();
+        // The database may have been poisoned while this group waited.
+        let ready = st.check_writable();
+        let injected = st.failpoint("wal:sync");
+        let sync = st.opts.sync_mode == SyncMode::Always;
+        #[cfg(test)]
+        let slow = st.slow_wal;
+        st.writing = true;
+        let wal = Arc::clone(&st.wal);
+        drop(st);
+
+        // The slow part, without the state lock: readers keep reading and new
+        // writers keep queueing (they become the next group).
+        let logged = ready.and_then(|()| {
+            let mut wal = lock(&wal);
+            let syncs_before = wal.sync_count();
+            for (_, rec) in &group {
+                wal.append(rec)?;
+            }
+            #[cfg(test)]
+            thread::sleep(slow);
+            injected?;
+            // `Periodic` still pushes the bytes to the OS before acking: that
+            // makes the write survive a crash of this process (the kernel
+            // holds it), just not a power cut.
+            if sync {
+                wal.sync()?;
+            } else {
+                wal.flush()?;
+            }
+            Ok(wal.sync_count() - syncs_before)
+        });
+
+        let mut st = self.lock();
+        st.writing = false;
+        if let Ok(synced) = logged {
+            st.wal_syncs += synced;
+        }
+        let result = st.finish_group(group, logged.map(drop));
+        drop(st);
+        self.shared.turn.notify_all();
+        result
+    }
+
+    /// The state lock, once no write group is in flight. Flush and compaction
+    /// switch the WAL and memtable, which must never happen while a leader is
+    /// appending to the old WAL: its records would land in a retired log.
+    fn exclusive(&self) -> MutexGuard<'_, State> {
+        let mut st = self.lock();
+        while st.writing {
+            st = self.wait(st);
+        }
+        st
+    }
+
+    fn lock(&self) -> MutexGuard<'_, State> {
+        lock(&self.shared.state)
+    }
+
+    fn wait<'a>(&self, st: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
+        self.shared.turn.wait(st).expect("db lock poisoned")
+    }
+
+    #[cfg(test)]
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.lock()
+    }
+}
+
+impl Drop for Db {
+    /// Stops the periodic sync thread, then syncs the WAL once more, so a
+    /// clean close never loses an acknowledged write in any mode.
+    fn drop(&mut self) {
+        if let Some(syncer) = self.syncer.take() {
+            *lock(&self.shared.stop) = true;
+            self.shared.stop_signal.notify_all();
+            let _ = syncer.join();
+            let st = self.lock();
+            if st.poisoned.is_none() {
+                let _ = lock(&st.wal).sync();
+            }
+        }
+    }
+}
+
+/// `SyncMode::Periodic`'s thread: fsync the WAL every `every` until the `Db`
+/// is dropped. A failed fsync poisons the database, like a failed write.
+fn sync_periodically(shared: &Shared, every: Duration) {
+    let wal = Arc::clone(&lock(&shared.state).wal);
+    let mut stopped = lock(&shared.stop);
+    loop {
+        // `_while` checks the flag BEFORE sleeping. A plain `wait_timeout`
+        // misses a stop that `Drop` signalled before this thread got here
+        // (nobody was waiting yet, so the signal is lost), and then sleeps
+        // a whole interval: a lost wakeup.
+        stopped = shared
+            .stop_signal
+            .wait_timeout_while(stopped, every, |stopped| !*stopped)
+            .expect("stop lock poisoned")
+            .0;
+        if *stopped {
+            return;
+        }
+        drop(stopped);
+
+        let injected = lock(&shared.state).failpoint("wal:periodic_sync");
+        // Lock order: the WAL is released before the state lock is taken.
+        let synced = injected.and_then(|()| lock(&wal).sync());
+        let mut st = lock(&shared.state);
+        match synced {
+            Ok(()) => st.wal_syncs += 1,
+            Err(e) => {
+                st.poison(e);
+                return;
+            }
+        }
+        drop(st);
+        stopped = lock(&shared.stop);
+    }
+}
+
+/// Locks a mutex. A poisoned lock means a thread panicked mid-update and the
+/// state behind it is unknown, so this panics too rather than carry on.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().expect("db lock poisoned")
+}
+
+impl State {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.memtable.get(key) {
             Some(Entry::Value(v)) => return Ok(Some(v.clone())),
             Some(Entry::Tombstone) => return Ok(None),
@@ -269,8 +538,55 @@ impl Db {
         Ok(None)
     }
 
-    /// Flushes the memtable, then compacts until no level is over its limit.
-    pub fn flush(&mut self) -> Result<()> {
+    /// Takes the next write group off the front of the queue: at least one
+    /// record, then more while the group stays under `MAX_GROUP_BYTES`.
+    fn take_group(&mut self) -> Vec<(u64, Record)> {
+        let mut group = Vec::new();
+        let mut bytes = 0;
+        while let Some((_, rec)) = self.queue.front() {
+            let size = record_len(rec);
+            if !group.is_empty() && bytes + size > MAX_GROUP_BYTES {
+                break;
+            }
+            bytes += size;
+            group.push(self.queue.pop_front().expect("front exists"));
+        }
+        group
+    }
+
+    /// After the leader logged a group: apply it to the memtable in queue
+    /// order (the same order as in the WAL, so a replay rebuilds exactly
+    /// this memtable) and record each follower's outcome. If logging failed,
+    /// none of the group was acknowledged, and the database is poisoned: the
+    /// log may now end in a partial record.
+    fn finish_group(&mut self, group: Vec<(u64, Record)>, logged: Result<()>) -> Result<()> {
+        let leader = group[0].0;
+        if let Err(e) = logged {
+            let e = self.poison(e);
+            let why = self.poisoned.clone().expect("just poisoned");
+            for (ticket, _) in &group[1..] {
+                self.finished
+                    .insert(*ticket, Err(Error::Poisoned(why.clone())));
+            }
+            return Err(e);
+        }
+        self.write_groups += 1;
+        for (ticket, rec) in group {
+            self.writes += 1;
+            self.user_bytes += record_len(&rec) as u64;
+            apply(&mut self.memtable, rec);
+            if ticket != leader {
+                self.finished.insert(ticket, Ok(()));
+            }
+        }
+        // The leader pays for the flush; its followers' writes are done.
+        if self.memtable.approx_size() >= self.opts.memtable_size {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
         self.flush_memtable()?;
         self.maybe_compact()
     }
@@ -289,6 +605,9 @@ impl Db {
     /// A failure before the commit point leaves the database usable; the
     /// orphans are cleaned up on the next open. A failure at or after it
     /// poisons the database (see `Error::Poisoned`).
+    ///
+    /// Callers hold the state lock with no write group in flight, so no
+    /// leader is appending to the WAL being retired.
     fn flush_memtable(&mut self) -> Result<()> {
         self.check_writable()?;
         if self.memtable.is_empty() {
@@ -331,13 +650,13 @@ impl Db {
             },
         );
         self.memtable = MemTable::new();
-        self.wal = new_wal;
+        *lock(&self.wal) = new_wal;
         self.wal_number = log_id;
         let _ = remove_obsolete_files(&self.dir, &self.version);
         Ok(())
     }
 
-    pub fn stats(&self) -> Stats {
+    fn stats(&self) -> Stats {
         let r = &self.read_ctx.stats;
         Stats {
             memtable_entries: self.memtable.len(),
@@ -350,6 +669,9 @@ impl Db {
                 .map(|l| l.iter().map(|t| t.reader.file_size()).sum())
                 .collect(),
             log_number: self.wal_number,
+            writes: self.writes,
+            write_groups: self.write_groups,
+            wal_syncs: self.wal_syncs,
             user_bytes: self.user_bytes,
             flush_bytes: self.flush_bytes,
             compaction_bytes: self.compaction_bytes,
@@ -366,28 +688,6 @@ impl Db {
             block_size: DEFAULT_BLOCK_SIZE,
             bloom_bits_per_key: self.opts.bloom_bits_per_key,
         }
-    }
-
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    fn write(&mut self, rec: Record) -> Result<()> {
-        self.check_writable()?;
-        // A failed append or fsync may leave a partial record in the log, and
-        // later appends would land after it (mid-log corruption on reopen).
-        if let Err(e) = self.wal.append(&rec).and_then(|()| self.wal.sync()) {
-            return Err(self.poison(e));
-        }
-        self.user_bytes += match &rec {
-            Record::Put { key, value } => (key.len() + value.len()) as u64,
-            Record::Delete { key } => key.len() as u64,
-        };
-        apply(&mut self.memtable, rec);
-        if self.memtable.approx_size() >= self.opts.memtable_size {
-            self.flush()?;
-        }
-        Ok(())
     }
 
     /// The commit point shared by flush and compaction: one durable manifest
@@ -420,8 +720,9 @@ impl Db {
     }
 
     /// Marks the database read-only and passes the original error through.
+    /// The first failure is the one remembered.
     fn poison(&mut self, e: Error) -> Error {
-        self.poisoned = Some(e.to_string());
+        self.poisoned.get_or_insert_with(|| e.to_string());
         e
     }
 
@@ -439,6 +740,14 @@ impl Db {
     #[inline(always)]
     fn failpoint(&self, _name: &'static str) -> Result<()> {
         Ok(())
+    }
+}
+
+/// Key + value bytes of a write (what `Stats::user_bytes` counts).
+fn record_len(rec: &Record) -> usize {
+    match rec {
+        Record::Put { key, value } => key.len() + value.len(),
+        Record::Delete { key } => key.len(),
     }
 }
 
@@ -607,7 +916,7 @@ mod tests {
     fn writes_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = Db::open(dir.path()).unwrap();
+            let db = Db::open(dir.path()).unwrap();
             db.put(b"a", b"1").unwrap();
             db.put(b"b", b"2").unwrap();
             db.delete(b"a").unwrap();
@@ -621,7 +930,7 @@ mod tests {
     fn open_refuses_mid_log_corruption() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = Db::open(dir.path()).unwrap();
+            let db = Db::open(dir.path()).unwrap();
             db.put(b"a", b"1").unwrap();
             db.put(b"b", b"2").unwrap();
         }
@@ -639,7 +948,7 @@ mod tests {
     fn writes_after_torn_tail_are_not_lost() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = Db::open(dir.path()).unwrap();
+            let db = Db::open(dir.path()).unwrap();
             db.put(b"a", b"1").unwrap();
             db.put(b"b", b"2").unwrap();
         }
@@ -654,7 +963,7 @@ mod tests {
             .unwrap();
 
         {
-            let mut db = Db::open(dir.path()).unwrap();
+            let db = Db::open(dir.path()).unwrap();
             assert_eq!(db.get(b"b").unwrap(), None);
             db.put(b"c", b"3").unwrap();
         }
@@ -677,7 +986,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let n = 2000;
         {
-            let mut db = Db::open_with(dir.path(), small()).unwrap();
+            let db = Db::open_with(dir.path(), small()).unwrap();
             for i in 0..n {
                 db.put(&key(i), format!("v{i}").as_bytes()).unwrap();
             }
@@ -709,7 +1018,7 @@ mod tests {
             assert_eq!(db.get(b"c").unwrap(), Some(b"3".to_vec()), "c: overwritten");
         };
         {
-            let mut db = Db::open(dir.path()).unwrap();
+            let db = Db::open(dir.path()).unwrap();
             db.put(b"a", b"1").unwrap();
             db.put(b"b", b"1").unwrap();
             db.put(b"c", b"1").unwrap();
@@ -727,7 +1036,7 @@ mod tests {
     #[test]
     fn flushing_an_empty_memtable_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open(dir.path()).unwrap();
+        let db = Db::open(dir.path()).unwrap();
         db.flush().unwrap();
         assert_eq!(db.stats().tables, 0);
         assert_eq!(files(dir.path()), vec![DbFile::Log(1)]);
@@ -737,7 +1046,7 @@ mod tests {
     fn open_removes_crash_leftovers_but_not_foreign_files() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = Db::open(dir.path()).unwrap();
+            let db = Db::open(dir.path()).unwrap();
             db.put(b"a", b"1").unwrap();
             db.flush().unwrap(); // table 2, log 3; log 1 is obsolete
         }
@@ -756,7 +1065,7 @@ mod tests {
     fn missing_live_table_is_corruption() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let mut db = Db::open(dir.path()).unwrap();
+            let db = Db::open(dir.path()).unwrap();
             db.put(b"a", b"1").unwrap();
             db.flush().unwrap();
         }
@@ -805,7 +1114,7 @@ mod tests {
         place_table(d, 14, 0, &[("a", Some("L0-old")), ("d", Some("L0-old"))]);
         place_table(d, 15, 0, &[("a", Some("L0-new"))]);
 
-        let mut db = Db::open(d).unwrap();
+        let db = Db::open(d).unwrap();
         db.put(b"z", b"mem").unwrap();
         let get = |db: &Db, k: &str| {
             db.get(k.as_bytes())
@@ -836,7 +1145,8 @@ mod tests {
 
     /// Entries stored across all live tables (all versions, plus tombstones).
     fn stored_entries(db: &Db) -> u64 {
-        db.levels
+        db.state()
+            .levels
             .iter()
             .flatten()
             .map(|t| t.reader.entry_count())
@@ -848,7 +1158,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let n = 4000;
         {
-            let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+            let db = Db::open_with(dir.path(), tiny()).unwrap();
             for i in 0..n {
                 db.put(&key(i), &key(i)).unwrap();
                 assert!(
@@ -869,7 +1179,7 @@ mod tests {
     #[test]
     fn overwritten_versions_are_garbage_collected() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
         for round in 0..40 {
             for i in 0..100 {
                 db.put(&key(i), format!("r{round}").as_bytes()).unwrap();
@@ -887,7 +1197,7 @@ mod tests {
     #[test]
     fn compact_all_drops_deleted_data_entirely() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
         for i in 0..1000 {
             db.put(&key(i), &key(i)).unwrap();
         }
@@ -910,7 +1220,7 @@ mod tests {
     fn tombstone_survives_while_older_data_is_deeper() {
         let dir = tempfile::tempdir().unwrap();
         place_table(dir.path(), 10, 3, &[("a", Some("old"))]);
-        let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
         db.delete(b"a").unwrap();
         db.flush().unwrap();
         db.put(b"b", b"1").unwrap();
@@ -931,7 +1241,7 @@ mod tests {
     #[test]
     fn lone_table_moves_down_without_rewriting() {
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open(dir.path()).unwrap();
+        let db = Db::open(dir.path()).unwrap();
         db.put(b"a", b"1").unwrap();
         db.compact_all().unwrap(); // flush, then 6 trivial moves to the bottom
         let st = db.stats();
@@ -955,7 +1265,7 @@ mod tests {
     /// failpoint). Returns how many keys were written; the failing key's own
     /// WAL record is durable, so it counts too.
     fn write_until_failpoint(db: &mut Db, fp: &'static str) -> usize {
-        db.fail_at = Some(fp);
+        db.state().fail_at = Some(fp);
         for i in 0..100_000 {
             if db.put(&key(i), &key(i)).is_err() {
                 return i + 1;
@@ -991,7 +1301,7 @@ mod tests {
             let n = write_until_failpoint(&mut db, fp);
             drop(db); // the "crash": nothing after the failpoint runs
 
-            let mut db = Db::open_with(dir.path(), small()).unwrap();
+            let db = Db::open_with(dir.path(), small()).unwrap();
             assert_eq!(db.get(b"before").unwrap(), Some(b"flush".to_vec()), "{fp}");
             assert_keys(&db, 0..n, fp);
             assert_no_orphans(dir.path(), &db, fp);
@@ -1017,14 +1327,14 @@ mod tests {
             "compact:after_manifest",
         ] {
             let dir = tempfile::tempdir().unwrap();
-            let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+            let db = Db::open_with(dir.path(), tiny()).unwrap();
             // Let a few compactions succeed first, so deeper levels exist.
             for i in 0..500 {
                 db.put(&key(i), &key(i)).unwrap();
             }
             assert!(db.stats().level_files[2] > 0, "{fp}: {:?}", db.stats());
             let start = 500;
-            db.fail_at = Some(fp);
+            db.state().fail_at = Some(fp);
             let mut n = start;
             while db.put(&key(n), &key(n)).is_ok() {
                 n += 1;
@@ -1032,7 +1342,7 @@ mod tests {
             let n = n + 1; // the failing put's WAL record is durable
             drop(db);
 
-            let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+            let db = Db::open_with(dir.path(), tiny()).unwrap();
             assert_keys(&db, 0..n, fp);
             assert_no_orphans(dir.path(), &db, fp);
 
@@ -1054,7 +1364,7 @@ mod tests {
             let mut db = Db::open_with(dir.path(), small()).unwrap();
             let n = write_until_failpoint(&mut db, fp);
 
-            db.fail_at = None;
+            db.state().fail_at = None;
             db.flush().unwrap();
             for i in n..n + 300 {
                 db.put(&key(i), &key(i)).unwrap();
@@ -1074,7 +1384,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut db = Db::open_with(dir.path(), small()).unwrap();
             let n = write_until_failpoint(&mut db, fp);
-            db.fail_at = None;
+            db.state().fail_at = None;
 
             assert!(
                 matches!(db.put(b"x", b"y"), Err(Error::Poisoned(_))),
@@ -1085,7 +1395,7 @@ mod tests {
             assert_keys(&db, 0..n, &format!("{fp}, reads while poisoned"));
             drop(db);
 
-            let mut db = Db::open_with(dir.path(), small()).unwrap();
+            let db = Db::open_with(dir.path(), small()).unwrap();
             assert_keys(&db, 0..n, &format!("{fp}, reopened"));
             assert_eq!(db.get(b"x").unwrap(), None, "{fp}: refused write leaked");
             db.put(b"x", b"y").unwrap();
@@ -1103,7 +1413,7 @@ mod tests {
             block_cache_bytes: 0,
             ..Options::default()
         };
-        let mut db = Db::open_with(dir, opts).unwrap();
+        let db = Db::open_with(dir, opts).unwrap();
         for round in 0..8 {
             for i in (round..n).step_by(8) {
                 db.put(format!("key{i:06}").as_bytes(), b"v").unwrap();
@@ -1159,7 +1469,7 @@ mod tests {
         // The tombstone must pass the newer table's filter; if tombstones were
         // left out of filters, the lookup would fall through to the old value.
         let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open_with(dir.path(), small()).unwrap();
+        let db = Db::open_with(dir.path(), small()).unwrap();
         db.put(b"k", b"old").unwrap();
         db.flush().unwrap();
         db.delete(b"k").unwrap();
@@ -1177,7 +1487,7 @@ mod tests {
             l0_compaction_trigger: 100,
             ..small()
         };
-        let mut db = Db::open_with(dir.path(), no_filters.clone()).unwrap();
+        let db = Db::open_with(dir.path(), no_filters.clone()).unwrap();
         db.put(b"a", b"1").unwrap();
         db.flush().unwrap();
         drop(db);
@@ -1186,10 +1496,13 @@ mod tests {
             bloom_bits_per_key: 10,
             ..no_filters
         };
-        let mut db = Db::open_with(dir.path(), with_filters).unwrap();
+        let db = Db::open_with(dir.path(), with_filters).unwrap();
         db.put(b"b", b"2").unwrap();
         db.flush().unwrap();
-        let filtered: Vec<bool> = db.levels[0].iter().map(|t| t.reader.has_filter()).collect();
+        let filtered: Vec<bool> = db.state().levels[0]
+            .iter()
+            .map(|t| t.reader.has_filter())
+            .collect();
         assert_eq!(filtered, [true, false], "newest first");
 
         assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
@@ -1216,7 +1529,7 @@ mod tests {
                 block_cache_bytes: cache,
                 ..Options::default()
             };
-            let mut db = Db::open_with(dir.path(), opts).unwrap();
+            let db = Db::open_with(dir.path(), opts).unwrap();
             for i in 0..n {
                 db.put(format!("key{i:06}").as_bytes(), &value).unwrap();
             }
@@ -1253,6 +1566,321 @@ mod tests {
         );
     }
 
+    // ---- M7: group commit and sync modes ----
+
+    #[test]
+    fn db_is_send_and_sync() {
+        fn shareable<T: Send + Sync>() {}
+        shareable::<Db>();
+    }
+
+    #[test]
+    fn concurrent_writers_share_fsyncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.state().slow_wal = Duration::from_millis(2);
+        let (threads, per) = (8, 40);
+        thread::scope(|s| {
+            for t in 0..threads {
+                let db = &db;
+                s.spawn(move || {
+                    for i in 0..per {
+                        db.put(format!("t{t}-{i}").as_bytes(), b"v").unwrap();
+                    }
+                });
+            }
+        });
+        let st = db.stats();
+        println!(
+            "{} writes from {threads} threads in {} groups ({} fsyncs)",
+            st.writes, st.write_groups, st.wal_syncs
+        );
+        assert_eq!(st.writes, threads * per);
+        assert_eq!(st.wal_syncs, st.write_groups, "one fsync per group");
+        assert!(
+            st.write_groups * 3 < st.writes,
+            "writers didn't share fsyncs"
+        );
+
+        drop(db);
+        let db = Db::open(dir.path()).unwrap();
+        for t in 0..threads {
+            for i in 0..per {
+                assert!(db.get(format!("t{t}-{i}").as_bytes()).unwrap().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn failed_group_sync_fails_every_writer_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.state().slow_wal = Duration::from_millis(100);
+        let pause = || thread::sleep(Duration::from_millis(20));
+        let results: Vec<Result<()>> = thread::scope(|s| {
+            // The first writer leads alone and holds the WAL for 100 ms...
+            let first = s.spawn(|| db.put(b"first", b"1"));
+            pause();
+            // ...while seven more queue up behind it as one group...
+            let rest: Vec<_> = (0..7)
+                .map(|i| {
+                    let db = &db;
+                    s.spawn(move || db.put(format!("k{i}").as_bytes(), b"v"))
+                })
+                .collect();
+            pause();
+            // ...whose fsync will fail. (The first group already passed this
+            // failpoint before it released the state lock.)
+            db.state().fail_at = Some("wal:sync");
+            std::iter::once(first)
+                .chain(rest)
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert!(
+            results[0].is_ok(),
+            "the first group synced: {:?}",
+            results[0]
+        );
+        let failed = &results[1..];
+        assert!(
+            failed.iter().all(Result::is_err),
+            "acked without an fsync: {failed:?}"
+        );
+        let followers = failed
+            .iter()
+            .filter(|r| matches!(r, Err(Error::Poisoned(_))))
+            .count();
+        assert_eq!(
+            followers, 6,
+            "the leader gets the I/O error, followers Poisoned"
+        );
+        assert_eq!(db.stats().write_groups, 1);
+        assert!(matches!(db.put(b"x", b"y"), Err(Error::Poisoned(_))));
+        assert_eq!(db.get(b"first").unwrap(), Some(b"1".to_vec()));
+
+        drop(db);
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"first").unwrap(), Some(b"1".to_vec()));
+        db.put(b"x", b"y").unwrap();
+    }
+
+    /// Writers race each other and explicit flushes (with automatic flushes
+    /// and compactions too). Two checks after a reopen: every acknowledged
+    /// unique key is there, and every shared key reads exactly as before the
+    /// close, which needs the WAL and memtable to agree on write order.
+    #[test]
+    fn concurrent_writes_and_flushes_survive_reopen_identically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
+        db.state().slow_wal = Duration::from_micros(300);
+        let threads = 6;
+        thread::scope(|s| {
+            for t in 0..threads {
+                let db = &db;
+                s.spawn(move || {
+                    let mut rng = Rng::new(t + 1);
+                    for i in 0..300 {
+                        db.put(format!("u{t}-{i}").as_bytes(), b"unique").unwrap();
+                        let shared = format!("s{}", rng.below(20));
+                        if rng.below(5) == 0 {
+                            db.delete(shared.as_bytes()).unwrap();
+                        } else {
+                            db.put(shared.as_bytes(), format!("{t}-{i}").as_bytes())
+                                .unwrap();
+                        }
+                        if i % 50 == 25 {
+                            db.flush().unwrap();
+                        }
+                    }
+                });
+            }
+        });
+        let shared: Vec<_> = (0..20)
+            .map(|k| db.get(format!("s{k}").as_bytes()).unwrap())
+            .collect();
+        drop(db);
+
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
+        for t in 0..threads {
+            for i in 0..300 {
+                let k = format!("u{t}-{i}");
+                assert!(db.get(k.as_bytes()).unwrap().is_some(), "lost {k}");
+            }
+        }
+        for (k, before) in shared.iter().enumerate() {
+            let after = db.get(format!("s{k}").as_bytes()).unwrap();
+            assert_eq!(&after, before, "s{k} changed across reopen");
+        }
+    }
+
+    /// For the staged tests below: the leader holds the WAL for 150 ms, and
+    /// each step waits 30 ms so the previous one has reached its position.
+    const SLOW: Duration = Duration::from_millis(150);
+    fn step() {
+        thread::sleep(Duration::from_millis(30));
+    }
+
+    #[test]
+    fn flush_waits_for_the_group_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.put(b"before", b"1").unwrap();
+        db.state().slow_wal = SLOW;
+        thread::scope(|s| {
+            // "a" is being logged into the current WAL...
+            s.spawn(|| db.put(b"a", b"1").unwrap());
+            step();
+            // ...so this flush must wait. If it went ahead, it would retire
+            // that WAL, and "a" would then land in a memtable whose log
+            // doesn't hold it.
+            db.flush().unwrap();
+        });
+        drop(db);
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"before").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(
+            db.get(b"a").unwrap(),
+            Some(b"1".to_vec()),
+            "acked write lost"
+        );
+    }
+
+    #[test]
+    fn group_applies_in_queue_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        db.state().slow_wal = SLOW;
+        thread::scope(|s| {
+            s.spawn(|| db.put(b"lead", b"x").unwrap());
+            step();
+            // Two writes to one key queue up, in this order, into one group.
+            s.spawn(|| db.put(b"k", b"first").unwrap());
+            step();
+            s.spawn(|| db.put(b"k", b"second").unwrap());
+        });
+        assert_eq!(db.stats().write_groups, 2);
+        // Later in the queue = later in the WAL = the value a replay ends on.
+        // The memtable must agree, or a reopen changes what readers see.
+        assert_eq!(db.get(b"k").unwrap(), Some(b"second".to_vec()));
+        drop(db);
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"k").unwrap(), Some(b"second".to_vec()));
+    }
+
+    #[test]
+    fn writers_queued_behind_a_failed_group_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path()).unwrap();
+        {
+            let mut st = db.state();
+            st.slow_wal = SLOW;
+            st.fail_at = Some("wal:sync");
+        }
+        let results: Vec<Result<()>> = thread::scope(|s| {
+            let first = s.spawn(|| db.put(b"first", b"1"));
+            step();
+            let rest: Vec<_> = (0..3)
+                .map(|i| {
+                    let db = &db;
+                    s.spawn(move || db.put(format!("k{i}").as_bytes(), b"v"))
+                })
+                .collect();
+            step();
+            // The disk "recovers" before the queued group leads. It must
+            // still be refused: the first group may have left a partial
+            // record at the end of the log, and appending after it would
+            // turn a torn tail into mid-log corruption (D2).
+            db.state().fail_at = None;
+            std::iter::once(first)
+                .chain(rest)
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        assert!(matches!(results[0], Err(Error::Io(_))), "{:?}", results[0]);
+        for r in &results[1..] {
+            assert!(matches!(r, Err(Error::Poisoned(_))), "{r:?}");
+        }
+        assert_eq!(db.stats().write_groups, 0);
+    }
+
+    fn periodic(every: Duration) -> Options {
+        Options {
+            sync_mode: SyncMode::Periodic(every),
+            ..Options::default()
+        }
+    }
+
+    /// Waits up to 5 s for `cond`, for tests that depend on a background thread.
+    fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        false
+    }
+
+    #[test]
+    fn periodic_mode_acks_once_the_os_has_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), periodic(Duration::from_secs(3600))).unwrap();
+        for i in 0..3 {
+            db.put(format!("k{i}").as_bytes(), b"v").unwrap();
+        }
+        assert_eq!(db.stats().wal_syncs, 0, "no fsync yet");
+        // Not fsynced, but already written to the OS: another reader of the
+        // file (here, a replay) sees every acknowledged record.
+        let replay = Wal::replay(&only_log(dir.path())).unwrap();
+        assert_eq!(replay.records.len(), 3);
+
+        // Dropping must stop the thread now, not after its hour-long wait.
+        let start = std::time::Instant::now();
+        drop(db);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let db = Db::open(dir.path()).unwrap();
+        assert_eq!(db.get(b"k2").unwrap(), Some(b"v".to_vec()));
+    }
+
+    /// Regression test for a lost wakeup: `Drop` signalled "stop" before the
+    /// new sync thread was waiting, and the thread then slept a full interval
+    /// (an hour here), hanging the drop. Opening and dropping at once, many
+    /// times, makes that ordering near-certain to occur.
+    #[test]
+    fn drop_right_after_open_does_not_wait_out_the_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            drop(Db::open_with(dir.path(), periodic(Duration::from_secs(3600))).unwrap());
+        }
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn periodic_thread_syncs_in_the_background() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), periodic(Duration::from_millis(5))).unwrap();
+        db.put(b"k", b"v").unwrap();
+        assert!(eventually(|| db.stats().wal_syncs >= 2));
+        assert_eq!(db.stats().write_groups, 1);
+    }
+
+    #[test]
+    fn failed_periodic_sync_poisons() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), periodic(Duration::from_millis(5))).unwrap();
+        db.put(b"k", b"v").unwrap();
+        db.state().fail_at = Some("wal:periodic_sync");
+        assert!(eventually(|| matches!(
+            db.put(b"k2", b"v"),
+            Err(Error::Poisoned(_))
+        )));
+        assert_eq!(db.get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
     /// Random puts, deletes, flushes, reads and reopens, checked against a
     /// BTreeMap after every read and at the end of each run.
     #[test]
@@ -1272,6 +1900,11 @@ mod tests {
                 bloom_bits_per_key: bloom_sizes[rng.below(4) as usize],
                 // Off, tiny (constant eviction) or roomy.
                 block_cache_bytes: [0, 300, 4096, 1 << 20][rng.below(4) as usize],
+                sync_mode: if rng.below(2) == 0 {
+                    SyncMode::Always
+                } else {
+                    SyncMode::Periodic(Duration::from_millis(1))
+                },
             };
             let mut db = Db::open_with(dir.path(), opts.clone()).unwrap();
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
