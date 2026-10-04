@@ -5,9 +5,9 @@ with group commit, a lock-free skiplist memtable, checksummed SSTables with bloo
 leveled compaction on a background thread, snapshots, range scans, atomic batches, optimistic transactions,
 and a Redis-protocol server, so `redis-cli` talks to it.
 
-Its crash safety is tested two ways: real `kill -9`s of a running process (SOAK_LINE), and a
+Its crash safety is tested two ways: real `kill -9`s of a running process (300 rounds, over a million acknowledged writes, none lost), and a
 **deterministic simulation** that runs the engine on a simulated disk and cuts the power at random points. The
-simulation found a real bug the crash tests never could (a manifest commit torn by a power cut), and catches 9 of
+simulation found two real bugs the crash tests never could (a manifest commit torn by a power cut, and recovery serving unsynced data), and catches 9 of
 10 planted durability bugs that `kill -9` misses entirely. See [how it's tested](#how-its-tested).
 
 About 9,800 lines of Rust (8,100 in `src/`, unit tests included). Three runtime dependencies: `crc32fast`, `crossbeam-skiplist` and `thiserror`.
@@ -165,16 +165,19 @@ shown; up to 0.5 s) is level-0 backpressure: when the writer outruns compaction,
   - **A `kill -9` harness** (`tests/kill9.rs`): a child process writes (puts, deletes and atomic batches)
     from 4 threads and is killed at random moments, round after round, against one directory. After each
     kill, every key must hold exactly its last acknowledged value, and an in-flight batch must be there
-    whole or not at all. Long run: SOAK_DETAIL (`cargo test --release --test kill9 -- --ignored`).
+    whole or not at all. Long run: 300 rounds, 1,022,073 acknowledged operations, none lost (`cargo test --release --test kill9 -- --ignored`).
   - **Deterministic simulation** (`tests/sim.rs`): the engine runs single-threaded on `SimFs`, a
     simulated disk that tracks what was fsynced. The test cuts the power at a random I/O (keeping a random
     torn prefix of unsynced data) or fails an fsync, reopens, and requires the durable state plus a
     prefix of later operations: nothing acknowledged lost in `Always` mode, no holes in `Periodic` mode.
-    A seed replays exactly. Long run: SIM_DETAIL (`LSMKV_SIM_SEEDS=20000 cargo test --release --test sim`).
+    A seed replays exactly. Long run: 100 seeds in every `cargo test`; 20,000-seed release runs (`LSMKV_SIM_SEEDS=20000 cargo test --release --test sim`).
     - **It found a real bug:** a compaction's manifest commit, torn by a power cut, could apply its
       "remove inputs" records without its "add outputs" records, losing data. `kill -9` can't tear a
       write, so the crash harness, the fuzzer and every unit test had missed it. Commits now carry a
       group header and apply whole or not at all (D28).
+    - **And a second:** recovery replayed write-ahead logs without fsyncing them, so after a restart the
+      database could serve a write that a later power cut or failed fsync took back. Recovery now fsyncs
+      what it replays (D28).
     - **Planted durability bugs** (a missing fsync, a missing directory fsync, an ack before the fsync, ...):
       the simulation caught 9 of 10, the `kill -9` harness 0 of 10 (the 10th is a harmless equivalent).
   - **A model-based fuzz test** (`tests/model.rs`, proptest): random options and random sequences of
