@@ -34,6 +34,6 @@ Implement `src/memtable.rs` (M1) until `cargo test memtable` passes, then `src/w
 
 ## Blockers / open decisions
 - [ ] Rust toolchain not installed (`sudo pacman -S rustup && rustup default stable`)
-- [ ] `gh auth login` not done, so no GitHub remote yet (repo will be `lsmkv`, private)
+- [x] GitHub: private repo https://github.com/keshavdhingra001/lsmkv (HTTPS remote, pushed M0)
 - [ ] Confirm git email `keshavdhingra007@gmail.com` is on the GitHub account
 - [ ] DESIGN.md: how to treat mid-log WAL corruption (see `Wal::replay` doc comment)
