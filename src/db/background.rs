@@ -180,7 +180,7 @@ impl State {
             0,
             Arc::new(Table {
                 id: table_id,
-                reader,
+                reader: Arc::new(reader),
             }),
         );
         self.install(super::SuperVersion {

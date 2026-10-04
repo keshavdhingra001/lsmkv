@@ -28,7 +28,7 @@ mod reader;
 mod writer;
 
 pub use cache::BlockCache;
-pub use reader::SstReader;
+pub use reader::{SstIter, SstReader};
 pub use writer::{SstWriter, WriterOptions};
 
 use std::sync::atomic::{AtomicU64, Ordering};

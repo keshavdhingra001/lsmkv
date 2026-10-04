@@ -543,3 +543,125 @@ fn corrupt_block_is_never_cached() {
     assert_eq!(count(&ctx.stats.block_reads), 2);
     assert!(ctx.cache.is_empty());
 }
+
+// ---- M9: streaming iteration ----
+
+/// A table where several keys have versions in more than one block: keys
+/// a00..a59, each with 1-4 versions, 64-byte blocks (about 2 entries each).
+fn multi_version_table(path: &Path) -> Vec<(Vec<u8>, SeqNo, Entry)> {
+    let mut rng = Rng::new(9);
+    let mut all = Vec::new();
+    let mut seq = 1000;
+    for i in 0..60 {
+        let key = format!("a{i:02}").into_bytes();
+        for _ in 0..1 + rng.below(4) {
+            let e = if rng.below(5) == 0 {
+                Entry::Tombstone
+            } else {
+                Entry::Value(rng.value())
+            };
+            all.push((key.clone(), seq, e));
+            seq -= 1; // newest first within a key
+        }
+    }
+    let mut w = SstWriter::with_block_size(path, 64).unwrap();
+    for (k, s, e) in &all {
+        w.add(k, *s, e).unwrap();
+    }
+    w.finish().unwrap();
+    all
+}
+
+#[test]
+fn iter_from_every_start_matches_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let all = multi_version_table(&path);
+    let r = std::sync::Arc::new(SstReader::open(&path).unwrap());
+    assert!(r.block_count() > 30, "the test needs many blocks");
+    assert_eq!(r.entries().unwrap(), all);
+
+    // Every key, plus starts between keys, before all and after all.
+    let mut starts: Vec<Vec<u8>> = all.iter().map(|(k, _, _)| k.clone()).collect();
+    starts.extend([b"".to_vec(), b"a".to_vec(), b"a05x".to_vec(), b"b".to_vec()]);
+    for start in starts {
+        let want: Vec<_> = all
+            .iter()
+            .filter(|(k, _, _)| *k >= start)
+            .cloned()
+            .collect();
+        let got: Vec<_> = r.iter(Some(&start)).unwrap().map(|e| e.unwrap()).collect();
+        assert_eq!(got, want, "start {:?}", String::from_utf8_lossy(&start));
+    }
+    let got: Vec<_> = r.iter(None).unwrap().map(|e| e.unwrap()).collect();
+    assert_eq!(got, all);
+}
+
+#[test]
+fn iter_outlives_the_callers_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(300);
+    write_table(&path, 128, &entries);
+    let r = std::sync::Arc::new(SstReader::open(&path).unwrap());
+    let it = r.iter(None).unwrap();
+    drop(r);
+    // The file can go too: the open descriptor keeps it readable.
+    std::fs::remove_file(&path).unwrap();
+    let got: Vec<_> = it.map(|e| e.unwrap()).collect();
+    assert_eq!(got, at_seq_1(&entries));
+}
+
+#[test]
+fn iter_reads_through_the_cache_without_filling_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(500);
+    write_table(&path, 128, &entries);
+    let ctx = cached_ctx();
+    let r =
+        std::sync::Arc::new(SstReader::open_with(&path, 1, std::sync::Arc::clone(&ctx)).unwrap());
+
+    assert_eq!(r.iter(None).unwrap().count(), 500);
+    assert!(ctx.cache.is_empty(), "a scan must not fill the cache");
+
+    // A block a point read cached is served from the cache: corrupt the
+    // file under it, and the scan still reads the cached (good) copy.
+    let last = &entries.last().unwrap().0;
+    r.get(last, MAX_SEQ).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last_block_byte = footer_of(&bytes).filter_offset as usize - 5;
+    bytes[last_block_byte] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+    let got: Vec<_> = r.iter(Some(last)).unwrap().map(|e| e.unwrap()).collect();
+    assert_eq!(got.len(), 1);
+}
+
+#[test]
+fn iter_reports_a_corrupt_block_then_stops() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(200);
+    write_table(&path, 128, &entries);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last_block_byte = footer_of(&bytes).filter_offset as usize - 5;
+    bytes[last_block_byte] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let r = std::sync::Arc::new(SstReader::open(&path).unwrap());
+    let mut it = r.iter(None).unwrap();
+    let mut good = 0;
+    let err = loop {
+        match it.next() {
+            Some(Ok(_)) => good += 1,
+            Some(Err(e)) => break e,
+            None => panic!("the scan must hit the bad block"),
+        }
+    };
+    assert!(matches!(err, Error::Corruption(_)), "{err:?}");
+    assert!(good > 150, "blocks before the bad one are read: {good}");
+    assert!(it.next().is_none(), "nothing after an error");
+    // Seeking straight into the bad block fails up front.
+    let last = &entries.last().unwrap().0;
+    expect_corruption(r.iter(Some(last)).map(|_| ()), "seek into bad block");
+}

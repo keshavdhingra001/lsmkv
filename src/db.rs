@@ -155,7 +155,8 @@ impl Stats {
 /// A live table: its file number plus an open reader.
 struct Table {
     id: u64,
-    reader: SstReader,
+    /// Shared, so a scan's table iterator can own it (M9).
+    reader: Arc<SstReader>,
 }
 
 impl Table {
@@ -1071,7 +1072,10 @@ fn open_levels(dir: &Path, version: &Version, ctx: &Arc<ReadContext>) -> Result<
     let mut levels: Levels = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
     for (&id, &level) in &version.tables {
         let reader = open_table(dir, id, ctx)?;
-        levels[level as usize].push(Arc::new(Table { id, reader }));
+        levels[level as usize].push(Arc::new(Table {
+            id,
+            reader: Arc::new(reader),
+        }));
     }
     levels[0].sort_by_key(|t| std::cmp::Reverse(t.id));
     for (n, level) in levels.iter_mut().enumerate().skip(1) {

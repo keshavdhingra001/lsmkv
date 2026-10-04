@@ -120,9 +120,15 @@ impl<'a> Block<'a> {
     /// Entries in key order. Yields one `Err` and then stops if an entry is
     /// malformed (only possible with a writer bug, since the CRC passed).
     pub fn iter(&self) -> BlockIter<'a> {
+        self.iter_at(0)
+    }
+
+    /// Entries from byte offset `pos` on, which must be an entry boundary
+    /// (0, or a `BlockIter::position` from this block).
+    pub(crate) fn iter_at(&self, pos: usize) -> BlockIter<'a> {
         BlockIter {
             data: self.data,
-            pos: 0,
+            pos,
         }
     }
 
@@ -150,6 +156,14 @@ impl<'a> Block<'a> {
 pub struct BlockIter<'a> {
     data: &'a [u8],
     pos: usize,
+}
+
+impl BlockIter<'_> {
+    /// Byte offset of the next entry: lets a caller that can't hold the
+    /// borrow (a table iterator) resume with `Block::iter_at`.
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
 }
 
 impl<'a> Iterator for BlockIter<'a> {

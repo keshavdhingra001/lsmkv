@@ -10,12 +10,14 @@
 //! waits for the other. Readers never see half of a group, because they read
 //! at a snapshot taken before the group's numbers were published.
 
+use std::collections::VecDeque;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crossbeam_skiplist::SkipMap;
 
-use crate::key::{InternalKey, SeqNo};
+use crate::key::{InternalKey, SeqNo, MAX_SEQ};
 
 /// What the memtable knows about a key.
 ///
@@ -26,6 +28,12 @@ pub enum Entry {
     Value(Vec<u8>),
     Tombstone,
 }
+
+/// One version, owned: (user key, seq, entry). What scans pass around.
+pub type ScanEntry = (Vec<u8>, SeqNo, Entry);
+
+/// How many versions a `MemIter` copies out per skiplist search.
+const ITER_BATCH: usize = 64;
 
 /// One version in the memtable, borrowed from the skiplist.
 pub type MemEntry<'a> = crossbeam_skiplist::map::Entry<'a, InternalKey, Entry>;
@@ -92,6 +100,67 @@ impl MemTable {
     /// Every version in internal key order (what a flush consumes).
     pub fn iter(&self) -> impl Iterator<Item = MemEntry<'_>> {
         self.map.iter()
+    }
+
+    /// Every version from user key `start` on (all if `None`), in internal
+    /// key order, as an iterator that owns an `Arc` of the memtable.
+    pub fn iter_from(self: &Arc<Self>, start: Option<&[u8]>) -> MemIter {
+        MemIter {
+            mem: Arc::clone(self),
+            buf: VecDeque::new(),
+            resume: match start {
+                // The first version of `start` in internal key order.
+                Some(k) => Bound::Included(InternalKey::new(k, MAX_SEQ)),
+                None => Bound::Unbounded,
+            },
+            done: false,
+        }
+    }
+}
+
+/// A memtable's versions in internal key order (DESIGN.md D20).
+///
+/// A skiplist iterator borrows the map, so a struct that owns the `Arc` can't
+/// also keep one without `unsafe`. Instead each refill searches the skiplist
+/// again from just past the last version copied, and copies the next
+/// `ITER_BATCH`: one O(log n) search per batch.
+///
+/// Writes may land in between refills. A new version is newer than the
+/// scan's snapshot (sequence numbers only grow), so the scan skips it
+/// whether or not it sees it.
+pub struct MemIter {
+    mem: Arc<MemTable>,
+    buf: VecDeque<ScanEntry>,
+    /// Where the next refill starts.
+    resume: Bound<InternalKey>,
+    done: bool,
+}
+
+impl MemIter {
+    fn refill(&mut self) {
+        let range = (self.resume.as_ref(), Bound::Unbounded);
+        for e in self.mem.map.range(range).take(ITER_BATCH) {
+            let k = e.key();
+            self.buf
+                .push_back((k.user_key.clone(), k.seq, e.value().clone()));
+        }
+        match self.buf.back() {
+            Some((key, seq, _)) if self.buf.len() == ITER_BATCH => {
+                self.resume = Bound::Excluded(InternalKey::new(key, *seq));
+            }
+            _ => self.done = true,
+        }
+    }
+}
+
+impl Iterator for MemIter {
+    type Item = ScanEntry;
+
+    fn next(&mut self) -> Option<ScanEntry> {
+        if self.buf.is_empty() && !self.done {
+            self.refill();
+        }
+        self.buf.pop_front()
     }
 }
 
@@ -233,5 +302,73 @@ mod tests {
         for r in readers {
             r.join().unwrap();
         }
+    }
+
+    // ---- M9: iter_from ----
+
+    fn collect(mem: &Arc<MemTable>, start: Option<&[u8]>) -> Vec<ScanEntry> {
+        mem.iter_from(start).collect()
+    }
+
+    #[test]
+    fn iter_from_matches_the_map_across_batches() {
+        let mem = Arc::new(MemTable::new());
+        // 3 versions of 100 keys: several refills, with batch edges falling
+        // inside one key's versions.
+        let mut seq = 0;
+        for round in 0..3 {
+            for i in 0..100 {
+                seq += 1;
+                let k = format!("k{i:03}");
+                if (i + round) % 9 == 0 {
+                    mem.delete(k.as_bytes(), seq);
+                } else {
+                    mem.put(k.as_bytes(), seq, format!("v{seq}").as_bytes());
+                }
+            }
+        }
+        let all: Vec<ScanEntry> = mem
+            .iter()
+            .map(|e| (e.key().user_key.clone(), e.key().seq, e.value().clone()))
+            .collect();
+        assert_eq!(all.len(), 300);
+        assert_eq!(collect(&mem, None), all);
+        for start in ["", "k", "k000", "k050", "k0505", "k099", "k1", "z"] {
+            let want: Vec<_> = all
+                .iter()
+                .filter(|(k, _, _)| k.as_slice() >= start.as_bytes())
+                .cloned()
+                .collect();
+            assert_eq!(collect(&mem, Some(start.as_bytes())), want, "start {start}");
+        }
+    }
+
+    #[test]
+    fn iter_from_sees_every_older_version_while_a_writer_inserts() {
+        let mem = Arc::new(MemTable::new());
+        for i in 0..1000u64 {
+            mem.put(format!("k{:04}", i * 2).as_bytes(), i + 1, b"old");
+        }
+        let writer = {
+            let mem = Arc::clone(&mem);
+            thread::spawn(move || {
+                // Newer versions of the same keys, and keys in between.
+                for i in 0..2000u64 {
+                    mem.put(format!("k{i:04}").as_bytes(), 10_000 + i, b"new");
+                }
+            })
+        };
+        for _ in 0..20 {
+            let old: Vec<_> = mem
+                .iter_from(None)
+                .filter(|(_, seq, _)| *seq <= 1000)
+                .map(|(k, _, _)| k)
+                .collect();
+            let want: Vec<_> = (0..1000u64)
+                .map(|i| format!("k{:04}", i * 2).into_bytes())
+                .collect();
+            assert_eq!(old, want);
+        }
+        writer.join().unwrap();
     }
 }

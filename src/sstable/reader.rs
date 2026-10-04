@@ -12,7 +12,7 @@ use super::{Footer, ReadContext, ReadStats, FOOTER_LEN};
 use crate::codec::{read_u32, read_u64};
 use crate::error::{Error, Result};
 use crate::key::{self, SeqNo};
-use crate::memtable::Entry;
+use crate::memtable::{Entry, ScanEntry};
 
 #[derive(Debug)]
 struct IndexEntry {
@@ -164,23 +164,23 @@ impl SstReader {
         Ok(raw)
     }
 
-    /// Every entry (each version of each key) in internal key order. Reads the whole table; used by tests now and
-    /// by flush/compaction later (M9 replaces it with a streaming iterator).
-    /// Bypasses the block cache: a compaction reads each block once, and
-    /// caching them would evict the blocks that reads actually reuse.
+    /// An iterator over every version of every key from `start` on (all of
+    /// them if `None`), in internal key order, one block in memory at a time.
+    /// It owns an `Arc` of the reader, so it can outlive the caller's borrow.
+    pub fn iter(self: &Arc<Self>, start: Option<&[u8]>) -> Result<SstIter> {
+        Ok(SstIter {
+            cursor: Cursor::seek(self, start)?,
+            reader: Arc::clone(self),
+        })
+    }
+
+    /// Every entry, read in one go. Checks the count against the footer, so
+    /// tests use it to compare whole tables.
     pub fn entries(&self) -> Result<Vec<(Vec<u8>, SeqNo, Entry)>> {
         let mut out = Vec::with_capacity(self.footer.entry_count as usize);
-        for entry in &self.index {
-            let raw = self.read_block(entry)?;
-            let block = Block::new(&raw).map_err(|e| self.block_error(e, entry))?;
-            for item in block.iter() {
-                let (k, seq, v) = item.map_err(|e| self.block_error(e, entry))?;
-                let v = match v {
-                    Some(v) => Entry::Value(v.to_vec()),
-                    None => Entry::Tombstone,
-                };
-                out.push((k.to_vec(), seq, v));
-            }
+        let mut cursor = Cursor::seek(self, None)?;
+        while let Some(item) = cursor.next(self)? {
+            out.push(item);
         }
         if out.len() as u64 != self.footer.entry_count {
             return Err(Error::Corruption(format!(
@@ -191,6 +191,20 @@ impl SstReader {
             )));
         }
         Ok(out)
+    }
+
+    /// Block `i` for a scan or a compaction: from the cache if it's there,
+    /// otherwise from disk and verified, but NOT added to the cache. A scan
+    /// reads each block once, in order; caching them would evict the blocks
+    /// that point reads keep coming back to (DESIGN.md D10, D20).
+    fn scan_block(&self, i: usize) -> Result<Arc<[u8]>> {
+        let entry = &self.index[i];
+        if let Some(raw) = self.ctx.cache.get((self.id, entry.offset)) {
+            return Ok(raw);
+        }
+        let raw = self.read_block(entry)?;
+        Block::new(&raw).map_err(|e| self.block_error(e, entry))?;
+        Ok(raw.into())
     }
 
     /// Smallest key in the table, or `None` for an empty table.
@@ -242,6 +256,107 @@ impl SstReader {
                 entry.offset
             )),
             other => other,
+        }
+    }
+}
+
+/// A table's entries from some key on, in internal key order (DESIGN.md D20).
+/// Holds one block at a time. After an error it yields nothing more.
+pub struct SstIter {
+    reader: Arc<SstReader>,
+    cursor: Cursor,
+}
+
+impl Iterator for SstIter {
+    type Item = Result<ScanEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.cursor.next(&self.reader) {
+            Ok(item) => item.map(Ok),
+            Err(e) => {
+                self.cursor.block = None;
+                Some(Err(e))
+            }
+        }
+    }
+}
+
+/// A position in a table: which block is loaded, and the byte offset of the
+/// next entry in it. It doesn't own the reader, so each call is handed the
+/// one it was created from (`SstIter` pairs them up).
+struct Cursor {
+    block_idx: usize,
+    /// The loaded block (verified), or `None` once the table is exhausted.
+    block: Option<Arc<[u8]>>,
+    pos: usize,
+}
+
+impl Cursor {
+    /// Positions at the first entry whose user key is >= `start`.
+    fn seek(r: &SstReader, start: Option<&[u8]>) -> Result<Self> {
+        // The first block whose last entry is at or after (start, MAX_SEQ),
+        // the very first version of `start`, holds the first entry >= it.
+        let block_idx = match start {
+            Some(start) => r.index.partition_point(|e| {
+                key::compare(&e.last_key, e.last_seq, start, key::MAX_SEQ).is_lt()
+            }),
+            None => 0,
+        };
+        let mut cursor = Self {
+            block_idx,
+            block: None,
+            pos: 0,
+        };
+        cursor.load(r)?;
+        // Skip the block's entries before `start`.
+        if let (Some(start), Some(raw)) = (start, cursor.block.clone()) {
+            let mut it = Block::from_verified(&raw).iter();
+            loop {
+                let at = it.position();
+                match it.next() {
+                    Some(Ok((k, _, _))) if k < start => {}
+                    Some(Err(e)) => return Err(r.block_error(e, &r.index[block_idx])),
+                    _ => {
+                        cursor.pos = at;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(cursor)
+    }
+
+    /// Loads block `block_idx` (or marks the cursor exhausted past the end).
+    fn load(&mut self, r: &SstReader) -> Result<()> {
+        self.pos = 0;
+        self.block = None;
+        if self.block_idx < r.index.len() {
+            self.block = Some(r.scan_block(self.block_idx)?);
+        }
+        Ok(())
+    }
+
+    fn next(&mut self, r: &SstReader) -> Result<Option<ScanEntry>> {
+        loop {
+            let Some(raw) = &self.block else {
+                return Ok(None);
+            };
+            let mut it = Block::from_verified(raw).iter_at(self.pos);
+            match it.next() {
+                Some(Ok((k, seq, v))) => {
+                    self.pos = it.position();
+                    let v = match v {
+                        Some(v) => Entry::Value(v.to_vec()),
+                        None => Entry::Tombstone,
+                    };
+                    return Ok(Some((k.to_vec(), seq, v)));
+                }
+                Some(Err(e)) => return Err(r.block_error(e, &r.index[self.block_idx])),
+                None => {
+                    self.block_idx += 1;
+                    self.load(r)?;
+                }
+            }
         }
     }
 }

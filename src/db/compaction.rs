@@ -291,7 +291,7 @@ impl CompactionJob {
                     writer.finish()?;
                     outputs.push(Arc::new(Table {
                         id,
-                        reader: open_table(&env.dir, id, &env.read_ctx)?,
+                        reader: Arc::new(open_table(&env.dir, id, &env.read_ctx)?),
                     }));
                 }
             }
@@ -314,7 +314,7 @@ impl CompactionJob {
             writer.finish()?;
             outputs.push(Arc::new(Table {
                 id,
-                reader: open_table(&env.dir, id, &env.read_ctx)?,
+                reader: Arc::new(open_table(&env.dir, id, &env.read_ctx)?),
             }));
         }
         Ok(outputs)
