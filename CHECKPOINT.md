@@ -25,6 +25,41 @@ Single source of truth for "where are we". Update at the end of every session.
 ### Tier 3: Stretch (pick 2–3 later)
 MVCC, atomic batches, RESP server, compression, deterministic simulation testing, Raft.
 
+## ▶ RESUME HERE (handover 2026-10-04)
+
+**State:** Tier 1 (M0–M4) and M5 are done. 71/71 tests pass, clippy clean, everything pushed to `main`
+at https://github.com/keshavdhingra001/lsmkv (private; owner said keep it private "not yet").
+
+**Next action:** M6 (bloom filters + block cache). The proposal below has been presented to the owner,
+who has **not approved it yet**. Confirm it (or apply their changes) before writing code, then build it
+in sections with one commit each, like M3–M5.
+
+**M6 proposal (pending owner approval):**
+| Decision | Proposal | Reason |
+|---|---|---|
+| Filter granularity | One bloom filter per SSTable, stored in the reserved filter block (`filter_offset`/`filter_len` in the footer) | A missing-key lookup skips the table without reading a block; the big win is L0, where every table is checked |
+| Bits per key | 10 bits/key, k = 7 | About 1% false positives (LevelDB default). Put the math in DESIGN.md |
+| Hash | Our own fixed 64-bit hash (FNV-1a or a murmur variant), NOT `std` `DefaultHasher` | Filters are persisted; `DefaultHasher` may change between Rust versions and silently break every saved filter |
+| k probes | Double hashing (Kirsch–Mitzenmacher) from one 64-bit hash | One hash per lookup, same false-positive rate |
+| Block cache | One LRU shared by all tables, 8 MiB default (`Options`), key = (table id, block offset), stores CRC-verified blocks; needs interior mutability (`Mutex`), since `get` takes `&self` | Hot reads skip the pread and the CRC; report hits/misses in `Stats` |
+| Proof | Count block reads for missing-key lookups with and without filters; measure the false-positive rate vs the ~1% theory | Turns "added bloom filters" into a measured resume claim |
+
+Format note: tables written before M6 have `filter_len = 0`. Readers must treat that as "no filter, always maybe" so M5-era data dirs keep working.
+
+**Working agreement (see CLAUDE.md):** Claude writes each milestone in sections, tests it (including
+mutation checks that the tests can fail), commits `M<n>: ...` and pushes, explains it, and asks review questions.
+Consult the owner on design decisions before coding, and record them in DESIGN.md as D9+.
+
+**Environment gotchas:**
+- Pushing over SSH from Claude's shell: `SSH_AUTH_SOCK=$(ls ~/.ssh/agent/s.* | head -1) git push`.
+  If that fails, the owner must run `ssh-add ~/.ssh/id_ed25519` (the key has a passphrase).
+- Rust 1.99.0 is installed. If rustup is slow (the hotspot's route to the Fastly CDN), prefix the command with
+  `RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup`. crates.io downloads work fine.
+
+**Code map:** `src/wal.rs` (log), `src/memtable.rs`, `src/sstable/{block,writer,reader,mod}.rs`,
+`src/manifest.rs`, `src/db.rs` (open/recovery/flush/read path/poisoning + most tests),
+`src/db/compaction.rs`, `src/codec.rs`, `src/fsutil.rs`, `src/test_util.rs` (Rng), `src/main.rs` (REPL).
+
 ## Current status
 
 **2026-10-04: M0 done.** Scaffold committed. Nothing compiled yet (Rust not installed at scaffold time).
