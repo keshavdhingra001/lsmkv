@@ -186,3 +186,172 @@ fn footer_roundtrip_and_magic_at_end() {
     assert_eq!(&bytes[44..], b"LSMKVSST");
     assert_eq!(Footer::decode(&bytes).unwrap(), f);
 }
+
+// ---- Section 4: corruption and randomized tests ----
+
+fn footer_of(bytes: &[u8]) -> Footer {
+    let tail: &[u8; FOOTER_LEN] = bytes[bytes.len() - FOOTER_LEN..].try_into().unwrap();
+    Footer::decode(tail).unwrap()
+}
+
+fn expect_corruption<T: std::fmt::Debug>(r: Result<T>, why: &str) {
+    assert!(matches!(r, Err(Error::Corruption(_))), "{why}: got {r:?}");
+}
+
+#[test]
+fn flipped_data_byte_fails_only_that_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(200);
+    write_table(&path, 128, &entries);
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[5] ^= 0x01; // inside block 0
+    std::fs::write(&path, &bytes).unwrap();
+
+    // Index and footer are intact, so open succeeds...
+    let r = SstReader::open(&path).unwrap();
+    // ...but reading block 0 is caught by its CRC,
+    match r.get(&entries[0].0) {
+        Err(Error::Corruption(msg)) => assert!(msg.contains("block at offset 0"), "{msg}"),
+        other => panic!("expected Corruption, got {other:?}"),
+    }
+    expect_corruption(r.entries(), "full scan over bad block");
+    // ...while keys in other blocks are still readable.
+    let (k, e) = entries.last().unwrap();
+    assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+}
+
+#[test]
+fn every_metadata_byte_flip_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    write_table(&path, 64, &numbered(50));
+    let good = std::fs::read(&path).unwrap();
+    let meta_start = footer_of(&good).index_offset as usize;
+
+    for i in meta_start..good.len() {
+        let mut bad = good.clone();
+        bad[i] ^= 0x01;
+        std::fs::write(&path, &bad).unwrap();
+        expect_corruption(SstReader::open(&path), &format!("flip at byte {i}"));
+    }
+}
+
+#[test]
+fn truncation_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    write_table(&path, 64, &numbered(50));
+    let good = std::fs::read(&path).unwrap();
+
+    let cuts = [
+        1,
+        2,
+        10,
+        FOOTER_LEN - 1,
+        FOOTER_LEN,
+        FOOTER_LEN + 1,
+        good.len() / 2,
+        good.len() - 1,
+    ];
+    for cut in cuts {
+        std::fs::write(&path, &good[..good.len() - cut]).unwrap();
+        expect_corruption(SstReader::open(&path), &format!("cut {cut} bytes"));
+    }
+}
+
+#[test]
+fn appended_garbage_is_detected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    write_table(&path, 64, &numbered(10));
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.extend_from_slice(b"trailing junk");
+    std::fs::write(&path, &bytes).unwrap();
+    expect_corruption(SstReader::open(&path), "appended bytes");
+}
+
+#[test]
+fn non_sstable_files_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+
+    std::fs::write(&path, b"").unwrap();
+    expect_corruption(SstReader::open(&path), "empty file");
+
+    std::fs::write(
+        &path,
+        "this is a text file, definitely not an sstable!!".repeat(3),
+    )
+    .unwrap();
+    match SstReader::open(&path) {
+        Err(Error::Corruption(msg)) => assert!(msg.contains("magic"), "{msg}"),
+        other => panic!("expected bad magic, got {other:?}"),
+    }
+}
+
+/// xorshift64: tiny deterministic PRNG, so failures are reproducible by seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    /// Short keys over a 4-letter alphabet: lots of shared prefixes, empty
+    /// keys and near-misses, which is where off-by-one bugs live.
+    fn key(&mut self) -> Vec<u8> {
+        let len = self.below(9);
+        (0..len).map(|_| b'a' + self.below(4) as u8).collect()
+    }
+
+    fn value(&mut self) -> Vec<u8> {
+        let len = self.below(65);
+        (0..len).map(|_| self.next() as u8).collect()
+    }
+}
+
+#[test]
+fn randomized_tables_match_a_btreemap() {
+    let dir = tempfile::tempdir().unwrap();
+    for seed in 1..=40u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut model = std::collections::BTreeMap::new();
+        for _ in 0..rng.below(1500) {
+            let e = if rng.below(5) == 0 {
+                Entry::Tombstone
+            } else {
+                Entry::Value(rng.value())
+            };
+            model.insert(rng.key(), e);
+        }
+        let entries: Vec<(Vec<u8>, Entry)> = model.clone().into_iter().collect();
+        let block_size = 32 + rng.below(1024) as usize;
+        let path = dir.path().join(format!("{seed}.sst"));
+        write_table(&path, block_size, &entries);
+
+        let r = SstReader::open(&path).unwrap();
+        assert_eq!(r.entries().unwrap(), entries, "seed {seed}");
+        for (k, e) in &entries {
+            assert_eq!(r.get(k).unwrap().as_ref(), Some(e), "seed {seed} key {k:?}");
+        }
+        for _ in 0..500 {
+            let probe = rng.key();
+            assert_eq!(
+                r.get(&probe).unwrap().as_ref(),
+                model.get(&probe),
+                "seed {seed} probe {probe:?}"
+            );
+        }
+    }
+}
