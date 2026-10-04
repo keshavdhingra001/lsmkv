@@ -114,7 +114,7 @@ Mistakes on the way: a non-terminating `shuffled` helper hung a benchmark for 44
 Mistakes on the way: a `/tmp` cleanup deleted a live soak's database (not an engine bug); the first inline mode flushed eagerly and masked two planted bugs; a recursive glob was exponential (replaced); the first pipelining test was too small to split commands across reads.
 
 A 20,000-seed release run found a second real bug (seed 14676): recovery replayed WALs without fsyncing them, so a later failed fsync or power cut could take back writes the reopened database had already served. Fixed (recovery fsyncs replayed WALs), with a unit test and a process-kill fault in the simulation.
-**Left running at handover (detached):** a 20,000-seed simulation rerun on the final code (`target/sim20k-final.log`), and the 10,000-round kill -9 soak started in M13 (`target/soak10k.log`, built from M13-era code). Check both first thing; if they passed, put the numbers in the README where it says SOAK_LINE / SOAK_DETAIL / SIM_DETAIL, and rerun the demo for the README's demo output (it gained a transactions step).
+**Left running at handover (detached):** a 20,000-seed simulation rerun on the final code (`target/sim20k-final.log`), and the 10,000-round kill -9 soak started in M13 (`target/soak10k.log`, built from M13-era code). Check both first thing. If they passed, update the README's long-run numbers (it currently cites the 300-round soak and "20,000-seed release runs"), and rerun the demo to refresh the README's demo output (it gained a transactions step). If either failed, replay it (`LSMKV_SIM_SEED=<n>`) before anything else.
 
 **Next step:** see RESUME HERE (the quiz in a new chat).
 
