@@ -51,6 +51,10 @@ fn main() -> lsmkv::Result<()> {
                     s.flush_bytes,
                     s.compaction_bytes
                 );
+                println!(
+                    "  reads: {} blocks from disk | bloom: {} skipped, {} false positives",
+                    s.block_reads, s.filter_negatives, s.filter_false_positives
+                );
                 for (level, (files, bytes)) in s.level_files.iter().zip(&s.level_bytes).enumerate()
                 {
                     if *files > 0 {

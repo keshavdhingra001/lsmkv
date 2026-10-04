@@ -7,7 +7,8 @@
 //! ```
 //!
 //! - Data blocks: see `block.rs`.
-//! - Filter block: reserved for bloom filters (M6); zero bytes for now.
+//! - Filter block: a bloom filter over every key (see `filter.rs`). Zero bytes
+//!   means "no filter": tables written before M6, or with filters turned off.
 //! - Index block: one entry per data block, then a CRC32 of the entries:
 //!   `[key_len u32][last_key][offset u64][size u32]`.
 //!   `last_key` is the largest key in that block, so a binary search over the
@@ -25,7 +26,9 @@ mod reader;
 mod writer;
 
 pub use reader::SstReader;
-pub use writer::SstWriter;
+pub use writer::{SstWriter, WriterOptions};
+
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::codec::{read_u32, read_u64};
 use crate::error::{Error, Result};
@@ -36,6 +39,30 @@ pub const DEFAULT_BLOCK_SIZE: usize = 4096;
 pub const FOOTER_LEN: usize = 5 * 8 + 4 + 8;
 /// "LSMKVSST" read as a little-endian u64.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"LSMKVSST");
+
+/// Counters shared by every table a database has open. Atomics, because
+/// `SstReader::get` takes `&self` (and M8 will call it from many threads).
+/// `Relaxed` is enough: each counter is independent, nothing is ordered by it.
+#[derive(Debug, Default)]
+pub struct ReadStats {
+    /// Data blocks read from disk by `get`.
+    pub block_reads: AtomicU64,
+    /// Lookups where a table's filter said "definitely not here" (each one a
+    /// block read saved).
+    pub filter_negatives: AtomicU64,
+    /// Lookups where the filter said "maybe" but the table didn't hold the key.
+    pub filter_false_positives: AtomicU64,
+}
+
+impl ReadStats {
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn get(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Footer {

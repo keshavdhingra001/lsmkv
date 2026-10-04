@@ -208,8 +208,8 @@ fn flipped_data_byte_fails_only_that_block() {
 
     let good = std::fs::read(&path).unwrap();
     // A byte just before the last block's 4-byte CRC trailer, i.e. inside the
-    // last data block (the filter block is empty, so the index follows it).
-    let last_block_byte = footer_of(&good).index_offset as usize - 5;
+    // last data block (the filter block follows it).
+    let last_block_byte = footer_of(&good).filter_offset as usize - 5;
     let mut bytes = good.clone();
     bytes[last_block_byte] ^= 0x01;
     std::fs::write(&path, &bytes).unwrap();
@@ -240,7 +240,9 @@ fn every_metadata_byte_flip_is_detected() {
     let path = table_path(&dir);
     write_table(&path, 64, &numbered(50));
     let good = std::fs::read(&path).unwrap();
-    let meta_start = footer_of(&good).index_offset as usize;
+    // Filter, index and footer: everything after the data blocks.
+    let meta_start = footer_of(&good).filter_offset as usize;
+    assert!(footer_of(&good).filter_len > 0);
 
     for i in meta_start..good.len() {
         let mut bad = good.clone();
@@ -353,4 +355,85 @@ fn key_range_and_size_metadata() {
     write_table(&empty, 128, &[]);
     let r = SstReader::open(&empty).unwrap();
     assert_eq!((r.smallest_key(), r.largest_key()), (None, None));
+}
+
+// ---- M6: bloom filters ----
+
+fn write_with_bloom(path: &Path, bits_per_key: usize, entries: &[(Vec<u8>, Entry)]) {
+    let opts = WriterOptions {
+        block_size: 128,
+        bloom_bits_per_key: bits_per_key,
+    };
+    let mut w = SstWriter::with_options(path, opts).unwrap();
+    for (k, e) in entries {
+        w.add(k, e).unwrap();
+    }
+    w.finish().unwrap();
+}
+
+fn count(c: &std::sync::atomic::AtomicU64) -> u64 {
+    ReadStats::get(c)
+}
+
+#[test]
+fn filter_skips_block_reads_for_missing_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(2000);
+    write_with_bloom(&path, 10, &entries);
+    let r = SstReader::open(&path).unwrap();
+    assert!(r.has_filter());
+
+    // Present keys (tombstones included) always get through the filter.
+    for (k, e) in &entries {
+        assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+    }
+    let s = r.stats();
+    assert_eq!(count(&s.block_reads), 2000);
+    assert_eq!(count(&s.filter_negatives), 0);
+    assert_eq!(count(&s.filter_false_positives), 0);
+
+    // Missing keys inside the table's key range: without a filter, each one
+    // costs a block read.
+    let misses = 2000;
+    for i in 0..misses {
+        assert_eq!(r.get(format!("key{i:06}x").as_bytes()).unwrap(), None);
+    }
+    let fp = count(&s.filter_false_positives);
+    assert_eq!(count(&s.filter_negatives) + fp, misses);
+    assert_eq!(count(&s.block_reads), 2000 + fp);
+    assert!(fp < misses / 50, "{fp} false positives in {misses}");
+}
+
+#[test]
+fn table_without_filter_reads_correctly() {
+    // bits_per_key = 0 writes the same empty filter block as pre-M6 tables.
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(300);
+    write_with_bloom(&path, 0, &entries);
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(footer_of(&bytes).filter_len, 0);
+
+    let r = SstReader::open(&path).unwrap();
+    assert!(!r.has_filter());
+    for (k, e) in &entries {
+        assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+    }
+    assert_eq!(r.get(b"key000000x").unwrap(), None);
+    // No filter, so no filter verdicts, and the miss cost a block read.
+    assert_eq!(count(&r.stats().filter_negatives), 0);
+    assert_eq!(count(&r.stats().filter_false_positives), 0);
+    assert_eq!(count(&r.stats().block_reads), 301);
+}
+
+#[test]
+fn filter_block_sits_between_blocks_and_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    write_with_bloom(&path, 10, &numbered(1000));
+    let f = footer_of(&std::fs::read(&path).unwrap());
+    // 1000 keys * 10 bits = 1250 bytes of bits, plus k and the CRC.
+    assert_eq!(f.filter_len, 1250 + 1 + 4);
+    assert_eq!(f.filter_offset + f.filter_len, f.index_offset);
 }

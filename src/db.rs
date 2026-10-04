@@ -11,12 +11,14 @@
 
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
 use crate::manifest::{Edit, Manifest, Version, MAX_LEVELS};
 use crate::memtable::{Entry, MemTable};
-use crate::sstable::{SstReader, SstWriter};
+use crate::sstable::filter::DEFAULT_BITS_PER_KEY;
+use crate::sstable::{ReadStats, SstReader, SstWriter, WriterOptions, DEFAULT_BLOCK_SIZE};
 use crate::wal::{Record, Wal};
 
 mod compaction;
@@ -34,6 +36,9 @@ pub struct Options {
     pub level_size_multiplier: u64,
     /// Compaction output is split into tables of roughly this size.
     pub target_file_size: usize,
+    /// Bloom filter bits per key in new tables; 0 turns filters off. Tables
+    /// already on disk keep whatever filter they were written with.
+    pub bloom_bits_per_key: usize,
 }
 
 impl Default for Options {
@@ -44,6 +49,7 @@ impl Default for Options {
             level1_max_bytes: 10 << 20,
             level_size_multiplier: 10,
             target_file_size: 2 << 20,
+            bloom_bits_per_key: DEFAULT_BITS_PER_KEY,
         }
     }
 }
@@ -66,6 +72,12 @@ pub struct Stats {
     pub flush_bytes: u64,
     /// SSTable bytes written by compactions since open.
     pub compaction_bytes: u64,
+    /// Data blocks `get` read from disk since open.
+    pub block_reads: u64,
+    /// Table lookups a bloom filter answered without a block read.
+    pub filter_negatives: u64,
+    /// Table lookups where the filter said "maybe" but the key wasn't there.
+    pub filter_false_positives: u64,
 }
 
 impl Stats {
@@ -107,6 +119,8 @@ pub struct Db {
     levels: Vec<Vec<Table>>,
     /// Next unused file number, for both logs and tables.
     next_file: u64,
+    /// Read counters shared by every open table.
+    read_stats: Arc<ReadStats>,
     /// Set after a WAL or manifest write fails; see `Error::Poisoned`.
     poisoned: Option<String>,
     /// Per level: largest key of the last table compacted out of it, so
@@ -152,7 +166,8 @@ impl Db {
             .max()
             .unwrap_or(0);
 
-        let levels = open_levels(&dir, &version)?;
+        let read_stats = Arc::new(ReadStats::default());
+        let levels = open_levels(&dir, &version, &read_stats)?;
 
         let mut memtable = MemTable::new();
         for (i, &n) in live_logs.iter().enumerate() {
@@ -197,6 +212,7 @@ impl Db {
             version,
             levels,
             next_file,
+            read_stats,
             poisoned: None,
             compact_pointer: vec![None; MAX_LEVELS],
             user_bytes: 0,
@@ -276,12 +292,12 @@ impl Db {
         self.next_file += 2;
 
         let table_path = table_path(&self.dir, table_id);
-        let mut writer = SstWriter::create(&table_path)?;
+        let mut writer = SstWriter::with_options(&table_path, self.writer_options())?;
         for (key, entry) in self.memtable.iter() {
             writer.add(key, entry)?;
         }
         writer.finish()?;
-        let reader = SstReader::open(&table_path)?;
+        let reader = open_table(&self.dir, table_id, &self.read_stats)?;
         self.failpoint("flush:after_table")?;
 
         let new_wal = Wal::open(&log_path(&self.dir, log_id))?;
@@ -313,6 +329,7 @@ impl Db {
     }
 
     pub fn stats(&self) -> Stats {
+        let r = &self.read_stats;
         Stats {
             memtable_entries: self.memtable.len(),
             memtable_bytes: self.memtable.approx_size(),
@@ -327,6 +344,16 @@ impl Db {
             user_bytes: self.user_bytes,
             flush_bytes: self.flush_bytes,
             compaction_bytes: self.compaction_bytes,
+            block_reads: ReadStats::get(&r.block_reads),
+            filter_negatives: ReadStats::get(&r.filter_negatives),
+            filter_false_positives: ReadStats::get(&r.filter_false_positives),
+        }
+    }
+
+    fn writer_options(&self) -> WriterOptions {
+        WriterOptions {
+            block_size: DEFAULT_BLOCK_SIZE,
+            bloom_bits_per_key: self.opts.bloom_bits_per_key,
         }
     }
 
@@ -427,10 +454,10 @@ fn table_for_key<'a>(level: &'a [Table], key: &[u8]) -> Option<&'a Table> {
 
 /// Opens every live table and arranges them by level, checking that levels
 /// 1+ are non-overlapping (the invariant `table_for_key` relies on).
-fn open_levels(dir: &Path, version: &Version) -> Result<Vec<Vec<Table>>> {
+fn open_levels(dir: &Path, version: &Version, stats: &Arc<ReadStats>) -> Result<Vec<Vec<Table>>> {
     let mut levels: Vec<Vec<Table>> = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
     for (&id, &level) in &version.tables {
-        let reader = open_table(dir, id)?;
+        let reader = open_table(dir, id, stats)?;
         levels[level as usize].push(Table { id, reader });
     }
     levels[0].sort_by_key(|t| std::cmp::Reverse(t.id));
@@ -454,8 +481,8 @@ fn open_levels(dir: &Path, version: &Version) -> Result<Vec<Vec<Table>>> {
     Ok(levels)
 }
 
-fn open_table(dir: &Path, id: u64) -> Result<SstReader> {
-    SstReader::open(&table_path(dir, id)).map_err(|e| match e {
+fn open_table(dir: &Path, id: u64, stats: &Arc<ReadStats>) -> Result<SstReader> {
+    SstReader::open_with(&table_path(dir, id), Arc::clone(stats)).map_err(|e| match e {
         Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Error::Corruption(format!(
             "manifest lists table {id}, but {id:06}.sst is missing"
         )),
@@ -538,6 +565,7 @@ mod tests {
             level1_max_bytes: 4096,
             level_size_multiplier: 3,
             target_file_size: 1024,
+            ..Options::default()
         }
     }
 
@@ -1053,6 +1081,114 @@ mod tests {
         }
     }
 
+    /// Eight level-0 tables that each span the whole key range, so every
+    /// lookup must consult all of them. Returns the database, with the key
+    /// numbers 0..n spread over the tables.
+    fn eight_overlapping_tables(dir: &Path, bloom_bits_per_key: usize, n: usize) -> Db {
+        let opts = Options {
+            l0_compaction_trigger: 100,
+            bloom_bits_per_key,
+            ..Options::default()
+        };
+        let mut db = Db::open_with(dir, opts).unwrap();
+        for round in 0..8 {
+            for i in (round..n).step_by(8) {
+                db.put(format!("key{i:06}").as_bytes(), b"v").unwrap();
+            }
+            db.flush().unwrap();
+        }
+        assert_eq!(db.stats().level_files[0], 8);
+        db
+    }
+
+    #[test]
+    fn bloom_filters_cut_block_reads_for_missing_keys() {
+        let n = 4000;
+        let mut reads = Vec::new();
+        for bits in [0, 10] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = eight_overlapping_tables(dir.path(), bits, n);
+            let before = db.stats();
+            // Between two real keys. Stopping 8 short of n keeps each probe
+            // below every table's last key, so the index alone can't rule it
+            // out: without a filter, each table costs one block read.
+            let misses = n - 8;
+            for i in 0..misses {
+                assert_eq!(db.get(format!("key{i:06}x").as_bytes()).unwrap(), None);
+            }
+            let after = db.stats();
+            let block_reads = after.block_reads - before.block_reads;
+            let negatives = after.filter_negatives - before.filter_negatives;
+            let fps = after.filter_false_positives - before.filter_false_positives;
+            let lookups = 8 * misses as u64;
+            println!(
+                "bits/key {bits:2}: {block_reads} block reads for {misses} missing keys \
+                 ({negatives} filter negatives, {fps} false positives = {:.2}%)",
+                100.0 * fps as f64 / lookups as f64
+            );
+            if bits == 0 {
+                assert_eq!(block_reads, lookups, "one read per table");
+                assert_eq!(negatives + fps, 0);
+            } else {
+                assert_eq!(negatives + fps, lookups, "every table consulted its filter");
+                assert_eq!(block_reads, fps, "only false positives read a block");
+            }
+            reads.push(block_reads);
+        }
+        assert!(
+            reads[1] * 50 < reads[0],
+            "filters saved too little: {reads:?}"
+        );
+    }
+
+    #[test]
+    fn deleted_key_in_a_filtered_table_shadows_older_tables() {
+        // The tombstone must pass the newer table's filter; if tombstones were
+        // left out of filters, the lookup would fall through to the old value.
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_with(dir.path(), small()).unwrap();
+        db.put(b"k", b"old").unwrap();
+        db.flush().unwrap();
+        db.delete(b"k").unwrap();
+        db.flush().unwrap();
+        assert_eq!(db.stats().level_files[0], 2);
+        assert_eq!(db.get(b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn tables_with_and_without_filters_coexist() {
+        let dir = tempfile::tempdir().unwrap();
+        let no_filters = Options {
+            bloom_bits_per_key: 0,
+            l0_compaction_trigger: 100,
+            ..small()
+        };
+        let mut db = Db::open_with(dir.path(), no_filters.clone()).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        let with_filters = Options {
+            bloom_bits_per_key: 10,
+            ..no_filters
+        };
+        let mut db = Db::open_with(dir.path(), with_filters).unwrap();
+        db.put(b"b", b"2").unwrap();
+        db.flush().unwrap();
+        let filtered: Vec<bool> = db.levels[0].iter().map(|t| t.reader.has_filter()).collect();
+        assert_eq!(filtered, [true, false], "newest first");
+
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+        let before = db.stats();
+        // "0" sorts before every key, so the index alone can't rule it out.
+        assert_eq!(db.get(b"0").unwrap(), None);
+        let after = db.stats();
+        // The filtered table rules it out; the old one has to read a block.
+        assert_eq!(after.filter_negatives - before.filter_negatives, 1);
+        assert_eq!(after.block_reads - before.block_reads, 1);
+    }
+
     /// Random puts, deletes, flushes, reads and reopens, checked against a
     /// BTreeMap after every read and at the end of each run.
     #[test]
@@ -1060,12 +1196,16 @@ mod tests {
         for seed in 1..=12u64 {
             let mut rng = Rng::new(seed);
             let dir = tempfile::tempdir().unwrap();
-            let opts = Options {
+            // Filter size changes on every reopen, so one database mixes
+            // tables with no filter, weak filters and normal ones.
+            let bloom_sizes = [0, 1, 4, 10];
+            let mut opts = Options {
                 memtable_size: 64 + rng.below(4000) as usize,
                 l0_compaction_trigger: 2 + rng.below(4) as usize,
                 level1_max_bytes: 512 + rng.below(8192),
                 level_size_multiplier: 2 + rng.below(9),
                 target_file_size: 256 + rng.below(4096) as usize,
+                bloom_bits_per_key: bloom_sizes[rng.below(4) as usize],
             };
             let mut db = Db::open_with(dir.path(), opts.clone()).unwrap();
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
@@ -1085,6 +1225,7 @@ mod tests {
                     85..=89 => db.flush().unwrap(),
                     90..=92 => {
                         drop(db);
+                        opts.bloom_bits_per_key = bloom_sizes[rng.below(4) as usize];
                         db = Db::open_with(dir.path(), opts.clone()).unwrap();
                     }
                     _ => assert_eq!(db.get(&k).unwrap().as_ref(), model.get(&k), "seed {seed}"),

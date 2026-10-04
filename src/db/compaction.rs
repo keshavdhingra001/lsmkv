@@ -141,7 +141,11 @@ impl Db {
             if current.is_none() {
                 let id = self.next_file;
                 self.next_file += 1;
-                current = Some((id, SstWriter::create(&table_path(&self.dir, id))?, 0));
+                current = Some((
+                    id,
+                    SstWriter::with_options(&table_path(&self.dir, id), self.writer_options())?,
+                    0,
+                ));
             }
             let (_, writer, size) = current.as_mut().expect("just set");
             writer.add(&key, &entry)?;
@@ -151,7 +155,7 @@ impl Db {
                 writer.finish()?;
                 outputs.push(Table {
                     id,
-                    reader: open_table(&self.dir, id)?,
+                    reader: open_table(&self.dir, id, &self.read_stats)?,
                 });
             }
         }
@@ -159,7 +163,7 @@ impl Db {
             writer.finish()?;
             outputs.push(Table {
                 id,
-                reader: open_table(&self.dir, id)?,
+                reader: open_table(&self.dir, id, &self.read_stats)?,
             });
         }
         self.failpoint("compact:after_tables")?;

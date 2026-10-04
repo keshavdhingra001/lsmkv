@@ -9,35 +9,67 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use super::block::BlockBuilder;
+use super::filter::{self, DEFAULT_BITS_PER_KEY};
 use super::{Footer, DEFAULT_BLOCK_SIZE};
 use crate::codec::len_u32;
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
 use crate::memtable::Entry;
 
+#[derive(Debug, Clone, Copy)]
+pub struct WriterOptions {
+    /// Target data block size.
+    pub block_size: usize,
+    /// Bloom filter size per key; 0 writes no filter (an empty filter block,
+    /// the same as tables written before filters existed).
+    pub bloom_bits_per_key: usize,
+}
+
+impl Default for WriterOptions {
+    fn default() -> Self {
+        Self {
+            block_size: DEFAULT_BLOCK_SIZE,
+            bloom_bits_per_key: DEFAULT_BITS_PER_KEY,
+        }
+    }
+}
+
 pub struct SstWriter {
     file: BufWriter<File>,
     tmp_path: PathBuf,
     final_path: PathBuf,
     block: BlockBuilder,
-    block_size: usize,
+    opts: WriterOptions,
     /// Encoded index entries, written out in `finish`.
     index: Vec<u8>,
     /// Bytes written so far, i.e. where the next block starts.
     offset: u64,
     last_key: Option<Vec<u8>>,
+    /// Hash of every key, for the bloom filter built in `finish`. 8 bytes per
+    /// key, far less than keeping the keys themselves.
+    key_hashes: Vec<u64>,
     entry_count: u64,
     finished: bool,
 }
 
 impl SstWriter {
     pub fn create(path: &Path) -> Result<Self> {
-        Self::with_block_size(path, DEFAULT_BLOCK_SIZE)
+        Self::with_options(path, WriterOptions::default())
     }
 
     /// Like `create`, with a custom block size (tests use tiny blocks to get
     /// many of them).
     pub fn with_block_size(path: &Path, block_size: usize) -> Result<Self> {
+        Self::with_options(
+            path,
+            WriterOptions {
+                block_size,
+                ..WriterOptions::default()
+            },
+        )
+    }
+
+    pub fn with_options(path: &Path, opts: WriterOptions) -> Result<Self> {
         if path.exists() {
             return Err(Error::InvalidArgument(format!(
                 "{} already exists; sstables are immutable",
@@ -56,10 +88,11 @@ impl SstWriter {
             tmp_path,
             final_path: path.to_path_buf(),
             block: BlockBuilder::new(),
-            block_size,
+            opts,
             index: Vec::new(),
             offset: 0,
             last_key: None,
+            key_hashes: Vec::new(),
             entry_count: 0,
             finished: false,
         })
@@ -80,7 +113,12 @@ impl SstWriter {
         self.block.add(key, entry)?;
         self.last_key = Some(key.to_vec());
         self.entry_count += 1;
-        if self.block.size() >= self.block_size {
+        // Tombstones go in the filter too: a lookup must find them to learn
+        // the key is deleted, or it would fall through to older tables.
+        if self.opts.bloom_bits_per_key > 0 {
+            self.key_hashes.push(filter::hash(key));
+        }
+        if self.block.size() >= self.opts.block_size {
             self.flush_block()?;
         }
         Ok(())
@@ -106,13 +144,17 @@ impl SstWriter {
         Ok(())
     }
 
-    /// Writes the index and footer, then atomically publishes the file.
+    /// Writes the filter, index and footer, then atomically publishes the file.
     pub fn finish(mut self) -> Result<()> {
         self.flush_block()?;
 
-        // Filter block: empty until bloom filters land in M6.
         let filter_offset = self.offset;
-        let filter_len = 0;
+        let mut filter_len = 0;
+        if self.opts.bloom_bits_per_key > 0 {
+            let f = filter::build(&self.key_hashes, self.opts.bloom_bits_per_key);
+            self.file.write_all(&f)?;
+            filter_len = f.len() as u64;
+        }
 
         let index_offset = filter_offset + filter_len;
         let index_crc = crc32fast::hash(&self.index);

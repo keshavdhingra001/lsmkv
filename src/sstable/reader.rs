@@ -1,11 +1,14 @@
-//! Reads an SSTable: footer -> index (kept in memory) -> one block per lookup.
+//! Reads an SSTable: footer -> filter and index (both kept in memory) -> at
+//! most one block per lookup.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::block::Block;
-use super::{Footer, FOOTER_LEN};
+use super::filter::BloomFilter;
+use super::{Footer, ReadStats, FOOTER_LEN};
 use crate::codec::{read_u32, read_u64};
 use crate::error::{Error, Result};
 use crate::memtable::Entry;
@@ -22,16 +25,25 @@ pub struct SstReader {
     file: File,
     path: PathBuf,
     index: Vec<IndexEntry>,
+    /// `None` for tables written without a filter: every lookup is a "maybe".
+    filter: Option<BloomFilter>,
     footer: Footer,
     /// First key in the table (read from block 0 on open); `None` if empty.
     smallest: Option<Vec<u8>>,
     file_size: u64,
+    stats: Arc<ReadStats>,
 }
 
 impl SstReader {
-    /// Opens and validates the footer and index. Data blocks are read lazily
-    /// and checked by their own CRC on every read.
+    /// Opens a table with its own private counters (tests and tools).
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, Arc::default())
+    }
+
+    /// Opens and validates the footer, filter and index. Data blocks are read
+    /// lazily and checked by their own CRC on every read. `stats` is shared
+    /// with the database's other tables.
+    pub fn open_with(path: &Path, stats: Arc<ReadStats>) -> Result<Self> {
         let corrupt = |what: String| Error::Corruption(format!("{}: {what}", path.display()));
 
         let file = File::open(path)?;
@@ -61,13 +73,23 @@ impl SstReader {
         file.read_exact_at(&mut ibuf, footer.index_offset)?;
         let index = decode_index(&ibuf, footer.filter_offset).map_err(corrupt)?;
 
+        let filter = if footer.filter_len == 0 {
+            None
+        } else {
+            let mut buf = vec![0u8; footer.filter_len as usize];
+            file.read_exact_at(&mut buf, footer.filter_offset)?;
+            Some(BloomFilter::decode(&buf).map_err(|e| corrupt(e.to_string()))?)
+        };
+
         let mut reader = Self {
             file,
             path: path.to_path_buf(),
             index,
+            filter,
             footer,
             smallest: None,
             file_size: file_len,
+            stats,
         };
         // The index only stores each block's LAST key, so the table's first
         // key costs one block read. Compaction needs it for overlap checks.
@@ -86,12 +108,29 @@ impl SstReader {
 
     /// `None` = key not in this table; `Some(Tombstone)` = deleted here.
     pub fn get(&self, key: &[u8]) -> Result<Option<Entry>> {
+        let Some(filter) = &self.filter else {
+            return self.search(key);
+        };
+        if !filter.may_contain(key) {
+            ReadStats::bump(&self.stats.filter_negatives);
+            return Ok(None);
+        }
+        let found = self.search(key)?;
+        if found.is_none() {
+            ReadStats::bump(&self.stats.filter_false_positives);
+        }
+        Ok(found)
+    }
+
+    /// The lookup without the filter: index, then one block.
+    fn search(&self, key: &[u8]) -> Result<Option<Entry>> {
         // First block whose last key >= key: the only block that can hold it.
         let i = self.index.partition_point(|e| e.last_key.as_slice() < key);
         let Some(entry) = self.index.get(i) else {
             return Ok(None);
         };
         let raw = self.read_block(entry)?;
+        ReadStats::bump(&self.stats.block_reads);
         Block::new(&raw)
             .and_then(|b| b.get(key))
             .map_err(|e| self.block_error(e, entry))
@@ -144,6 +183,14 @@ impl SstReader {
 
     pub fn block_count(&self) -> usize {
         self.index.len()
+    }
+
+    pub fn has_filter(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    pub fn stats(&self) -> &ReadStats {
+        &self.stats
     }
 
     pub fn path(&self) -> &Path {
