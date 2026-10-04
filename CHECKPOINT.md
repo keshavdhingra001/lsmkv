@@ -30,6 +30,17 @@ MVCC, atomic batches, RESP server, compression, deterministic simulation testing
 **State:** M0–M7 are done. 109 unit tests + the kill -9 integration test pass, clippy clean, everything pushed to `main`
 at https://github.com/keshavdhingra001/lsmkv (private; owner said keep it private "not yet").
 
+**Progress:** 8 of 13 milestones (M0–M7). By effort it's about 55%: M8 is the biggest one left; M9–M11 are medium, M12 is small.
+
+**Open with the owner (not blocking, but raise them):**
+- 40 review questions (M1–M7, below) are unanswered. CLAUDE.md says to answer them before the next milestone; the owner has said "go" each time anyway. Offer to quiz them.
+- The repo stays private until the owner says otherwise.
+
+**Commands:**
+- Everything: `cargo fmt && cargo clippy --all-targets && cargo test` (about 2 s; includes `tests/kill9.rs`).
+- Benchmark: `cargo run --release --example durability` (about 20 s; writes under `target/`).
+- REPL: `cargo run -- ./data`, then `stats` shows writes/groups/fsyncs, reads, cache and bloom counters.
+
 **Next action:** M8 (concurrency, the read side). It needs a design consult before any code. Propose these as a table with a recommendation, then wait for "go":
 - **Reads without the state lock:** today `get` holds the state lock for its whole lookup, including disk reads. RocksDB's "SuperVersion" approach: an `Arc` snapshot of (memtable, immutable memtables, table levels), grabbed under a brief lock, then read with no lock held.
 - **Immutable memtable + background flush:** swap a full memtable out instead of flushing inline, so writers don't stall (D11's max latency is 140–570 ms). Reads must then check the active memtable, then the immutable ones, then the tables.
