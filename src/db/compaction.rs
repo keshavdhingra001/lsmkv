@@ -19,6 +19,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use std::sync::Arc;
+
 use super::{open_table, remove_obsolete_files, table_for_key, table_path, State, Table};
 use crate::error::Result;
 use crate::key::{InternalKey, Shadowed};
@@ -50,7 +52,7 @@ impl State {
     pub(super) fn compact_all(&mut self) -> Result<()> {
         self.flush_memtable()?;
         for level in 0..MAX_LEVELS - 1 {
-            while !self.levels[level].is_empty() {
+            while !self.current.levels[level].is_empty() {
                 let c = self.compaction_for(level);
                 self.run(c)?;
             }
@@ -61,9 +63,12 @@ impl State {
     /// The level whose score (fullness relative to its limit) is highest,
     /// if any level is at or over its limit. The bottom level never compacts.
     fn pick_level(&self) -> Option<usize> {
-        let l0 = self.levels[0].len() as f64 / self.opts.l0_compaction_trigger as f64;
+        let l0 = self.current.levels[0].len() as f64 / self.opts.l0_compaction_trigger as f64;
         let deeper = (1..MAX_LEVELS - 1).map(|n| {
-            let bytes: u64 = self.levels[n].iter().map(|t| t.reader.file_size()).sum();
+            let bytes: u64 = self.current.levels[n]
+                .iter()
+                .map(|t| t.reader.file_size())
+                .sum();
             (bytes as f64 / self.max_bytes_for(n) as f64, n)
         });
         std::iter::once((l0, 0))
@@ -83,8 +88,8 @@ impl State {
 
     /// Chooses the input tables for compacting `level` (which must be non-empty).
     fn compaction_for(&self, level: usize) -> Compaction {
-        let tables = &self.levels[level];
-        let inputs: Vec<&Table> = if level == 0 {
+        let tables = &self.current.levels[level];
+        let inputs: Vec<&Arc<Table>> = if level == 0 {
             tables.iter().collect()
         } else {
             let after_pointer = self.compact_pointer[level]
@@ -99,7 +104,7 @@ impl State {
             .min()
             .unwrap_or_default();
         let hi = inputs.iter().map(|t| t.largest()).max().unwrap_or_default();
-        let next = self.levels[level + 1]
+        let next = self.current.levels[level + 1]
             .iter()
             .filter(|t| t.largest() >= lo && t.smallest() <= hi)
             .map(|t| t.id)
@@ -124,7 +129,7 @@ impl State {
         let mut merged: BTreeMap<InternalKey, Entry> = BTreeMap::new();
         for (level, ids) in [(c.level, &c.inputs), (out_level, &c.next)] {
             for id in ids {
-                let table = self.levels[level]
+                let table = self.current.levels[level]
                     .iter()
                     .find(|t| t.id == *id)
                     .expect("compaction input is live");
@@ -138,8 +143,8 @@ impl State {
         // only leaves orphan files, which the next open deletes.
         let oldest_snapshot = self.oldest_snapshot();
         let mut shadowed = Shadowed::new(oldest_snapshot);
-        let deeper = &self.levels[out_level + 1..];
-        let mut outputs: Vec<Table> = Vec::new();
+        let deeper = &self.current.levels[out_level + 1..];
+        let mut outputs: Vec<Arc<Table>> = Vec::new();
         // (table id, writer, bytes so far, last user key written)
         let mut current: Option<(u64, SstWriter, usize, Vec<u8>)> = None;
         for (InternalKey { user_key: key, seq }, entry) in merged {
@@ -155,10 +160,10 @@ impl State {
                 if *size >= self.opts.target_file_size && *last != key {
                     let (id, writer, _, _) = current.take().expect("just checked");
                     writer.finish()?;
-                    outputs.push(Table {
+                    outputs.push(Arc::new(Table {
                         id,
                         reader: open_table(&self.dir, id, &self.read_ctx)?,
-                    });
+                    }));
                 }
             }
             if current.is_none() {
@@ -178,10 +183,10 @@ impl State {
         }
         if let Some((id, writer, _, _)) = current.take() {
             writer.finish()?;
-            outputs.push(Table {
+            outputs.push(Arc::new(Table {
                 id,
                 reader: open_table(&self.dir, id, &self.read_ctx)?,
-            });
+            }));
         }
         self.failpoint("compact:after_tables")?;
 
@@ -194,17 +199,23 @@ impl State {
         self.commit(&edits, "compact")?;
 
         if c.level > 0 {
-            self.compact_pointer[c.level] = self.levels[c.level]
+            self.compact_pointer[c.level] = self.current.levels[c.level]
                 .iter()
                 .find(|t| t.id == c.inputs[0])
                 .map(|t| t.largest().to_vec());
         }
         self.compaction_bytes += outputs.iter().map(|t| t.reader.file_size()).sum::<u64>();
+        let mut levels = self.current.levels.clone();
         for level in [c.level, out_level] {
-            self.levels[level].retain(|t| !removed.contains(&t.id));
+            levels[level].retain(|t| !removed.contains(&t.id));
         }
-        self.levels[out_level].extend(outputs);
-        self.levels[out_level].sort_by(|a, b| a.smallest().cmp(b.smallest()));
+        levels[out_level].extend(outputs);
+        levels[out_level].sort_by(|a, b| a.smallest().cmp(b.smallest()));
+        let mem = Arc::clone(&self.current.mem);
+        self.install(mem, levels);
+        // Readers still holding the old SuperVersion keep reading the inputs:
+        // an unlinked file stays readable through a descriptor that's already
+        // open (POSIX), and the descriptor closes with the last `Arc<Table>`.
         let _ = remove_obsolete_files(&self.dir, &self.version);
         Ok(())
     }
@@ -221,17 +232,20 @@ impl State {
         ];
         self.commit(&edits, "compact")?;
 
-        let i = self.levels[level]
+        let mut levels = self.current.levels.clone();
+        let i = levels[level]
             .iter()
             .position(|t| t.id == id)
             .expect("moved table is live");
-        let table = self.levels[level].remove(i);
+        let table = levels[level].remove(i);
         if level > 0 {
             self.compact_pointer[level] = Some(table.largest().to_vec());
         }
-        let next = &mut self.levels[level + 1];
+        let next = &mut levels[level + 1];
         let at = next.partition_point(|t| t.smallest() < table.smallest());
         next.insert(at, table);
+        let mem = Arc::clone(&self.current.mem);
+        self.install(mem, levels);
         Ok(())
     }
 }

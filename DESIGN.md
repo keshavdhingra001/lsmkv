@@ -196,6 +196,30 @@ The owner approved the whole proposal ("go"). Each entry is filled in as its sec
 - **D17 Writer wakeups:** one condition variable per writer instead of `notify_all`.
 - **D18 Sequence numbers and snapshots:** done first, in M8 rather than Tier 3, because M9's range scans need a consistent view too.
 
+### D12: Reads without the state lock: SuperVersion (approved 2026-10-04)
+- **Before:** `get` held the state lock for its whole lookup, disk reads included, so every read waited behind any write group's bookkeeping, and behind every inline flush and compaction (hundreds of ms).
+- **What:** a `SuperVersion` is an immutable bundle of everything a read needs: the memtable (`Arc<MemTable>`) and the table levels (`Vec<Vec<Arc<Table>>>`). The current one sits in a small `ReadView` mutex together with `last_seq`. `get` locks it only to clone one `Arc` and copy one number (tens of ns), releases it, and then searches with no lock held.
+- **Changes never mutate a SuperVersion:** flush and compaction build the next one (cloning the level vectors is just `Arc` clones) and `State::install` it, which also publishes it to the read view. `State` holds the current one as an `Arc<SuperVersion>`, which Rust won't let you mutate, so a change that forgets to publish doesn't compile. The compiler caught exactly that while this was being built: compaction's in-place `levels.retain(...)` stopped compiling.
+- **A reader with an old SuperVersion stays correct:** the `Arc`s keep its memtable and tables alive. Compaction deletes its input files right after installing, while a reader may still be searching them. That's safe on POSIX: an unlinked file stays readable through a descriptor that's already open, and `SstReader` holds its descriptor until the last `Arc<Table>` drops (`an_old_super_version_stays_readable_after_compaction`). On Windows this would need deferred deletion (RocksDB keeps a list of obsolete files and deletes them when the last reference goes).
+- **One lock, not two atomics:** `last_seq` and the SuperVersion are read under the same lock, so a reader can never pair a new snapshot number with an old SuperVersion that's missing the memtable those writes went into. With separate atomics, the load order would have to be argued very carefully. RocksDB goes further (thread-local cached SuperVersions, no shared lock at all), which only matters at millions of reads per second.
+- **Lock order:** state, then the WAL or the read view. Readers take only the read view.
+- **Verified by:**
+  - `reads_never_wait_for_the_state_lock`: a test holds the state lock, and reads of a table key, a memtable key and a missing key all finish.
+  - `readers_see_every_acknowledged_write_across_flushes_and_compactions`: one writer counts a key up through hundreds of flushes and compactions while 3 readers check that the value never goes backwards and is never below the last acknowledged value.
+  - Mutation checks, each caught: `get` taking the state lock; flush publishing the emptied memtable before its table (caught 5 of 5 runs); a group never published to readers; `install` not publishing.
+
+### D13: Memtable: a lock-free skiplist (approved 2026-10-04)
+- **What:** `crossbeam_skiplist::SkipMap<InternalKey, Entry>` instead of a `BTreeMap`. Inserts take `&self`, so the group commit leader inserts while readers search the same map, and neither blocks the other.
+- **Alternatives:**
+  - `RwLock<BTreeMap>`: readers would block while a group is applied, and the writer would wait for the readers to drain.
+  - A hand-written skiplist: LevelDB's own uses one writer plus atomic pointers. In Rust it needs `unsafe` code and manual memory reclamation, which is a project of its own.
+  - crossbeam's version handles memory reclamation with epochs. It's the one dependency besides `crc32fast` and `thiserror` that sits on the core path.
+- **Why a skiplist at all:** it's the standard structure for this (LevelDB, RocksDB). A sorted linked list with express lanes allows lock-free insertion, since a new node is linked in with one compare-and-swap per level. Balanced trees rebalance, which touches many nodes at once.
+- **Half-applied groups are invisible:** the leader inserts a group's versions one by one, but they carry numbers above the published `last_seq` until the whole group is in. Readers read at the published number, so they skip all of them (`readers_see_exactly_their_snapshot_while_a_writer_inserts`: one writer and 3 readers checking exact versions at 20,000 snapshots).
+- **Costs:**
+  - A `get` now clones the value out of the map (it returned a reference before); `Db::get` copied it anyway.
+  - Nothing is ever removed from a memtable, so epoch reclamation has nothing to do until the whole memtable drops.
+
 ### D18: Sequence numbers and the internal key order (approved 2026-10-04)
 - **What:** every write gets the next sequence number (`SeqNo`, a `u64`; 0 means "before any write"). Every stored version carries it: WAL records, memtable keys and table entries. A read picks a snapshot number and sees, per key, the newest version at or below it.
 - **Order:** versions sort by user key ascending, then by seq **descending**, so a key's newest version comes first and a lookup stops at the first version it may see (LevelDB's internal key order).

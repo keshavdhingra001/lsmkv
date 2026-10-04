@@ -145,6 +145,54 @@ impl Table {
     }
 }
 
+/// Live tables by level. Level 0: newest first, ranges may overlap.
+/// Levels 1+: sorted by key, ranges never overlap.
+type Levels = Vec<Vec<Arc<Table>>>;
+
+/// Everything a read needs, as one immutable unit (RocksDB's SuperVersion,
+/// DESIGN.md D12). A flush or compaction never changes one; it builds the
+/// next one and `State::install`s it. A reader holding an older one keeps
+/// reading it safely: its memtable and tables stay alive (and their files
+/// open) for as long as the reader holds the `Arc`.
+struct SuperVersion {
+    mem: Arc<MemTable>,
+    levels: Levels,
+}
+
+impl SuperVersion {
+    /// The newest version of `key` at or below `snapshot`. Sources are
+    /// searched newest first, and every version in a newer source is newer
+    /// than every version in an older one, so the first version found that
+    /// the snapshot may see is the answer.
+    fn get(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Vec<u8>>> {
+        match self.mem.get(key, snapshot) {
+            Some((_, Entry::Value(v))) => return Ok(Some(v)),
+            Some((_, Entry::Tombstone)) => return Ok(None),
+            None => {}
+        }
+        let level0 = self.levels[0].iter();
+        let deeper = self.levels[1..]
+            .iter()
+            .filter_map(|level| table_for_key(level, key));
+        for table in level0.chain(deeper) {
+            match table.reader.get(key, snapshot)? {
+                Some(Entry::Value(v)) => return Ok(Some(v)),
+                Some(Entry::Tombstone) => return Ok(None),
+                None => {}
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// What readers take, in one brief lock and never the state lock: the
+/// current SuperVersion and the snapshot to read it at.
+struct ReadView {
+    current: Arc<SuperVersion>,
+    /// `State::last_seq`, as of the last group applied.
+    last_seq: SeqNo,
+}
+
 /// A write group is cut off at this many bytes of records, so one writer's
 /// latency isn't stretched by an unbounded pile of others (LevelDB: 1 MiB).
 const MAX_GROUP_BYTES: usize = 1 << 20;
@@ -158,8 +206,11 @@ const MAX_GROUP_BYTES: usize = 1 << 20;
 /// others (the *followers*), whose writes are now done. Writers that arrive
 /// meanwhile queue up and form the next group. See DESIGN.md D11.
 ///
-/// Lock order: `state`, then the WAL. Nothing takes `state` while holding the
-/// WAL, so the two can't deadlock.
+/// Reads never take the state lock: they copy an `Arc` out of the read view
+/// and search it with no lock held (DESIGN.md D12).
+///
+/// Lock order: `state`, then the WAL or the read view. Nothing takes `state`
+/// while holding either, so they can't deadlock.
 pub struct Db {
     shared: Arc<Shared>,
     /// The background fsync thread in `SyncMode::Periodic`.
@@ -169,6 +220,9 @@ pub struct Db {
 struct Shared {
     dir: PathBuf,
     state: Mutex<State>,
+    /// What readers read. Its own lock, held only to copy out an `Arc` and a
+    /// number, so a reader never waits behind a write, flush or compaction.
+    view: Arc<Mutex<ReadView>>,
     /// Writers wait here for their turn to lead or for their leader to finish
     /// their write; flush and compaction wait here for a group to finish.
     turn: Condvar,
@@ -188,7 +242,10 @@ struct Shared {
 struct State {
     dir: PathBuf,
     opts: Options,
-    memtable: MemTable,
+    /// The live memtable and tables. Changed only by `install`, which also
+    /// publishes the new one to readers.
+    current: Arc<SuperVersion>,
+    view: Arc<Mutex<ReadView>>,
     /// The active log. Its own lock, so a leader can append and fsync while
     /// readers and queueing writers use `State`. Only a leader (with `writing`
     /// set) or a holder of the state lock with no group in flight touches it.
@@ -196,9 +253,6 @@ struct State {
     wal_number: u64,
     manifest: Manifest,
     version: Version,
-    /// Live tables by level. Level 0: newest first, ranges may overlap.
-    /// Levels 1+: sorted by key, ranges never overlap.
-    levels: Vec<Vec<Table>>,
     /// Next unused file number, for both logs and tables.
     next_file: u64,
     /// Sequence number of the newest write applied to the memtable. Reads
@@ -269,7 +323,7 @@ impl Db {
         let read_ctx = Arc::new(ReadContext::new(opts.block_cache_bytes));
         let levels = open_levels(&dir, &version, &read_ctx)?;
 
-        let mut memtable = MemTable::new();
+        let memtable = MemTable::new();
         // Writes in tables are numbered up to `last_sequence`; anything newer
         // is in the logs.
         let mut last_seq = version.last_sequence;
@@ -278,7 +332,7 @@ impl Db {
             let replay = Wal::replay(&path)?;
             for (seq, rec) in replay.records {
                 last_seq = last_seq.max(seq);
-                apply(&mut memtable, seq, rec);
+                apply(&memtable, seq, rec);
             }
             // Only the newest log gets appended to, so only it needs its torn
             // tail cut off (new writes must not land after garbage).
@@ -307,15 +361,23 @@ impl Db {
         sync_dir(&dir)?;
 
         let wal = Arc::new(Mutex::new(wal));
+        let current = Arc::new(SuperVersion {
+            mem: Arc::new(memtable),
+            levels,
+        });
+        let view = Arc::new(Mutex::new(ReadView {
+            current: Arc::clone(&current),
+            last_seq,
+        }));
         let state = State {
             dir: dir.clone(),
             opts: opts.clone(),
-            memtable,
+            current,
+            view: Arc::clone(&view),
             wal: Arc::clone(&wal),
             wal_number,
             manifest,
             version,
-            levels,
             next_file,
             last_seq,
             read_ctx,
@@ -339,6 +401,7 @@ impl Db {
         let shared = Arc::new(Shared {
             dir,
             state: Mutex::new(state),
+            view,
             turn: Condvar::new(),
             stop: Mutex::new(false),
             stop_signal: Condvar::new(),
@@ -375,9 +438,15 @@ impl Db {
     /// Newest data first: memtable, then every level-0 table (newest first),
     /// then at most one table per deeper level. The first hit wins, and a
     /// tombstone hit means "deleted": older data is not consulted.
+    ///
+    /// Takes no lock beyond copying out the read view, so it never waits for
+    /// a write group, flush or compaction (DESIGN.md D12).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let st = self.lock();
-        st.get(key, st.last_seq)
+        let (current, snapshot) = {
+            let view = lock(&self.shared.view);
+            (Arc::clone(&view.current), view.last_seq)
+        };
+        current.get(key, snapshot)
     }
 
     /// Flushes the memtable, then compacts until no level is over its limit.
@@ -556,30 +625,6 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl State {
-    /// The newest version of `key` at or below `snapshot`. Sources are
-    /// searched newest first, and every version in a newer source is newer
-    /// than every version in an older one, so the first version found that
-    /// the snapshot may see is the answer.
-    fn get(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Vec<u8>>> {
-        match self.memtable.get(key, snapshot) {
-            Some((_, Entry::Value(v))) => return Ok(Some(v.clone())),
-            Some((_, Entry::Tombstone)) => return Ok(None),
-            None => {}
-        }
-        let level0 = self.levels[0].iter();
-        let deeper = self.levels[1..]
-            .iter()
-            .filter_map(|level| table_for_key(level, key));
-        for table in level0.chain(deeper) {
-            match table.reader.get(key, snapshot)? {
-                Some(Entry::Value(v)) => return Ok(Some(v)),
-                Some(Entry::Tombstone) => return Ok(None),
-                None => {}
-            }
-        }
-        Ok(None)
-    }
-
     /// Takes the next write group off the front of the queue: at least one
     /// record, then more while the group stays under `MAX_GROUP_BYTES`.
     fn take_group(&mut self) -> Vec<(u64, Record)> {
@@ -622,14 +667,16 @@ impl State {
         for (seq, (ticket, rec)) in (first_seq..).zip(group) {
             self.writes += 1;
             self.user_bytes += record_len(&rec) as u64;
-            apply(&mut self.memtable, seq, rec);
+            apply(&self.current.mem, seq, rec);
             self.last_seq = seq;
             if ticket != leader {
                 self.finished.insert(ticket, Ok(()));
             }
         }
+        // Now the whole group is visible, at once.
+        lock(&self.view).last_seq = self.last_seq;
         // The leader pays for the flush; its followers' writes are done.
-        if self.memtable.approx_size() >= self.opts.memtable_size {
+        if self.current.mem.approx_size() >= self.opts.memtable_size {
             self.flush()?;
         }
         Ok(())
@@ -659,7 +706,7 @@ impl State {
     /// leader is appending to the WAL being retired.
     fn flush_memtable(&mut self) -> Result<()> {
         self.check_writable()?;
-        if self.memtable.is_empty() {
+        if self.current.mem.is_empty() {
             return Ok(());
         }
         let table_id = self.next_file;
@@ -673,9 +720,10 @@ impl State {
         // Overwritten versions no reader can see stay behind. Tombstones all
         // go in: older tables may hold what they delete.
         let mut shadowed = Shadowed::new(self.oldest_snapshot());
-        for (key, seq, entry) in self.memtable.iter() {
+        for e in self.current.mem.iter() {
+            let (key, seq) = (&e.key().user_key, e.key().seq);
             if !shadowed.check(key, seq) {
-                writer.add(key, seq, entry)?;
+                writer.add(key, seq, e.value())?;
             }
         }
         writer.finish()?;
@@ -698,14 +746,17 @@ impl State {
         self.commit(&edits, "flush")?;
 
         self.flush_bytes += reader.file_size();
-        self.levels[0].insert(
+        let mut levels = self.current.levels.clone();
+        levels[0].insert(
             0,
-            Table {
+            Arc::new(Table {
                 id: table_id,
                 reader,
-            },
+            }),
         );
-        self.memtable = MemTable::new();
+        // The flushed versions leave the memtable and appear in the table in
+        // one step, so a reader sees them in exactly one of the two.
+        self.install(Arc::new(MemTable::new()), levels);
         *lock(&self.wal) = new_wal;
         self.wal_number = log_id;
         let _ = remove_obsolete_files(&self.dir, &self.version);
@@ -715,11 +766,12 @@ impl State {
     fn stats(&self) -> Stats {
         let r = &self.read_ctx.stats;
         Stats {
-            memtable_entries: self.memtable.len(),
-            memtable_bytes: self.memtable.approx_size(),
-            tables: self.levels.iter().map(Vec::len).sum(),
-            level_files: self.levels.iter().map(Vec::len).collect(),
+            memtable_entries: self.current.mem.len(),
+            memtable_bytes: self.current.mem.approx_size(),
+            tables: self.current.levels.iter().map(Vec::len).sum(),
+            level_files: self.current.levels.iter().map(Vec::len).collect(),
             level_bytes: self
+                .current
                 .levels
                 .iter()
                 .map(|l| l.iter().map(|t| t.reader.file_size()).sum())
@@ -738,6 +790,13 @@ impl State {
             filter_negatives: ReadStats::get(&r.filter_negatives),
             filter_false_positives: ReadStats::get(&r.filter_false_positives),
         }
+    }
+
+    /// Makes `mem` and `levels` the live data, for this state and for
+    /// readers. The only way either changes after open.
+    fn install(&mut self, mem: Arc<MemTable>, levels: Levels) {
+        self.current = Arc::new(SuperVersion { mem, levels });
+        lock(&self.view).current = Arc::clone(&self.current);
     }
 
     /// The oldest snapshot any reader may still read at: versions it can't
@@ -815,7 +874,7 @@ fn record_len(rec: &Record) -> usize {
     }
 }
 
-fn apply(memtable: &mut MemTable, seq: SeqNo, rec: Record) {
+fn apply(memtable: &MemTable, seq: SeqNo, rec: Record) {
     match rec {
         Record::Put { key, value } => memtable.put(&key, seq, &value),
         Record::Delete { key } => memtable.delete(&key, seq),
@@ -831,18 +890,18 @@ fn table_path(dir: &Path, id: u64) -> PathBuf {
 }
 
 /// In a level >= 1 (sorted, non-overlapping), the only table that can hold `key`.
-fn table_for_key<'a>(level: &'a [Table], key: &[u8]) -> Option<&'a Table> {
+fn table_for_key<'a>(level: &'a [Arc<Table>], key: &[u8]) -> Option<&'a Arc<Table>> {
     let i = level.partition_point(|t| t.largest() < key);
     level.get(i).filter(|t| t.smallest() <= key)
 }
 
 /// Opens every live table and arranges them by level, checking that levels
 /// 1+ are non-overlapping (the invariant `table_for_key` relies on).
-fn open_levels(dir: &Path, version: &Version, ctx: &Arc<ReadContext>) -> Result<Vec<Vec<Table>>> {
-    let mut levels: Vec<Vec<Table>> = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
+fn open_levels(dir: &Path, version: &Version, ctx: &Arc<ReadContext>) -> Result<Levels> {
+    let mut levels: Levels = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
     for (&id, &level) in &version.tables {
         let reader = open_table(dir, id, ctx)?;
-        levels[level as usize].push(Table { id, reader });
+        levels[level as usize].push(Arc::new(Table { id, reader }));
     }
     levels[0].sort_by_key(|t| std::cmp::Reverse(t.id));
     for (n, level) in levels.iter_mut().enumerate().skip(1) {
@@ -1036,7 +1095,7 @@ mod tests {
         );
         db.flush().unwrap();
         let st = db.state();
-        let entries = st.levels[0][0].reader.entries().unwrap();
+        let entries = st.current.levels[0][0].reader.entries().unwrap();
         let kept: Vec<(&[u8], SeqNo)> = entries.iter().map(|(k, s, _)| (&k[..], *s)).collect();
         // Newest of a and b; c's tombstone stays (older tables may hold c).
         assert_eq!(kept, vec![(&b"a"[..], 5), (b"b", 7), (b"c", 8)]);
@@ -1264,6 +1323,7 @@ mod tests {
     /// Entries stored across all live tables (all versions, plus tombstones).
     fn stored_entries(db: &Db) -> u64 {
         db.state()
+            .current
             .levels
             .iter()
             .flatten()
@@ -1617,7 +1677,7 @@ mod tests {
         let db = Db::open_with(dir.path(), with_filters).unwrap();
         db.put(b"b", b"2").unwrap();
         db.flush().unwrap();
-        let filtered: Vec<bool> = db.state().levels[0]
+        let filtered: Vec<bool> = db.state().current.levels[0]
             .iter()
             .map(|t| t.reader.has_filter())
             .collect();
@@ -2085,5 +2145,117 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- M8: reads without the state lock ----
+
+    /// The read view, as `Db::get` takes it.
+    fn read_view(db: &Db) -> (Arc<SuperVersion>, SeqNo) {
+        let view = lock(&db.shared.view);
+        (Arc::clone(&view.current), view.last_seq)
+    }
+
+    #[test]
+    fn reads_never_wait_for_the_state_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(dir.path()).unwrap());
+        db.put(b"in-table", b"1").unwrap();
+        db.flush().unwrap();
+        db.put(b"in-memtable", b"2").unwrap();
+
+        // Stand-in for a long flush or compaction: hold the state lock.
+        let st = db.state();
+        let reader = {
+            let db = Arc::clone(&db);
+            thread::spawn(move || {
+                (
+                    db.get(b"in-table").unwrap(),
+                    db.get(b"in-memtable").unwrap(),
+                    db.get(b"missing").unwrap(),
+                )
+            })
+        };
+        let finished = eventually(|| reader.is_finished());
+        drop(st);
+        assert!(finished, "a read waited for the state lock");
+        let got = reader.join().unwrap();
+        assert_eq!(got, (Some(b"1".to_vec()), Some(b"2".to_vec()), None));
+    }
+
+    #[test]
+    fn an_old_super_version_stays_readable_after_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), small()).unwrap();
+        for i in 0..200 {
+            db.put(&key(i), b"old").unwrap();
+        }
+        db.flush().unwrap();
+        // A reader that grabbed the view before the compaction...
+        let (old, snapshot) = read_view(&db);
+        let old_ids: Vec<u64> = old.levels.iter().flatten().map(|t| t.id).collect();
+        for i in 0..200 {
+            db.put(&key(i), b"new").unwrap();
+        }
+        db.compact_all().unwrap();
+        // ...whose table files the compaction has since deleted...
+        for id in &old_ids {
+            assert!(
+                !table_path(dir.path(), *id).exists(),
+                "table {id} not deleted"
+            );
+        }
+        // ...still reads its point in time, through the descriptors it holds.
+        for i in (0..200).step_by(7) {
+            assert_eq!(old.get(&key(i), snapshot).unwrap(), Some(b"old".to_vec()));
+            assert_eq!(db.get(&key(i)).unwrap(), Some(b"new".to_vec()));
+        }
+    }
+
+    /// One writer counts a key up from 0 while flushes and compactions run.
+    /// Readers check two things on every read: the value never goes
+    /// backwards, and it's never below the last value acknowledged before the
+    /// read started. A reader that saw a memtable swapped out before its
+    /// table was in place, or a stale view, would break one of them.
+    #[test]
+    fn readers_see_every_acknowledged_write_across_flushes_and_compactions() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_with(dir.path(), tiny()).unwrap());
+        let acked = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        db.put(b"counter", &0u64.to_be_bytes()).unwrap();
+
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (db, acked, done) = (Arc::clone(&db), Arc::clone(&acked), Arc::clone(&done));
+                thread::spawn(move || {
+                    let mut last = 0;
+                    let mut reads = 0u64;
+                    while !done.load(Ordering::Acquire) {
+                        let floor = acked.load(Ordering::Acquire);
+                        let v = db.get(b"counter").unwrap().expect("counter vanished");
+                        let v = u64::from_be_bytes(v.try_into().unwrap());
+                        assert!(v >= floor, "read {v} after {floor} was acknowledged");
+                        assert!(v >= last, "went backwards: {last} then {v}");
+                        last = v;
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        let n = 3000u64;
+        for i in 1..=n {
+            db.put(b"counter", &i.to_be_bytes()).unwrap();
+            // Filler, so the memtable fills and flushes and compactions run.
+            db.put(&key(i as usize % 500), &[b'x'; 40]).unwrap();
+            acked.store(i, Ordering::Release);
+        }
+        done.store(true, Ordering::Release);
+        let reads: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        let st = db.stats();
+        assert!(st.compaction_bytes > 0 && st.flush_bytes > 0, "{st:?}");
+        assert!(reads > 1000, "only {reads} reads");
     }
 }
