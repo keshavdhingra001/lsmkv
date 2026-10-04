@@ -155,7 +155,7 @@ impl Db {
                 writer.finish()?;
                 outputs.push(Table {
                     id,
-                    reader: open_table(&self.dir, id, &self.read_stats)?,
+                    reader: open_table(&self.dir, id, &self.read_ctx)?,
                 });
             }
         }
@@ -163,7 +163,7 @@ impl Db {
             writer.finish()?;
             outputs.push(Table {
                 id,
-                reader: open_table(&self.dir, id, &self.read_stats)?,
+                reader: open_table(&self.dir, id, &self.read_ctx)?,
             });
         }
         self.failpoint("compact:after_tables")?;

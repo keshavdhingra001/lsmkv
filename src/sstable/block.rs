@@ -100,6 +100,14 @@ impl<'a> Block<'a> {
         Ok(Self { data })
     }
 
+    /// Wraps bytes that already passed `new` once (the block cache only holds
+    /// verified blocks), skipping the CRC. Never use it on bytes from disk.
+    pub(crate) fn from_verified(raw: &'a [u8]) -> Self {
+        Self {
+            data: &raw[..raw.len() - CRC_LEN],
+        }
+    }
+
     /// Entries in key order. Yields one `Err` and then stops if an entry is
     /// malformed (only possible with a writer bug, since the CRC passed).
     pub fn iter(&self) -> BlockIter<'a> {

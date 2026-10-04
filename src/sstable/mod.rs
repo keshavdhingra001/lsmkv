@@ -21,10 +21,12 @@
 //! See DESIGN.md D5 for the reasoning.
 
 pub mod block;
+pub mod cache;
 pub mod filter;
 mod reader;
 mod writer;
 
+pub use cache::BlockCache;
 pub use reader::SstReader;
 pub use writer::{SstWriter, WriterOptions};
 
@@ -40,13 +42,38 @@ pub const FOOTER_LEN: usize = 5 * 8 + 4 + 8;
 /// "LSMKVSST" read as a little-endian u64.
 pub const MAGIC: u64 = u64::from_le_bytes(*b"LSMKVSST");
 
+/// What every table a database has open shares: one block cache and one set
+/// of counters. The default has the cache turned off.
+#[derive(Debug)]
+pub struct ReadContext {
+    pub cache: BlockCache,
+    pub stats: ReadStats,
+}
+
+impl ReadContext {
+    pub fn new(cache_bytes: usize) -> Self {
+        Self {
+            cache: BlockCache::new(cache_bytes),
+            stats: ReadStats::default(),
+        }
+    }
+}
+
+impl Default for ReadContext {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
 /// Counters shared by every table a database has open. Atomics, because
 /// `SstReader::get` takes `&self` (and M8 will call it from many threads).
 /// `Relaxed` is enough: each counter is independent, nothing is ordered by it.
 #[derive(Debug, Default)]
 pub struct ReadStats {
-    /// Data blocks read from disk by `get`.
+    /// Data blocks read from disk by `get` (block cache misses).
     pub block_reads: AtomicU64,
+    /// Data blocks `get` found in the block cache.
+    pub cache_hits: AtomicU64,
     /// Lookups where a table's filter said "definitely not here" (each one a
     /// block read saved).
     pub filter_negatives: AtomicU64,

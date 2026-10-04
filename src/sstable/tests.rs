@@ -437,3 +437,74 @@ fn filter_block_sits_between_blocks_and_index() {
     assert_eq!(f.filter_len, 1250 + 1 + 4);
     assert_eq!(f.filter_offset + f.filter_len, f.index_offset);
 }
+
+// ---- M6: block cache ----
+
+fn cached_ctx() -> std::sync::Arc<ReadContext> {
+    std::sync::Arc::new(ReadContext::new(1 << 20))
+}
+
+#[test]
+fn repeat_reads_hit_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(500);
+    write_table(&path, 128, &entries);
+    let r = SstReader::open_with(&path, 1, cached_ctx()).unwrap();
+
+    for _ in 0..3 {
+        for (k, e) in &entries {
+            assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+        }
+    }
+    let s = r.stats();
+    // Each block comes off the disk once; every other access is a hit.
+    let blocks = r.block_count() as u64;
+    assert_eq!(count(&s.block_reads), blocks);
+    assert_eq!(count(&s.cache_hits), 3 * 500 - blocks);
+}
+
+#[test]
+fn cache_keys_include_the_table_id() {
+    // Two tables with identical layouts (same keys, same-length values), so
+    // every block sits at the same offset in both. Only the id tells them apart.
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = cached_ctx();
+    let mut readers = Vec::new();
+    for (id, v) in [(1, "AAAA"), (2, "BBBB")] {
+        let path = dir.path().join(format!("{id}.sst"));
+        let entries: Vec<_> = (0..100)
+            .map(|i| (format!("k{i:03}").into_bytes(), val(v)))
+            .collect();
+        write_table(&path, 128, &entries);
+        readers.push(SstReader::open_with(&path, id, std::sync::Arc::clone(&ctx)).unwrap());
+    }
+    for _ in 0..2 {
+        assert_eq!(readers[0].get(b"k050").unwrap(), Some(val("AAAA")));
+        assert_eq!(readers[1].get(b"k050").unwrap(), Some(val("BBBB")));
+    }
+    assert_eq!(count(&ctx.stats.block_reads), 2);
+    assert_eq!(count(&ctx.stats.cache_hits), 2);
+}
+
+#[test]
+fn corrupt_block_is_never_cached() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(200);
+    write_table(&path, 128, &entries);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let last_block_byte = footer_of(&bytes).filter_offset as usize - 5;
+    bytes[last_block_byte] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let ctx = cached_ctx();
+    let r = SstReader::open_with(&path, 1, std::sync::Arc::clone(&ctx)).unwrap();
+    let last = &entries.last().unwrap().0;
+    for _ in 0..2 {
+        expect_corruption(r.get(last), "bad block, read again");
+    }
+    // Both reads went to the disk, and nothing bad was kept.
+    assert_eq!(count(&ctx.stats.block_reads), 2);
+    assert!(ctx.cache.is_empty());
+}

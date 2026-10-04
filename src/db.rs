@@ -18,7 +18,9 @@ use crate::fsutil::sync_dir;
 use crate::manifest::{Edit, Manifest, Version, MAX_LEVELS};
 use crate::memtable::{Entry, MemTable};
 use crate::sstable::filter::DEFAULT_BITS_PER_KEY;
-use crate::sstable::{ReadStats, SstReader, SstWriter, WriterOptions, DEFAULT_BLOCK_SIZE};
+use crate::sstable::{
+    ReadContext, ReadStats, SstReader, SstWriter, WriterOptions, DEFAULT_BLOCK_SIZE,
+};
 use crate::wal::{Record, Wal};
 
 mod compaction;
@@ -39,6 +41,8 @@ pub struct Options {
     /// Bloom filter bits per key in new tables; 0 turns filters off. Tables
     /// already on disk keep whatever filter they were written with.
     pub bloom_bits_per_key: usize,
+    /// Block cache size, shared by all tables; 0 turns it off.
+    pub block_cache_bytes: usize,
 }
 
 impl Default for Options {
@@ -50,6 +54,7 @@ impl Default for Options {
             level_size_multiplier: 10,
             target_file_size: 2 << 20,
             bloom_bits_per_key: DEFAULT_BITS_PER_KEY,
+            block_cache_bytes: 8 << 20,
         }
     }
 }
@@ -72,8 +77,12 @@ pub struct Stats {
     pub flush_bytes: u64,
     /// SSTable bytes written by compactions since open.
     pub compaction_bytes: u64,
-    /// Data blocks `get` read from disk since open.
+    /// Data blocks `get` read from disk since open (block cache misses).
     pub block_reads: u64,
+    /// Data blocks `get` found in the block cache since open.
+    pub cache_hits: u64,
+    /// Bytes currently in the block cache.
+    pub cache_bytes: usize,
     /// Table lookups a bloom filter answered without a block read.
     pub filter_negatives: u64,
     /// Table lookups where the filter said "maybe" but the key wasn't there.
@@ -119,8 +128,8 @@ pub struct Db {
     levels: Vec<Vec<Table>>,
     /// Next unused file number, for both logs and tables.
     next_file: u64,
-    /// Read counters shared by every open table.
-    read_stats: Arc<ReadStats>,
+    /// Block cache and read counters, shared by every open table.
+    read_ctx: Arc<ReadContext>,
     /// Set after a WAL or manifest write fails; see `Error::Poisoned`.
     poisoned: Option<String>,
     /// Per level: largest key of the last table compacted out of it, so
@@ -166,8 +175,8 @@ impl Db {
             .max()
             .unwrap_or(0);
 
-        let read_stats = Arc::new(ReadStats::default());
-        let levels = open_levels(&dir, &version, &read_stats)?;
+        let read_ctx = Arc::new(ReadContext::new(opts.block_cache_bytes));
+        let levels = open_levels(&dir, &version, &read_ctx)?;
 
         let mut memtable = MemTable::new();
         for (i, &n) in live_logs.iter().enumerate() {
@@ -212,7 +221,7 @@ impl Db {
             version,
             levels,
             next_file,
-            read_stats,
+            read_ctx,
             poisoned: None,
             compact_pointer: vec![None; MAX_LEVELS],
             user_bytes: 0,
@@ -297,7 +306,7 @@ impl Db {
             writer.add(key, entry)?;
         }
         writer.finish()?;
-        let reader = open_table(&self.dir, table_id, &self.read_stats)?;
+        let reader = open_table(&self.dir, table_id, &self.read_ctx)?;
         self.failpoint("flush:after_table")?;
 
         let new_wal = Wal::open(&log_path(&self.dir, log_id))?;
@@ -329,7 +338,7 @@ impl Db {
     }
 
     pub fn stats(&self) -> Stats {
-        let r = &self.read_stats;
+        let r = &self.read_ctx.stats;
         Stats {
             memtable_entries: self.memtable.len(),
             memtable_bytes: self.memtable.approx_size(),
@@ -345,6 +354,8 @@ impl Db {
             flush_bytes: self.flush_bytes,
             compaction_bytes: self.compaction_bytes,
             block_reads: ReadStats::get(&r.block_reads),
+            cache_hits: ReadStats::get(&r.cache_hits),
+            cache_bytes: self.read_ctx.cache.used(),
             filter_negatives: ReadStats::get(&r.filter_negatives),
             filter_false_positives: ReadStats::get(&r.filter_false_positives),
         }
@@ -454,10 +465,10 @@ fn table_for_key<'a>(level: &'a [Table], key: &[u8]) -> Option<&'a Table> {
 
 /// Opens every live table and arranges them by level, checking that levels
 /// 1+ are non-overlapping (the invariant `table_for_key` relies on).
-fn open_levels(dir: &Path, version: &Version, stats: &Arc<ReadStats>) -> Result<Vec<Vec<Table>>> {
+fn open_levels(dir: &Path, version: &Version, ctx: &Arc<ReadContext>) -> Result<Vec<Vec<Table>>> {
     let mut levels: Vec<Vec<Table>> = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
     for (&id, &level) in &version.tables {
-        let reader = open_table(dir, id, stats)?;
+        let reader = open_table(dir, id, ctx)?;
         levels[level as usize].push(Table { id, reader });
     }
     levels[0].sort_by_key(|t| std::cmp::Reverse(t.id));
@@ -481,8 +492,8 @@ fn open_levels(dir: &Path, version: &Version, stats: &Arc<ReadStats>) -> Result<
     Ok(levels)
 }
 
-fn open_table(dir: &Path, id: u64, stats: &Arc<ReadStats>) -> Result<SstReader> {
-    SstReader::open_with(&table_path(dir, id), Arc::clone(stats)).map_err(|e| match e {
+fn open_table(dir: &Path, id: u64, ctx: &Arc<ReadContext>) -> Result<SstReader> {
+    SstReader::open_with(&table_path(dir, id), id, Arc::clone(ctx)).map_err(|e| match e {
         Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Error::Corruption(format!(
             "manifest lists table {id}, but {id:06}.sst is missing"
         )),
@@ -1088,6 +1099,8 @@ mod tests {
         let opts = Options {
             l0_compaction_trigger: 100,
             bloom_bits_per_key,
+            // Cache off, so every block a lookup needs is a disk read.
+            block_cache_bytes: 0,
             ..Options::default()
         };
         let mut db = Db::open_with(dir, opts).unwrap();
@@ -1160,6 +1173,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let no_filters = Options {
             bloom_bits_per_key: 0,
+            block_cache_bytes: 0,
             l0_compaction_trigger: 100,
             ..small()
         };
@@ -1189,6 +1203,56 @@ mod tests {
         assert_eq!(after.block_reads - before.block_reads, 1);
     }
 
+    /// Skewed reads (90% of lookups hit the first 5% of keys), with the cache
+    /// off and then on.
+    #[test]
+    fn hot_keys_are_served_from_the_cache() {
+        let n = 20_000;
+        let value = [b'v'; 100];
+        let mut results = Vec::new();
+        for cache in [0, 256 << 10] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = Options {
+                block_cache_bytes: cache,
+                ..Options::default()
+            };
+            let mut db = Db::open_with(dir.path(), opts).unwrap();
+            for i in 0..n {
+                db.put(format!("key{i:06}").as_bytes(), &value).unwrap();
+            }
+            db.compact_all().unwrap();
+
+            let mut rng = Rng::new(7);
+            let before = db.stats();
+            let reads = 20_000;
+            for _ in 0..reads {
+                let i = if rng.below(10) < 9 {
+                    rng.below(n / 20)
+                } else {
+                    rng.below(n)
+                };
+                let k = format!("key{i:06}");
+                assert_eq!(db.get(k.as_bytes()).unwrap().as_deref(), Some(&value[..]));
+            }
+            let after = db.stats();
+            let disk = after.block_reads - before.block_reads;
+            let hits = after.cache_hits - before.cache_hits;
+            println!(
+                "cache {:>3} KiB: {disk} disk reads, {hits} hits ({:.1}% hit rate) for {reads} gets",
+                cache >> 10,
+                100.0 * hits as f64 / reads as f64
+            );
+            assert_eq!(disk + hits, reads, "one block per get, from somewhere");
+            assert!(after.cache_bytes <= cache);
+            results.push(disk);
+        }
+        assert_eq!(results[0], 20_000);
+        assert!(
+            results[1] * 5 < results[0],
+            "cache saved too little: {results:?}"
+        );
+    }
+
     /// Random puts, deletes, flushes, reads and reopens, checked against a
     /// BTreeMap after every read and at the end of each run.
     #[test]
@@ -1206,6 +1270,8 @@ mod tests {
                 level_size_multiplier: 2 + rng.below(9),
                 target_file_size: 256 + rng.below(4096) as usize,
                 bloom_bits_per_key: bloom_sizes[rng.below(4) as usize],
+                // Off, tiny (constant eviction) or roomy.
+                block_cache_bytes: [0, 300, 4096, 1 << 20][rng.below(4) as usize],
             };
             let mut db = Db::open_with(dir.path(), opts.clone()).unwrap();
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();

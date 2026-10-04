@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use super::block::Block;
 use super::filter::BloomFilter;
-use super::{Footer, ReadStats, FOOTER_LEN};
+use super::{Footer, ReadContext, ReadStats, FOOTER_LEN};
 use crate::codec::{read_u32, read_u64};
 use crate::error::{Error, Result};
 use crate::memtable::Entry;
@@ -31,19 +31,22 @@ pub struct SstReader {
     /// First key in the table (read from block 0 on open); `None` if empty.
     smallest: Option<Vec<u8>>,
     file_size: u64,
-    stats: Arc<ReadStats>,
+    /// The table's file number: its half of every block cache key.
+    id: u64,
+    ctx: Arc<ReadContext>,
 }
 
 impl SstReader {
-    /// Opens a table with its own private counters (tests and tools).
+    /// Opens a table with its own counters and no block cache (tests and tools).
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with(path, Arc::default())
+        Self::open_with(path, 0, Arc::default())
     }
 
     /// Opens and validates the footer, filter and index. Data blocks are read
-    /// lazily and checked by their own CRC on every read. `stats` is shared
-    /// with the database's other tables.
-    pub fn open_with(path: &Path, stats: Arc<ReadStats>) -> Result<Self> {
+    /// lazily and checked by their own CRC when read from disk. `ctx` (cache
+    /// and counters) is shared with the database's other tables; `id` must be
+    /// unique among them, since it keys this table's blocks in the cache.
+    pub fn open_with(path: &Path, id: u64, ctx: Arc<ReadContext>) -> Result<Self> {
         let corrupt = |what: String| Error::Corruption(format!("{}: {what}", path.display()));
 
         let file = File::open(path)?;
@@ -89,7 +92,8 @@ impl SstReader {
             footer,
             smallest: None,
             file_size: file_len,
-            stats,
+            id,
+            ctx,
         };
         // The index only stores each block's LAST key, so the table's first
         // key costs one block read. Compaction needs it for overlap checks.
@@ -112,12 +116,12 @@ impl SstReader {
             return self.search(key);
         };
         if !filter.may_contain(key) {
-            ReadStats::bump(&self.stats.filter_negatives);
+            ReadStats::bump(&self.ctx.stats.filter_negatives);
             return Ok(None);
         }
         let found = self.search(key)?;
         if found.is_none() {
-            ReadStats::bump(&self.stats.filter_false_positives);
+            ReadStats::bump(&self.ctx.stats.filter_false_positives);
         }
         Ok(found)
     }
@@ -129,15 +133,34 @@ impl SstReader {
         let Some(entry) = self.index.get(i) else {
             return Ok(None);
         };
-        let raw = self.read_block(entry)?;
-        ReadStats::bump(&self.stats.block_reads);
-        Block::new(&raw)
-            .and_then(|b| b.get(key))
+        let raw = self.cached_block(entry)?;
+        Block::from_verified(&raw)
+            .get(key)
             .map_err(|e| self.block_error(e, entry))
+    }
+
+    /// A CRC-verified data block, from the cache if it's there, otherwise
+    /// read from disk, verified, and cached. A block that fails its CRC is
+    /// never cached, so every later read reports the corruption too.
+    fn cached_block(&self, entry: &IndexEntry) -> Result<Arc<[u8]>> {
+        let key = (self.id, entry.offset);
+        let stats = &self.ctx.stats;
+        if let Some(raw) = self.ctx.cache.get(key) {
+            ReadStats::bump(&stats.cache_hits);
+            return Ok(raw);
+        }
+        let raw = self.read_block(entry)?;
+        ReadStats::bump(&stats.block_reads);
+        Block::new(&raw).map_err(|e| self.block_error(e, entry))?;
+        let raw: Arc<[u8]> = raw.into();
+        self.ctx.cache.insert(key, Arc::clone(&raw));
+        Ok(raw)
     }
 
     /// Every entry in key order. Reads the whole table; used by tests now and
     /// by flush/compaction later (M9 replaces it with a streaming iterator).
+    /// Bypasses the block cache: a compaction reads each block once, and
+    /// caching them would evict the blocks that reads actually reuse.
     pub fn entries(&self) -> Result<Vec<(Vec<u8>, Entry)>> {
         let mut out = Vec::with_capacity(self.footer.entry_count as usize);
         for entry in &self.index {
@@ -190,7 +213,7 @@ impl SstReader {
     }
 
     pub fn stats(&self) -> &ReadStats {
-        &self.stats
+        &self.ctx.stats
     }
 
     pub fn path(&self) -> &Path {
