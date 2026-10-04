@@ -3,12 +3,12 @@
 LSM-tree KV store in Rust. Portfolio project aimed at SWE / backend interviews, so the owner
 must be able to defend every design decision and line of core logic.
 
-## Pair mode (agreed 2026-10-04)
-- **The owner implements the core logic:** memtable, WAL encode/decode, SSTable format,
-  flush, compaction, bloom filter, iterators. These are marked `TODO(you, Mx)` / `todo!()`.
-- **Claude** scaffolds, writes tests and harnesses, reviews, explains, and writes glue,
-  CLI and benchmarks. Don't fill in a `todo!()` in core logic unless the owner explicitly
-  asks for that specific piece. Give hints, failing tests, or review comments instead.
+## Claude builds, owner studies (changed from pair mode on 2026-10-04)
+- **Claude implements each milestone**, including core logic, then explains every
+  non-obvious line and asks the owner interview-style questions about it.
+- **The owner studies and modifies the code before the next milestone starts.** Don't
+  start milestone N+1 until the owner confirms they've reviewed milestone N and answered
+  its questions. Track the answers in CHECKPOINT.md.
 - Stop and consult the owner at each design decision (format choices, compaction strategy,
   durability defaults). Record the decision in DESIGN.md.
 

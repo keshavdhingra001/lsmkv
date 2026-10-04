@@ -29,23 +29,23 @@ impl MemTable {
         Self::default()
     }
 
-    /// TODO(you, M1): insert `Entry::Value`, and add key + value length to `approx_size`.
+    /// Inserts or overwrites `key`.
     pub fn put(&mut self, key: &[u8], value: &[u8]) {
-        let _ = (key, value);
-        todo!("M1: MemTable::put")
+        self.approx_size += key.len() + value.len();
+        self.map.insert(key.to_vec(), Entry::Value(value.to_vec()));
     }
 
-    /// TODO(you, M1): insert `Entry::Tombstone`, and add key length to `approx_size`.
+    /// Marks `key` as deleted. The key stays in the map as a tombstone so the
+    /// delete still shadows older copies of the key that live in SSTables.
     pub fn delete(&mut self, key: &[u8]) {
-        let _ = key;
-        todo!("M1: MemTable::delete")
+        self.approx_size += key.len();
+        self.map.insert(key.to_vec(), Entry::Tombstone);
     }
 
-    /// TODO(you, M1): `None` = memtable has never seen the key;
+    /// `None` = memtable has never seen the key;
     /// `Some(Entry::Tombstone)` = key was deleted.
     pub fn get(&self, key: &[u8]) -> Option<&Entry> {
-        let _ = key;
-        todo!("M1: MemTable::get")
+        self.map.get(key)
     }
 
     pub fn approx_size(&self) -> usize {

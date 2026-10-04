@@ -6,7 +6,7 @@ Single source of truth for "where are we". Update at the end of every session.
 
 ### Tier 1: Baseline
 - [x] **M0** Scaffold: crate layout, error type, Db glue, REPL, tests for M1/M2 *(Claude)*
-- [ ] **M1** Memtable: `put` / `delete` / `get` with tombstones *(you)*
+- [x] **M1** Memtable: `put` / `delete` / `get` with tombstones *(Claude; 7/7 tests pass; owner review pending)*
 - [ ] **M2** WAL: `append` / `replay`, CRC32 per record, torn-tail handling *(you)*
 - [ ] **M3** SSTable writer + reader: data blocks, index block, footer *(you, Claude writes tests)*
 - [ ] **M4** Flush memtable -> SSTable at size threshold; read path checks memtable then SSTables newest-first; manifest *(you)*
@@ -29,11 +29,19 @@ MVCC, atomic batches, RESP server, compression, deterministic simulation testing
 
 **2026-10-04: M0 done.** Scaffold committed. Nothing compiled yet (Rust not installed at scaffold time).
 
-**Next step:** install Rust, then run `cargo test`. Every M1/M2 test should fail with `todo!()` panics.
-Implement `src/memtable.rs` (M1) until `cargo test memtable` passes, then `src/wal.rs` (M2).
+**2026-10-04: Mode switched.** Claude now writes each milestone; owner studies and answers questions before the next one (see CLAUDE.md).
+M1 done: 7/7 memtable tests pass, clippy clean. Rust 1.99.0 installed (via TUNA mirror; Fastly route from the hotspot is slow).
+
+**Next step:** owner answers M1 questions. WAL/db tests fail on `todo!()` until M2.
+Owner answers the M1 questions below, then Claude starts M2 (WAL).
+
+## M1 review questions (owner answers)
+1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?
+2. Why `BTreeMap` and not `HashMap`?
+3. `approx_size` never shrinks on overwrite. When does that flush early, and why is it acceptable?
 
 ## Blockers / open decisions
-- [ ] Rust toolchain not installed (`sudo pacman -S rustup && rustup default stable`)
+- [x] Rust 1.99.0 installed
 - [x] GitHub: private repo https://github.com/keshavdhingra001/lsmkv (SSH remote, key ~/.ssh/id_ed25519)
 - [x] Git email links to GitHub account keshavdhingra001
 - [ ] DESIGN.md: how to treat mid-log WAL corruption (see `Wal::replay` doc comment)
