@@ -438,3 +438,35 @@ The owner approved the combined M9–M12 proposal in one "go".
 ### M10 results
 - **Crash soak** (`cargo test --release --test kill9 -- --ignored`): 300 `kill -9` rounds against one directory, alternating `Always` and `Periodic`; **1,022,073 acknowledged operations checked, 573 in flight at a kill, none lost or wrong.** The data reached level 4 (108 tables). 85 s.
 - **Long fuzz** (`PROPTEST_CASES=5000 cargo test --release --test model`): 5,000 random option sets and operation sequences (up to 300 operations each), no failure. 41 s.
+
+### M11: Benchmarks vs RocksDB, approved 2026-10-04 (D24)
+
+### D24: Benchmark methodology (approved 2026-10-04)
+- **Harness:** a separate crate, `bench/` (its own `[workspace]`), depending on `lsmkv` and the `rocksdb` crate 0.25 (RocksDB 11.8.1) with default features off (no compression libraries) plus `bindgen-runtime`. `cargo test` on the main crate never builds librocksdb. The first build compiles RocksDB's C++: about 7 minutes on this laptop.
+- **Workloads,** named after `db_bench`: `fillseq`, `fillrandom`, `overwrite`, `readrandom`, `readmissing` (16-byte keys that sort among the real ones but were never written), `seekrandom` (seek + 100 `next`), `readwhilewriting` (4 readers + 1 writer for 10 s), and `fillrandom` with fsync per write (20k keys). 1M keys of 16 bytes, 100-byte values.
+- **Matched settings:** 4 MiB memtable with one immutable memtable behind it, 10-bit bloom filters, 8 MiB block cache, 4 KiB blocks, no compression, level-0 triggers 4 / 8 / 12, 10 MiB level 1 growing 10x, 2 MiB tables, one background thread, WAL written but not fsynced per write (`Periodic(1s)` vs `sync = false`).
+- **Metrics:** ops/s; p50/p99/p99.9 from every operation's latency (`Instant` around each call, sorted at the end; no histogram dependency). Write amplification is SSTable bytes written by flushes and compactions over user bytes: ours from `Stats`, RocksDB's from its `rocksdb.flush.write.bytes` and `rocksdb.compact.write.bytes` tickers. WAL bytes are left out on both sides.
+- **Fairness fixes, made after the first run showed lsmkv ahead almost everywhere:**
+  - RocksDB statistics at the default level time every operation. Set to counters only (`ExceptHistogramOrTimers`).
+  - RocksDB sizes levels dynamically by default since 8.x. Set to static (`level_compaction_dynamic_level_bytes = false`), like lsmkv.
+  - Checked that librocksdb is built with `NDEBUG` (no assertions).
+  - Rebuilt both with `-C target-cpu=native`, in case RocksDB's CRC32C was falling back to software while `crc32fast` picks SSE4.2/PCLMUL at run time. The results didn't change, so that wasn't it.
+- **Results** (native builds, ranges over 2 runs; the same table is in the README):
+| workload | lsmkv ops/s | RocksDB ops/s | p99 µs, lsmkv vs RocksDB | write amp, lsmkv vs RocksDB |
+|---|---:|---:|---:|---:|
+| fillseq | 390k–414k | 406k–421k | 4.9 vs 4.6–4.7 | 2.28 vs 1.00 |
+| fillrandom | 293k–314k | 339k–348k | 6.7–6.9 vs 6.0–6.3 | 5.81 vs 4.26–4.66 |
+| overwrite | 256k–276k | 179k–318k | 6.9–7.2 vs 7.0–9.5 | 6.86–6.89 vs 5.21–6.51 |
+| readrandom | 459k–472k | 236k–249k | 4.7–4.9 vs 7.7–9.4 |  |
+| readmissing | 1.75M–1.87M | 1.14M–1.16M | 1.8–1.9 vs 2.9 |  |
+| seekrandom (+100 next) | 43k–45k | 29k–31k | 39.4–39.7 vs 56.7–58.7 |  |
+| readwhilewriting: reads (4 threads) | 406k–410k | 398k–406k | 24.2–25.2 vs 19.4–20.4 |  |
+| readwhilewriting: writes (1 thread) | 138k–144k | 82k–171k | 10.6–11.0 vs 11.3–13.9 |  |
+| fillrandom (fsync each) | 586–840 | 493–722 | 9168–9774 vs 9227–16263 |  |
+- **Reading it honestly:**
+  - **Writes are roughly even, and RocksDB's compaction is better.** It fills randomly 8–19% faster with lower write amplification, and on sequential keys it moves level-0 tables down without rewriting them (write amp 1.00 vs our 2.28: our level-0 compaction always merges into level 1, D8).
+  - **Single-threaded point reads and seeks are 1.4–2.0x faster in lsmkv. Not profiled** (`perf` isn't available here). Ruled out: value copying (the crate's `get` is `get_pinned` + one `to_vec`, like ours) and CPU-specific CRC code (the native build). Likely: RocksDB's more general read path (merge operators, range tombstones, per-read options, a thread-local SuperVersion) and the C API boundary. That's a statement about this setup, not about read speed in general.
+  - **Under concurrency it evens out:** with 4 readers and a writer, read throughput is equal, and RocksDB has the better read p99 and steadier writes.
+  - **The run-to-run variance is large** (RocksDB `overwrite` 179k vs 318k; one run had a ~1 ms p99.9 from a stall). Two runs aren't enough for fine distinctions; differences under ~20% shouldn't be read as real.
+  - **Not compared:** compression, prefix-compressed blocks, multiple background threads, column families, and RocksDB's tuning for large datasets that don't fit in memory. Here 129 MiB of tables sit mostly in the OS page cache.
+- **A benchmark bug on the way:** `shuffled(i, n)` cycle-walks a permutation of `0..2^k` until it lands below `n`. That only terminates when the input is already below `n`. Called with `i * 7 + 3`, it looped forever (a 44-minute hung run). `examples/scan.rs` had the same latent bug. Both now reduce the input mod `n` first.

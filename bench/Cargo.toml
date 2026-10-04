@@ -1,0 +1,17 @@
+[package]
+name = "lsmkv-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "lsmkv vs RocksDB on db_bench-style workloads (DESIGN.md D24)"
+
+# Its own workspace, so building the main crate never builds librocksdb.
+[workspace]
+
+[dependencies]
+lsmkv = { path = ".." }
+# No compression libraries: the comparison runs with compression off.
+rocksdb = { version = "0.25", default-features = false, features = ["bindgen-runtime"] }
+
+[profile.release]
+debug = false

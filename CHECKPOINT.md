@@ -19,7 +19,7 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M8** Concurrency: snapshot reads that never block the writer *(Claude; 129 unit tests + kill -9 test + before/after benchmark vs M7; owner review pending)*
 - [x] **M9** Range scans: merging iterator across memtable + levels *(Claude; 145 unit tests; 20 mutants, 19 caught + 1 equivalent; owner review pending)*
 - [x] **M10** Crash-injection harness (random kill -9, verify no acked write lost) + model-based fuzz test *(Claude; 300-round soak: 1.02M acked ops, none lost; 5,000 fuzz cases; harness and fuzzer each mutation-checked; owner review pending)*
-- [ ] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB
+- [x] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB *(Claude; `bench/` crate, RocksDB 11.8; writes even, lsmkv faster on single-threaded reads (unprofiled), RocksDB better compaction and tails)*
 - [ ] **M12** DESIGN.md complete, README with results
 
 ### Tier 3: Stretch (pick 2–3 later)
@@ -232,6 +232,14 @@ Harness bug found: libtest's unterminated `test <name> ... ` line swallowed the 
 5. Why do the fuzz test's keys come from 3 letters instead of random bytes?
 6. A planted bug survived the fuzzer until snapshot `get`s were added. What does that say about how much a model test can be trusted, and how did the mutation run expose it?
 7. How would you test power-loss durability for real? What would LazyFS or dm-log-writes let you check that `kill -9` can't?
+
+## M11 review questions (owner answers)
+1. Why does RocksDB get write amplification 1.00 on `fillseq` and lsmkv 2.28? What would you change in lsmkv's level-0 compaction to match it?
+2. The first run showed lsmkv ahead almost everywhere. What did you check before believing it, and which settings changed?
+3. Why measure p99 and p99.9 and not just the mean? Which row shows why?
+4. Why is `readmissing` so much faster than `readrandom` for both engines?
+5. With 4 readers and a writer, read throughput is equal but RocksDB has the better p99. What in lsmkv's write path could cause read tail latency?
+6. Why is `fillrandom` with fsync per write about 1,000 ops/s for both? What would make it faster without giving up durability?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed

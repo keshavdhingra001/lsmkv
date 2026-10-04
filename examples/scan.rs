@@ -23,7 +23,8 @@ fn key(i: u64) -> Vec<u8> {
 fn shuffled(i: u64, n: u64) -> u64 {
     let bits = 64 - (n - 1).leading_zeros();
     let mask = (1u64 << bits) - 1;
-    let mut x = i;
+    // Start inside 0..n: walking from outside it might never come back in.
+    let mut x = i % n;
     loop {
         x = (x
             .wrapping_mul(0x9E37_79B9_7F4A_7C15 | 1)
