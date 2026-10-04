@@ -23,6 +23,9 @@ pub struct SstReader {
     path: PathBuf,
     index: Vec<IndexEntry>,
     footer: Footer,
+    /// First key in the table (read from block 0 on open); `None` if empty.
+    smallest: Option<Vec<u8>>,
+    file_size: u64,
 }
 
 impl SstReader {
@@ -58,12 +61,27 @@ impl SstReader {
         file.read_exact_at(&mut ibuf, footer.index_offset)?;
         let index = decode_index(&ibuf, footer.filter_offset).map_err(corrupt)?;
 
-        Ok(Self {
+        let mut reader = Self {
             file,
             path: path.to_path_buf(),
             index,
             footer,
-        })
+            smallest: None,
+            file_size: file_len,
+        };
+        // The index only stores each block's LAST key, so the table's first
+        // key costs one block read. Compaction needs it for overlap checks.
+        if let Some(first) = reader.index.first() {
+            let raw = reader.read_block(first)?;
+            let block = Block::new(&raw).map_err(|e| reader.block_error(e, first))?;
+            let (key, _) = block
+                .iter()
+                .next()
+                .ok_or_else(|| corrupt("first block is empty".into()))?
+                .map_err(|e| reader.block_error(e, first))?;
+            reader.smallest = Some(key.to_vec());
+        }
+        Ok(reader)
     }
 
     /// `None` = key not in this table; `Some(Tombstone)` = deleted here.
@@ -104,6 +122,20 @@ impl SstReader {
             )));
         }
         Ok(out)
+    }
+
+    /// Smallest key in the table, or `None` for an empty table.
+    pub fn smallest_key(&self) -> Option<&[u8]> {
+        self.smallest.as_deref()
+    }
+
+    /// Largest key in the table: the last block's index key.
+    pub fn largest_key(&self) -> Option<&[u8]> {
+        self.index.last().map(|e| e.last_key.as_slice())
+    }
+
+    pub fn file_size(&self) -> u64 {
+        self.file_size
     }
 
     pub fn entry_count(&self) -> u64 {

@@ -86,7 +86,7 @@ impl Db {
 
         let mut next_file = 1 + version
             .tables
-            .iter()
+            .keys()
             .chain(&live_logs)
             .chain([&version.log_number])
             .copied()
@@ -95,7 +95,7 @@ impl Db {
 
         let tables = version
             .tables
-            .iter()
+            .keys()
             .rev()
             .map(|&id| open_table(&dir, id))
             .collect::<Result<Vec<_>>>()?;
@@ -222,7 +222,13 @@ impl Db {
         // Commit point. If the manifest write fails, it may still have reached
         // the disk, in which case the current WAL is now obsolete. Writing
         // more to it would lose data on the next open, so poison instead.
-        let edits = [Edit::AddTable(table_id), Edit::SetLogNumber(log_id)];
+        let edits = [
+            Edit::AddTable {
+                id: table_id,
+                level: 0,
+            },
+            Edit::SetLogNumber(log_id),
+        ];
         let committed = self
             .failpoint("flush:manifest")
             .and_then(|()| self.manifest.append(&edits))
@@ -363,7 +369,7 @@ fn remove_obsolete_files(dir: &Path, version: &Version) -> Result<()> {
     for (kind, path) in list_files(dir)? {
         let obsolete = match kind {
             DbFile::Log(n) => n < version.log_number,
-            DbFile::Table(id) => !version.tables.contains(&id),
+            DbFile::Table(id) => !version.tables.contains_key(&id),
             DbFile::Temp => true,
         };
         if obsolete {

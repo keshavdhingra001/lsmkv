@@ -206,21 +206,32 @@ fn flipped_data_byte_fails_only_that_block() {
     let entries = numbered(200);
     write_table(&path, 128, &entries);
 
-    let mut bytes = std::fs::read(&path).unwrap();
-    bytes[5] ^= 0x01; // inside block 0
+    let good = std::fs::read(&path).unwrap();
+    // A byte just before the last block's 4-byte CRC trailer, i.e. inside the
+    // last data block (the filter block is empty, so the index follows it).
+    let last_block_byte = footer_of(&good).index_offset as usize - 5;
+    let mut bytes = good.clone();
+    bytes[last_block_byte] ^= 0x01;
     std::fs::write(&path, &bytes).unwrap();
 
-    // Index and footer are intact, so open succeeds...
+    // Index, footer and block 0 are intact, so open succeeds...
     let r = SstReader::open(&path).unwrap();
-    // ...but reading block 0 is caught by its CRC,
-    match r.get(&entries[0].0) {
-        Err(Error::Corruption(msg)) => assert!(msg.contains("block at offset 0"), "{msg}"),
+    // ...but reading the last block is caught by its CRC,
+    match r.get(&entries.last().unwrap().0) {
+        Err(Error::Corruption(msg)) => assert!(msg.contains("block at offset"), "{msg}"),
         other => panic!("expected Corruption, got {other:?}"),
     }
     expect_corruption(r.entries(), "full scan over bad block");
     // ...while keys in other blocks are still readable.
-    let (k, e) = entries.last().unwrap();
+    let (k, e) = &entries[0];
     assert_eq!(r.get(k).unwrap().as_ref(), Some(e));
+
+    // Block 0 is read on open (for the smallest key), so damage there
+    // is caught immediately.
+    let mut bytes = good;
+    bytes[5] ^= 0x01;
+    std::fs::write(&path, &bytes).unwrap();
+    expect_corruption(SstReader::open(&path), "block 0 damage at open");
 }
 
 #[test]
@@ -325,4 +336,21 @@ fn randomized_tables_match_a_btreemap() {
             );
         }
     }
+}
+
+#[test]
+fn key_range_and_size_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = table_path(&dir);
+    let entries = numbered(500);
+    write_table(&path, 128, &entries);
+    let r = SstReader::open(&path).unwrap();
+    assert_eq!(r.smallest_key(), Some(entries[0].0.as_slice()));
+    assert_eq!(r.largest_key(), Some(entries[499].0.as_slice()));
+    assert_eq!(r.file_size(), std::fs::metadata(&path).unwrap().len());
+
+    let empty = dir.path().join("empty.sst");
+    write_table(&empty, 128, &[]);
+    let r = SstReader::open(&empty).unwrap();
+    assert_eq!((r.smallest_key(), r.largest_key()), (None, None));
 }

@@ -2,8 +2,14 @@
 //!
 //! ```text
 //! record = [crc32 u32][tag u8][value u64]      (13 bytes; CRC covers tag + value)
-//! tag 1 = AddTable(id), 2 = RemoveTable(id), 3 = SetLogNumber(n)
+//! tag 0x10 + L = AddTable(id) at level L (0 <= L < MAX_LEVELS)
+//! tag 2        = RemoveTable(id)
+//! tag 3        = SetLogNumber(n)
+//! tag 1        = AddTable(id) at level 0 (written by M4; still read)
 //! ```
+//!
+//! Putting the level in the tag keeps records fixed-size and lets manifests
+//! written before levels existed still open.
 //!
 //! - Replaying every edit in order rebuilds the current `Version`.
 //! - `SetLogNumber(n)`: WALs numbered below `n` are already in tables, so
@@ -12,7 +18,7 @@
 //!   record, or an all-zero tail, is a crash artifact and is cut off. A bad
 //!   record with more data after it is corruption.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -23,13 +29,17 @@ use crate::fsutil::sync_dir;
 
 pub const MANIFEST_FILE: &str = "MANIFEST";
 const RECORD_LEN: usize = 4 + 1 + 8;
-const TAG_ADD_TABLE: u8 = 1;
+const TAG_ADD_TABLE_L0_LEGACY: u8 = 1;
 const TAG_REMOVE_TABLE: u8 = 2;
 const TAG_SET_LOG_NUMBER: u8 = 3;
+const TAG_ADD_TABLE_BASE: u8 = 0x10;
+
+/// Levels 0..MAX_LEVELS. Level MAX_LEVELS - 1 is the bottom.
+pub const MAX_LEVELS: usize = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Edit {
-    AddTable(u64),
+    AddTable { id: u64, level: u8 },
     RemoveTable(u64),
     SetLogNumber(u64),
 }
@@ -37,8 +47,8 @@ pub enum Edit {
 /// The set of live files, as of the last manifest edit.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Version {
-    /// Live table ids. Higher id = newer data.
-    pub tables: BTreeSet<u64>,
+    /// Live table id -> level. Within level 0, higher id = newer data.
+    pub tables: BTreeMap<u64, u8>,
     /// WALs numbered >= this are live. 0 = fresh database, no log yet.
     pub log_number: u64,
 }
@@ -47,13 +57,19 @@ impl Version {
     /// Applies one edit, rejecting edits that can't happen in a valid history.
     pub fn apply(&mut self, edit: Edit) -> std::result::Result<(), String> {
         match edit {
-            Edit::AddTable(id) => {
-                if !self.tables.insert(id) {
+            Edit::AddTable { id, level } => {
+                if level as usize >= MAX_LEVELS {
+                    return Err(format!(
+                        "table {id} added at level {level}, max is {}",
+                        MAX_LEVELS - 1
+                    ));
+                }
+                if self.tables.insert(id, level).is_some() {
                     return Err(format!("table {id} added twice"));
                 }
             }
             Edit::RemoveTable(id) => {
-                if !self.tables.remove(&id) {
+                if self.tables.remove(&id).is_none() {
                     return Err(format!("removing table {id}, which isn't live"));
                 }
             }
@@ -136,7 +152,7 @@ impl Manifest {
 
 fn encode(edit: Edit, out: &mut Vec<u8>) {
     let (tag, value) = match edit {
-        Edit::AddTable(id) => (TAG_ADD_TABLE, id),
+        Edit::AddTable { id, level } => (TAG_ADD_TABLE_BASE + level, id),
         Edit::RemoveTable(id) => (TAG_REMOVE_TABLE, id),
         Edit::SetLogNumber(n) => (TAG_SET_LOG_NUMBER, n),
     };
@@ -154,7 +170,16 @@ fn decode(rec: &[u8]) -> Option<Edit> {
     }
     let value = read_u64(rec, 5);
     match rec[4] {
-        TAG_ADD_TABLE => Some(Edit::AddTable(value)),
+        TAG_ADD_TABLE_L0_LEGACY => Some(Edit::AddTable {
+            id: value,
+            level: 0,
+        }),
+        tag if (TAG_ADD_TABLE_BASE..TAG_ADD_TABLE_BASE + MAX_LEVELS as u8).contains(&tag) => {
+            Some(Edit::AddTable {
+                id: value,
+                level: tag - TAG_ADD_TABLE_BASE,
+            })
+        }
         TAG_REMOVE_TABLE => Some(Edit::RemoveTable(value)),
         TAG_SET_LOG_NUMBER => Some(Edit::SetLogNumber(value)),
         _ => None,
@@ -196,6 +221,14 @@ mod tests {
         Manifest::open(dir).unwrap().1
     }
 
+    fn add(id: u64) -> Edit {
+        Edit::AddTable { id, level: 0 }
+    }
+
+    fn ids(v: &Version) -> Vec<u64> {
+        v.tables.keys().copied().collect()
+    }
+
     #[test]
     fn fresh_manifest_is_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -210,14 +243,12 @@ mod tests {
         {
             let (mut m, _) = Manifest::open(dir.path()).unwrap();
             m.append(&[Edit::SetLogNumber(1)]).unwrap();
-            m.append(&[Edit::AddTable(2), Edit::SetLogNumber(3)])
-                .unwrap();
-            m.append(&[Edit::AddTable(4), Edit::SetLogNumber(5)])
-                .unwrap();
+            m.append(&[add(2), Edit::SetLogNumber(3)]).unwrap();
+            m.append(&[add(4), Edit::SetLogNumber(5)]).unwrap();
             m.append(&[Edit::RemoveTable(2)]).unwrap();
         }
         let v = reopen(dir.path());
-        assert_eq!(v.tables, BTreeSet::from([4]));
+        assert_eq!(ids(&v), vec![4]);
         assert_eq!(v.log_number, 5);
     }
 
@@ -227,7 +258,7 @@ mod tests {
         let path = dir.path().join(MANIFEST_FILE);
         {
             let (mut m, _) = Manifest::open(dir.path()).unwrap();
-            m.append(&[Edit::AddTable(1), Edit::AddTable(2)]).unwrap();
+            m.append(&[add(1), add(2)]).unwrap();
         }
         // Crash halfway through the second record.
         let len = fs::metadata(&path).unwrap().len();
@@ -239,10 +270,10 @@ mod tests {
             .unwrap();
         {
             let (mut m, v) = Manifest::open(dir.path()).unwrap();
-            assert_eq!(v.tables, BTreeSet::from([1]));
-            m.append(&[Edit::AddTable(7)]).unwrap();
+            assert_eq!(ids(&v), vec![1]);
+            m.append(&[add(7)]).unwrap();
         }
-        assert_eq!(reopen(dir.path()).tables, BTreeSet::from([1, 7]));
+        assert_eq!(ids(&reopen(dir.path())), vec![1, 7]);
     }
 
     #[test]
@@ -251,19 +282,19 @@ mod tests {
         let path = dir.path().join(MANIFEST_FILE);
         {
             let (mut m, _) = Manifest::open(dir.path()).unwrap();
-            m.append(&[Edit::AddTable(1), Edit::AddTable(2)]).unwrap();
+            m.append(&[add(1), add(2)]).unwrap();
         }
         let good = fs::read(&path).unwrap();
 
         let mut bad_last = good.clone();
         *bad_last.last_mut().unwrap() ^= 0xFF;
         fs::write(&path, &bad_last).unwrap();
-        assert_eq!(reopen(dir.path()).tables, BTreeSet::from([1]));
+        assert_eq!(ids(&reopen(dir.path())), vec![1]);
 
         let mut zero_tail = good.clone();
         zero_tail.extend([0u8; 40]);
         fs::write(&path, &zero_tail).unwrap();
-        assert_eq!(reopen(dir.path()).tables, BTreeSet::from([1, 2]));
+        assert_eq!(ids(&reopen(dir.path())), vec![1, 2]);
     }
 
     #[test]
@@ -272,8 +303,7 @@ mod tests {
         let path = dir.path().join(MANIFEST_FILE);
         {
             let (mut m, _) = Manifest::open(dir.path()).unwrap();
-            m.append(&[Edit::AddTable(1), Edit::AddTable(2), Edit::AddTable(3)])
-                .unwrap();
+            m.append(&[add(1), add(2), add(3)]).unwrap();
         }
         let mut bytes = fs::read(&path).unwrap();
         bytes[RECORD_LEN + 6] ^= 0xFF; // inside record 2 of 3
@@ -287,7 +317,7 @@ mod tests {
     #[test]
     fn impossible_histories_are_corruption() {
         let cases: [&[Edit]; 3] = [
-            &[Edit::AddTable(1), Edit::AddTable(1)],
+            &[add(1), add(1)],
             &[Edit::RemoveTable(9)],
             &[Edit::SetLogNumber(5), Edit::SetLogNumber(4)],
         ];
@@ -302,5 +332,51 @@ mod tests {
                 "{edits:?}"
             );
         }
+    }
+
+    #[test]
+    fn level_out_of_range_is_rejected() {
+        let mut v = Version::default();
+        let too_deep = MAX_LEVELS as u8;
+        assert!(v
+            .apply(Edit::AddTable {
+                id: 1,
+                level: too_deep
+            })
+            .is_err());
+        assert!(v
+            .apply(Edit::AddTable {
+                id: 1,
+                level: too_deep - 1
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn levels_roundtrip_and_moves_work() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (mut m, _) = Manifest::open(dir.path()).unwrap();
+            m.append(&[add(1), Edit::AddTable { id: 2, level: 3 }])
+                .unwrap();
+            // A "trivial move": same id, new level, in one batch.
+            m.append(&[Edit::RemoveTable(1), Edit::AddTable { id: 1, level: 1 }])
+                .unwrap();
+        }
+        let v = reopen(dir.path());
+        assert_eq!(v.tables, BTreeMap::from([(1, 1), (2, 3)]));
+    }
+
+    #[test]
+    fn m4_manifests_still_open_with_tables_at_level_0() {
+        // Hand-encode a legacy tag-1 record, as M4 wrote it.
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = [0u8; RECORD_LEN - 4];
+        body[0] = TAG_ADD_TABLE_L0_LEGACY;
+        body[1..].copy_from_slice(&42u64.to_le_bytes());
+        let mut rec = crc32fast::hash(&body).to_le_bytes().to_vec();
+        rec.extend_from_slice(&body);
+        fs::write(dir.path().join(MANIFEST_FILE), &rec).unwrap();
+        assert_eq!(reopen(dir.path()).tables, BTreeMap::from([(42, 0)]));
     }
 }
