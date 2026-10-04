@@ -14,10 +14,10 @@
 //! - Header is 13 bytes.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 pub const HEADER_LEN: usize = 4 + 1 + 4 + 4;
 pub const KIND_PUT: u8 = 1;
@@ -53,12 +53,30 @@ impl Wal {
         })
     }
 
-    /// TODO(you, M2): encode `rec` in the layout above and write it to `self.file`.
-    /// Use `crc32fast::Hasher`. Do NOT fsync here; that's `sync`'s job, which lets
-    /// a caller batch several appends under one fsync later (group commit).
+    /// Encodes `rec` and writes it to the log buffer.
+    ///
+    /// Does NOT fsync; that's `sync`'s job, which lets a caller batch several
+    /// appends under one fsync later (group commit).
     pub fn append(&mut self, rec: &Record) -> Result<()> {
-        let _ = rec;
-        todo!("M2: Wal::append")
+        let (kind, key, value): (u8, &[u8], &[u8]) = match rec {
+            Record::Put { key, value } => (KIND_PUT, key, value),
+            Record::Delete { key } => (KIND_DELETE, key, &[]),
+        };
+        let key_len = len_u32(key, "key")?;
+        let val_len = len_u32(value, "value")?;
+
+        // Everything after the CRC field, built first so the CRC can cover it.
+        let mut body = Vec::with_capacity(HEADER_LEN - 4 + key.len() + value.len());
+        body.push(kind);
+        body.extend_from_slice(&key_len.to_le_bytes());
+        body.extend_from_slice(&val_len.to_le_bytes());
+        body.extend_from_slice(key);
+        body.extend_from_slice(value);
+
+        let crc = crc32fast::hash(&body);
+        self.file.write_all(&crc.to_le_bytes())?;
+        self.file.write_all(&body)?;
+        Ok(())
     }
 
     /// Pushes buffered bytes to the OS, then forces them to the disk.
@@ -68,20 +86,77 @@ impl Wal {
         Ok(())
     }
 
-    /// TODO(you, M2): read the whole file and decode records front to back.
+    /// Reads the whole log and decodes records front to back.
     ///
     /// - Missing file => empty `Replay` (fresh database).
-    /// - Stop (without an error) at the first record that is incomplete, has a
+    /// - Stops (without an error) at the first record that is incomplete, has a
     ///   bad checksum, or has an unknown `kind`. A crash mid-append leaves
-    ///   exactly that kind of torn tail.
-    /// - Set `valid_len` to the offset just past the last good record.
-    ///
-    /// Design question to answer in DESIGN.md: should corruption in the MIDDLE
-    /// of the log (good records after a bad one) be treated differently?
+    ///   exactly that kind of torn tail. (Mid-log corruption: see DESIGN.md D2.)
+    /// - `valid_len` is the offset just past the last good record.
     pub fn replay(path: &Path) -> Result<Replay> {
-        let _ = path;
-        todo!("M2: Wal::replay")
+        let buf = match std::fs::read(path) {
+            Ok(buf) => buf,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Replay::default()),
+            Err(e) => return Err(e.into()),
+        };
+
+        let mut records = Vec::new();
+        let mut pos = 0;
+        while let Some((rec, len)) = decode(&buf[pos..]) {
+            records.push(rec);
+            pos += len;
+        }
+        Ok(Replay {
+            records,
+            valid_len: pos as u64,
+        })
     }
+}
+
+/// Decodes one record from the front of `buf`.
+/// Returns the record and its encoded length, or `None` if `buf` doesn't start
+/// with a complete, valid record.
+fn decode(buf: &[u8]) -> Option<(Record, usize)> {
+    if buf.len() < HEADER_LEN {
+        return None;
+    }
+    let crc = read_u32(buf, 0);
+    let kind = buf[4];
+    let key_len = read_u32(buf, 5) as usize;
+    let val_len = read_u32(buf, 9) as usize;
+
+    // Lengths come from disk and may be garbage, so guard the addition too.
+    let total = HEADER_LEN.checked_add(key_len)?.checked_add(val_len)?;
+    if buf.len() < total {
+        return None;
+    }
+    if crc32fast::hash(&buf[4..total]) != crc {
+        return None;
+    }
+
+    let key = buf[HEADER_LEN..HEADER_LEN + key_len].to_vec();
+    let rec = match kind {
+        KIND_PUT => Record::Put {
+            key,
+            value: buf[HEADER_LEN + key_len..total].to_vec(),
+        },
+        KIND_DELETE if val_len == 0 => Record::Delete { key },
+        _ => return None,
+    };
+    Some((rec, total))
+}
+
+fn read_u32(buf: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(buf[at..at + 4].try_into().expect("4-byte slice"))
+}
+
+fn len_u32(bytes: &[u8], what: &str) -> Result<u32> {
+    u32::try_from(bytes.len()).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{what} too large: {} bytes (max {})", bytes.len(), u32::MAX),
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -166,6 +241,60 @@ mod tests {
 
         let r = Wal::replay(&path).unwrap();
         assert_eq!(r.records, vec![put("a", "1")]);
+    }
+
+    /// Builds a record by hand with a correct CRC, so tests can reach the
+    /// checks that come after the checksum.
+    fn raw_record(kind: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut body = vec![kind];
+        body.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        body.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        body.extend_from_slice(key);
+        body.extend_from_slice(value);
+        let mut out = crc32fast::hash(&body).to_le_bytes().to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn unknown_kind_stops_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        write_all(&path, &[put("a", "1")]);
+        let good_len = fs::metadata(&path).unwrap().len();
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend(raw_record(9, b"x", b"y"));
+        fs::write(&path, &bytes).unwrap();
+
+        let r = Wal::replay(&path).unwrap();
+        assert_eq!(r.records, vec![put("a", "1")]);
+        assert_eq!(r.valid_len, good_len);
+    }
+
+    #[test]
+    fn delete_with_value_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        fs::write(&path, raw_record(KIND_DELETE, b"k", b"oops")).unwrap();
+        let r = Wal::replay(&path).unwrap();
+        assert!(r.records.is_empty());
+    }
+
+    #[test]
+    fn huge_lengths_do_not_panic() {
+        // key_len = val_len = u32::MAX: must be treated as torn, not overflow
+        // or try to allocate gigabytes.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let mut bytes = vec![0u8; 4];
+        bytes.push(KIND_PUT);
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let r = Wal::replay(&path).unwrap();
+        assert!(r.records.is_empty());
+        assert_eq!(r.valid_len, 0);
     }
 
     #[test]
