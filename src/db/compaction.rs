@@ -6,7 +6,8 @@
 //! - Level n >= 1 compacts when its bytes exceed its limit. One table goes in,
 //!   chosen round-robin through the key space (`compact_pointer`).
 //! - The chosen tables plus every overlapping table in the next level are
-//!   merged in internal key order, and the result is written to the next
+//!   merged in internal key order (a streaming k-way merge, as for scans),
+//!   and the result is written to the next
 //!   level as new tables of about `target_file_size`. A table only ends
 //!   between two user keys, so each key's versions stay in one table and
 //!   tables in a level never overlap.
@@ -27,15 +28,16 @@
 //! levels can't change in between: only the background thread changes them,
 //! and it runs one job at a time.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::background::JobEnv;
+use super::iter::{MergeIter, Source};
 use super::{
     open_table, remove_obsolete_files, table_for_key, table_path, State, SuperVersion, Table,
 };
 use crate::error::Result;
-use crate::key::{InternalKey, Shadowed};
+use crate::key::Shadowed;
 use crate::manifest::{Edit, MAX_LEVELS};
 use crate::memtable::Entry;
 use crate::sstable::SstWriter;
@@ -261,14 +263,14 @@ impl CompactionJob {
     pub(super) fn run(&self, mut new_file: impl FnMut() -> u64) -> Result<Vec<Arc<Table>>> {
         #[cfg(test)]
         std::thread::sleep(self.env.slow);
-        // Merge every version into internal key order: per key, newest first.
-        // Sequence numbers are unique, so no two inputs hold the same version.
-        let mut merged: BTreeMap<InternalKey, Entry> = BTreeMap::new();
+        // Stream every version in internal key order (per key, newest
+        // first), merging the inputs as scans do: one block per input in
+        // memory, however big the compaction (DESIGN.md D20).
+        let mut sources: Vec<Source> = Vec::with_capacity(self.tables.len());
         for table in &self.tables {
-            for (key, seq, entry) in table.reader.entries()? {
-                merged.insert(InternalKey { user_key: key, seq }, entry);
-            }
+            sources.push(Box::new(table.reader.iter(None)?));
         }
+        let merged = MergeIter::new(sources)?;
 
         let env = &self.env;
         let mut shadowed = Shadowed::new(env.oldest_snapshot);
@@ -276,7 +278,8 @@ impl CompactionJob {
         let mut outputs: Vec<Arc<Table>> = Vec::new();
         // (table id, writer, bytes so far, last user key written)
         let mut current: Option<(u64, SstWriter, usize, Vec<u8>)> = None;
-        for (InternalKey { user_key: key, seq }, entry) in merged {
+        for item in merged {
+            let (key, seq, entry) = item?;
             if shadowed.check(&key, seq) {
                 continue;
             }

@@ -2995,6 +2995,44 @@ mod tests {
         assert!(now.iter().all(|(_, v)| v == b"new"));
     }
 
+    /// Staged: a flush is held in place, so the immutable memtable is one
+    /// of the scan's sources, overlapping the new memtable's keys.
+    #[test]
+    fn scan_reads_the_immutable_memtable_during_a_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            memtable_size: 16 << 10,
+            ..Options::default()
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+        db.state().slow_background = Duration::from_millis(400);
+        let flushing = |db: &Db| read_view(db).0.imm.is_some();
+        let mut n = 0;
+        while !flushing(&db) {
+            db.put(&key(n), b"imm").unwrap();
+            n += 1;
+        }
+        // Overwrite every other key in the fresh memtable.
+        for i in (0..n).step_by(2) {
+            db.put(&key(i), b"mem").unwrap();
+        }
+        let got = collect(db.iter().unwrap());
+        assert!(flushing(&db), "flush finished too soon to tell");
+        let want: Pairs = (0..n)
+            .map(|i| {
+                (
+                    key(i),
+                    if i % 2 == 0 {
+                        b"mem".to_vec()
+                    } else {
+                        b"imm".to_vec()
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
     /// A scan only opens tables whose key range overlaps it: with a table
     /// outside the range damaged on disk, a narrow scan still succeeds.
     #[test]
