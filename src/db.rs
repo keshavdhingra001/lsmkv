@@ -12,6 +12,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -170,6 +171,12 @@ struct Shared {
     /// Set when the `Db` is dropped, to stop the periodic sync thread.
     stop: Mutex<bool>,
     stop_signal: Condvar,
+    /// fsyncs done by the periodic thread. An atomic, not a `State` field,
+    /// so that thread never needs the state lock (see `sync_periodically`).
+    periodic_syncs: AtomicU64,
+    /// Test-only: the periodic thread's next fsync fails.
+    #[cfg(test)]
+    fail_periodic_sync: std::sync::atomic::AtomicBool,
 }
 
 /// Everything behind the state lock: the engine as it was before M7, plus the
@@ -287,11 +294,12 @@ impl Db {
         let wal = Wal::open(&log_path(&dir, wal_number))?;
         sync_dir(&dir)?;
 
+        let wal = Arc::new(Mutex::new(wal));
         let state = State {
             dir: dir.clone(),
             opts: opts.clone(),
             memtable,
-            wal: Arc::new(Mutex::new(wal)),
+            wal: Arc::clone(&wal),
             wal_number,
             manifest,
             version,
@@ -321,12 +329,17 @@ impl Db {
             turn: Condvar::new(),
             stop: Mutex::new(false),
             stop_signal: Condvar::new(),
+            periodic_syncs: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_periodic_sync: Default::default(),
         });
         let syncer = match opts.sync_mode {
             SyncMode::Always => None,
             SyncMode::Periodic(every) => {
                 let shared = Arc::clone(&shared);
-                Some(thread::spawn(move || sync_periodically(&shared, every)))
+                Some(thread::spawn(move || {
+                    sync_periodically(&shared, &wal, every)
+                }))
             }
         };
         Ok(Self { shared, syncer })
@@ -365,7 +378,9 @@ impl Db {
     }
 
     pub fn stats(&self) -> Stats {
-        self.lock().stats()
+        let mut stats = self.lock().stats();
+        stats.wal_syncs += self.shared.periodic_syncs.load(Ordering::Relaxed);
+        stats
     }
 
     pub fn dir(&self) -> &Path {
@@ -477,8 +492,12 @@ impl Drop for Db {
 
 /// `SyncMode::Periodic`'s thread: fsync the WAL every `every` until the `Db`
 /// is dropped. A failed fsync poisons the database, like a failed write.
-fn sync_periodically(shared: &Shared, every: Duration) {
-    let wal = Arc::clone(&lock(&shared.state).wal);
+///
+/// It never takes the state lock on the normal path, so a long flush or
+/// compaction (which holds that lock) can't stretch the interval, and it
+/// holds the WAL lock only to clone the file handle, never during the fsync
+/// itself, so writers keep appending while the disk catches up.
+fn sync_periodically(shared: &Shared, wal: &Mutex<Wal>, every: Duration) {
     let mut stopped = lock(&shared.stop);
     loop {
         // `_while` checks the flag BEFORE sleeping. A plain `wait_timeout`
@@ -495,18 +514,20 @@ fn sync_periodically(shared: &Shared, every: Duration) {
         }
         drop(stopped);
 
-        let injected = lock(&shared.state).failpoint("wal:periodic_sync");
-        // Lock order: the WAL is released before the state lock is taken.
-        let synced = injected.and_then(|()| lock(&wal).sync());
-        let mut st = lock(&shared.state);
-        match synced {
-            Ok(()) => st.wal_syncs += 1,
-            Err(e) => {
-                st.poison(e);
-                return;
+        // The WAL guard is a temporary: released at the end of this line.
+        let handle = lock(wal).sync_handle();
+        let synced = handle.and_then(|file| {
+            #[cfg(test)]
+            if shared.fail_periodic_sync.load(Ordering::Relaxed) {
+                return Err(Error::Io(std::io::Error::other("injected fsync failure")));
             }
+            Ok(file.sync_data()?)
+        });
+        if let Err(e) = synced {
+            lock(&shared.state).poison(e);
+            return;
         }
-        drop(st);
+        shared.periodic_syncs.fetch_add(1, Ordering::Relaxed);
         stopped = lock(&shared.stop);
     }
 }
@@ -1868,12 +1889,31 @@ mod tests {
         assert_eq!(db.stats().write_groups, 1);
     }
 
+    /// The periodic fsync must not wait behind a long flush or compaction,
+    /// or the "lose at most one interval" bound stretches under load.
+    #[test]
+    fn periodic_sync_never_waits_for_the_state_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), periodic(Duration::from_millis(5))).unwrap();
+        db.put(b"k", b"v").unwrap();
+        let syncs = || db.shared.periodic_syncs.load(Ordering::Relaxed);
+        let st = db.state(); // stands in for a 300 ms compaction
+        let before = syncs();
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            syncs() >= before + 5,
+            "{} syncs in 300 ms",
+            syncs() - before
+        );
+        drop(st);
+    }
+
     #[test]
     fn failed_periodic_sync_poisons() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_with(dir.path(), periodic(Duration::from_millis(5))).unwrap();
         db.put(b"k", b"v").unwrap();
-        db.state().fail_at = Some("wal:periodic_sync");
+        db.shared.fail_periodic_sync.store(true, Ordering::Relaxed);
         assert!(eventually(|| matches!(
             db.put(b"k2", b"v"),
             Err(Error::Poisoned(_))

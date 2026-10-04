@@ -90,6 +90,14 @@ impl Wal {
         Ok(())
     }
 
+    /// Pushes buffered bytes to the OS and returns a second handle to the
+    /// same file. fsync acts on the file, not the handle, so a caller can
+    /// fsync the clone without holding whatever lock guards this `Wal`.
+    pub fn sync_handle(&mut self) -> Result<File> {
+        self.file.flush()?;
+        Ok(self.file.get_ref().try_clone()?)
+    }
+
     /// Pushes buffered bytes to the OS, then forces them to the disk.
     pub fn sync(&mut self) -> Result<()> {
         self.file.flush()?;
