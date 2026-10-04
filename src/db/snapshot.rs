@@ -10,9 +10,10 @@
 //! state lock, so like `get` it never waits for writes, flushes or
 //! compactions.
 
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use super::{lock, Db};
+use super::{lock, Db, DbIter};
 use crate::error::Result;
 use crate::key::SeqNo;
 
@@ -45,6 +46,18 @@ impl Snapshot<'_> {
         // every version this snapshot can see, since compaction keeps those.
         let current = Arc::clone(&lock(&self.db.shared.view).current);
         current.get(key, self.seq)
+    }
+
+    /// The live keys in `range` as of this snapshot (see `Db::scan`). The
+    /// scan doesn't borrow the snapshot: it keeps what it reads alive itself.
+    pub fn scan<K: AsRef<[u8]> + ?Sized>(&self, range: impl RangeBounds<K>) -> Result<DbIter> {
+        let current = Arc::clone(&lock(&self.db.shared.view).current);
+        DbIter::new(&current, self.seq, range)
+    }
+
+    /// Every live key as of this snapshot.
+    pub fn iter(&self) -> Result<DbIter> {
+        self.scan::<[u8]>(..)
     }
 
     /// The sequence number this snapshot reads at: the last write it sees.

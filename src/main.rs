@@ -7,8 +7,8 @@ fn main() -> lsmkv::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "./data".into());
     let db = lsmkv::Db::open(&dir)?;
     println!(
-        "lsmkv @ {dir}  (put <k> <v> | get <k> | del <k> | snap | sget <k> | unsnap \
-         | flush | compact | stats | quit)"
+        "lsmkv @ {dir}  (put <k> <v> | get <k> | del <k> | scan [<from> [<to>]] | snap \
+         | sget <k> | sscan | unsnap | flush | compact | stats | quit)"
     );
     // At most one snapshot, for trying point-in-time reads by hand.
     let mut snap: Option<lsmkv::Snapshot> = None;
@@ -41,6 +41,13 @@ fn main() -> lsmkv::Result<()> {
                     Some(v) => println!("{}", String::from_utf8_lossy(&v)),
                     None => println!("(nil)"),
                 },
+                None => println!("no snapshot (use snap)"),
+            },
+            ["scan"] => print_scan(db.iter()?)?,
+            ["scan", from] => print_scan(db.scan(*from..)?)?,
+            ["scan", from, to] => print_scan(db.scan(*from..*to)?)?,
+            ["sscan"] => match &snap {
+                Some(s) => print_scan(s.iter()?)?,
                 None => println!("no snapshot (use snap)"),
             },
             ["unsnap"] => {
@@ -105,5 +112,23 @@ fn main() -> lsmkv::Result<()> {
             _ => println!("unknown command"),
         }
     }
+    Ok(())
+}
+
+/// Prints up to 50 pairs of a scan, then how many there were in all.
+fn print_scan(scan: lsmkv::DbIter) -> lsmkv::Result<()> {
+    let mut n = 0;
+    for item in scan {
+        let (k, v) = item?;
+        if n < 50 {
+            println!(
+                "{} = {}",
+                String::from_utf8_lossy(&k),
+                String::from_utf8_lossy(&v)
+            );
+        }
+        n += 1;
+    }
+    println!("({n} keys)");
     Ok(())
 }

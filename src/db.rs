@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
+use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -28,8 +29,10 @@ use crate::wal::{Record, Wal};
 
 mod background;
 mod compaction;
+mod iter;
 mod snapshot;
 
+pub use iter::DbIter;
 pub use snapshot::Snapshot;
 
 /// Tuning knobs. Defaults follow LevelDB.
@@ -539,6 +542,33 @@ impl Db {
             (Arc::clone(&view.current), view.last_seq)
         };
         current.get(key, snapshot)
+    }
+
+    /// The live keys in `range`, in key order, with their values, as of now:
+    /// a scan sees every write acknowledged before this call and none after
+    /// it, however long it runs. Like `get`, it never waits for writes,
+    /// flushes or compactions (DESIGN.md D19).
+    ///
+    /// Any range of byte strings works, e.g. `&str` or `Vec<u8>` keys:
+    ///
+    /// ```no_run
+    /// # let db = lsmkv::Db::open("data")?;
+    /// for item in db.scan("user:".."user;")? {
+    ///     let (key, value) = item?;
+    /// }
+    /// # Ok::<(), lsmkv::Error>(())
+    /// ```
+    pub fn scan<K: AsRef<[u8]> + ?Sized>(&self, range: impl RangeBounds<K>) -> Result<DbIter> {
+        let (current, snapshot) = {
+            let view = lock(&self.shared.view);
+            (Arc::clone(&view.current), view.last_seq)
+        };
+        DbIter::new(&current, snapshot, range)
+    }
+
+    /// Every live key, in order: `scan` over the whole key space.
+    pub fn iter(&self) -> Result<DbIter> {
+        self.scan::<[u8]>(..)
     }
 
     /// Flushes the memtable, and returns once the background thread has
@@ -1166,7 +1196,8 @@ mod tests {
     use super::*;
     use crate::sstable::SstWriter;
     use crate::test_util::Rng;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
+    use std::ops::Bound;
 
     fn small() -> Options {
         Options {
@@ -2784,6 +2815,320 @@ mod tests {
             for (snap, then) in &snaps {
                 for (k, v) in then {
                     assert_eq!(snap.get(k).unwrap().as_ref(), Some(v), "seed {seed}");
+                }
+            }
+        }
+    }
+
+    // ---- M9: range scans ----
+
+    type Pairs = Vec<(Vec<u8>, Vec<u8>)>;
+
+    fn collect(it: DbIter) -> Pairs {
+        it.map(|item| item.unwrap()).collect()
+    }
+
+    fn pairs<K: AsRef<[u8]> + ?Sized>(model: &Model, range: impl RangeBounds<K>) -> Pairs {
+        let range = (
+            range.start_bound().map(|k| k.as_ref()),
+            range.end_bound().map(|k| k.as_ref()),
+        );
+        model
+            .iter()
+            .filter(|(k, _)| range.contains(k.as_slice()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Versions spread over every kind of source: L1+ tables, level-0
+    /// tables, the immutable memtable is covered by the concurrent tests.
+    #[test]
+    fn scan_merges_every_source_and_honors_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), small()).unwrap();
+        let mut model = Model::new();
+        let mut put = |db: &Db, k: &str, v: &str| {
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+            model.insert(k.as_bytes().to_vec(), v.as_bytes().to_vec());
+        };
+        for i in 0..40 {
+            put(&db, &format!("k{i:02}"), "deep");
+        }
+        db.compact_all().unwrap();
+        for i in (0..40).step_by(3) {
+            put(&db, &format!("k{i:02}"), "l0");
+        }
+        db.flush().unwrap();
+        for i in (0..40).step_by(5) {
+            put(&db, &format!("k{i:02}"), "mem");
+        }
+        for k in ["k07", "k09", "k10"] {
+            db.delete(k.as_bytes()).unwrap();
+            model.remove(k.as_bytes());
+        }
+        let (current, _) = read_view(&db);
+        assert!(!current.levels[0].is_empty() && !current.mem.is_empty());
+        assert!(current.levels[1..].iter().any(|l| !l.is_empty()));
+
+        let b = |s: &'static str| s.as_bytes();
+        assert_eq!(collect(db.iter().unwrap()), pairs::<[u8]>(&model, ..));
+        assert_eq!(
+            collect(db.scan(b("k05")..b("k12")).unwrap()),
+            pairs(&model, b("k05")..b("k12"))
+        );
+        assert_eq!(
+            collect(db.scan(b("k05")..=b("k12")).unwrap()),
+            pairs(&model, b("k05")..=b("k12"))
+        );
+        assert_eq!(
+            collect(db.scan(b("k3")..).unwrap()),
+            pairs(&model, b("k3")..)
+        );
+        assert_eq!(
+            collect(db.scan(..b("k02")).unwrap()),
+            pairs(&model, ..b("k02"))
+        );
+        let excl = (Bound::Excluded(b("k05")), Bound::Included(b("k08")));
+        assert_eq!(
+            collect(db.scan::<[u8]>(excl).unwrap()),
+            pairs::<[u8]>(&model, excl)
+        );
+        // A deleted start key, ranges with nothing in them, and start > end.
+        assert_eq!(
+            collect(db.scan(b("k09")..b("k11")).unwrap()),
+            pairs(&model, b("k09")..b("k11"))
+        );
+        assert!(collect(db.scan(b("x")..).unwrap()).is_empty());
+        assert!(collect(db.scan(b("k20")..b("k10")).unwrap()).is_empty());
+        assert!(collect(db.scan(b("k20")..b("k20")).unwrap()).is_empty());
+    }
+
+    #[test]
+    fn scan_is_one_point_in_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
+        for i in 0..300 {
+            db.put(format!("k{i:03}").as_bytes(), b"before").unwrap();
+        }
+        let mut it = db.iter().unwrap();
+        let first = it.next().unwrap().unwrap();
+        // After the scan starts: overwrite, delete and add keys, then push
+        // everything down so the tables the scan is reading are deleted.
+        for i in 0..300 {
+            match i % 3 {
+                0 => db.put(format!("k{i:03}").as_bytes(), b"after").unwrap(),
+                1 => db.delete(format!("k{i:03}").as_bytes()).unwrap(),
+                _ => db.put(format!("k{i:03}x").as_bytes(), b"new").unwrap(),
+            }
+        }
+        db.compact_all().unwrap();
+        let rest = collect(it);
+        let mut seen = vec![first];
+        seen.extend(rest);
+        let want: Pairs = (0..300)
+            .map(|i| (format!("k{i:03}").into_bytes(), b"before".to_vec()))
+            .collect();
+        assert_eq!(seen, want);
+        // A new scan sees the new state: 100 overwritten, 100 deleted, 100
+        // untouched and 100 added.
+        let now = collect(db.iter().unwrap());
+        let count = |v: &[u8]| now.iter().filter(|(_, x)| x == v).count();
+        assert_eq!(
+            (count(b"after"), count(b"before"), count(b"new")),
+            (100, 100, 100)
+        );
+    }
+
+    #[test]
+    fn scan_keeps_reading_tables_compaction_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), small()).unwrap();
+        for i in 0..200 {
+            db.put(format!("k{i:03}").as_bytes(), &[b'v'; 50]).unwrap();
+        }
+        db.flush().unwrap();
+        let sst = |dir: &Path| -> HashSet<PathBuf> {
+            fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.extension().is_some_and(|x| x == "sst"))
+                .collect()
+        };
+        let before = sst(dir.path());
+        let it = db.iter().unwrap();
+        for i in 0..200 {
+            db.put(format!("k{i:03}").as_bytes(), b"new").unwrap();
+        }
+        db.compact_all().unwrap();
+        assert!(
+            sst(dir.path()).is_disjoint(&before),
+            "the old tables are gone"
+        );
+        let got = collect(it);
+        assert_eq!(got.len(), 200);
+        assert!(got.iter().all(|(_, v)| v == &[b'v'; 50]));
+    }
+
+    #[test]
+    fn snapshot_scan_sees_the_snapshot_after_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
+        for i in 0..100 {
+            db.put(format!("k{i:02}").as_bytes(), b"old").unwrap();
+        }
+        let snap = db.snapshot();
+        for i in 0..100 {
+            if i % 2 == 0 {
+                db.delete(format!("k{i:02}").as_bytes()).unwrap();
+            } else {
+                db.put(format!("k{i:02}").as_bytes(), b"new").unwrap();
+            }
+        }
+        db.compact_all().unwrap();
+        let got = collect(snap.scan(&b"k10"[..]..&b"k20"[..]).unwrap());
+        let want: Pairs = (10..20)
+            .map(|i| (format!("k{i:02}").into_bytes(), b"old".to_vec()))
+            .collect();
+        assert_eq!(got, want);
+        let now = collect(db.scan(&b"k10"[..]..&b"k20"[..]).unwrap());
+        assert_eq!(now.len(), 5);
+        assert!(now.iter().all(|(_, v)| v == b"new"));
+    }
+
+    /// A scan only opens tables whose key range overlaps it: with a table
+    /// outside the range damaged on disk, a narrow scan still succeeds.
+    #[test]
+    fn narrow_scan_skips_tables_outside_its_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            target_file_size: 16 << 10,
+            block_cache_bytes: 0,
+            ..small()
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+        for i in 0..4000 {
+            db.put(format!("k{i:04}").as_bytes(), &[b'v'; 20]).unwrap();
+        }
+        db.compact_all().unwrap();
+        let (current, _) = read_view(&db);
+        let level = current.levels.iter().rfind(|l| !l.is_empty()).unwrap();
+        assert!(level.len() > 4, "{} tables", level.len());
+        // Damage every table except the first, mid-file: past block 0, which
+        // open already read.
+        let mut damaged = 0;
+        for t in level[1..].iter().filter(|t| t.reader.block_count() >= 3) {
+            damaged += 1;
+            let path = table_path(dir.path(), t.id);
+            let mut bytes = fs::read(&path).unwrap();
+            let mid = bytes.len() / 2;
+            bytes[mid] ^= 0xff;
+            fs::write(&path, &bytes).unwrap();
+        }
+        assert!(damaged >= 3, "{damaged} tables damaged");
+        let first = &level[0];
+        let (lo, hi) = (first.smallest().to_vec(), first.largest().to_vec());
+        let got = collect(db.scan(&lo[..]..=&hi[..]).unwrap());
+        assert_eq!(got.len() as u64, first.reader.entry_count());
+        // A scan that reaches the damaged tables reports it.
+        let err = db.iter().unwrap().find_map(|item| item.err());
+        assert!(matches!(err, Some(Error::Corruption(_))), "{err:?}");
+    }
+
+    /// While a writer adds k0000, k0001, ... in order, with flushes and
+    /// compactions running, every scan must see a gap-free prefix: it's one
+    /// point in time, so it can't see a write without every earlier one.
+    #[test]
+    fn concurrent_scans_see_a_prefix_of_ordered_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_with(dir.path(), tiny()).unwrap());
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scanners: Vec<_> = (0..3)
+            .map(|_| {
+                let (db, done) = (Arc::clone(&db), Arc::clone(&done));
+                thread::spawn(move || {
+                    let mut scans = 0;
+                    while !done.load(Ordering::Acquire) {
+                        let keys: Vec<Vec<u8>> = collect(db.iter().unwrap())
+                            .into_iter()
+                            .map(|(k, _)| k)
+                            .collect();
+                        for (i, k) in keys.iter().enumerate() {
+                            assert_eq!(k, format!("k{i:04}").as_bytes(), "gap in a scan");
+                        }
+                        scans += 1;
+                    }
+                    scans
+                })
+            })
+            .collect();
+        for i in 0..3000 {
+            db.put(format!("k{i:04}").as_bytes(), &[b'v'; 16]).unwrap();
+        }
+        done.store(true, Ordering::Release);
+        let scans: u64 = scanners.into_iter().map(|s| s.join().unwrap()).sum();
+        assert!(scans > 10, "only {scans} scans");
+        assert!(db.stats().compaction_bytes > 0);
+    }
+
+    /// Random writes, snapshots, flushes and compactions; scans with random
+    /// bounds, at now or at a random live snapshot, checked against a model.
+    #[test]
+    fn randomized_scans_match_a_model() {
+        for seed in 1..=10u64 {
+            let mut rng = Rng::new(seed);
+            let dir = tempfile::tempdir().unwrap();
+            let opts = Options {
+                memtable_size: 256 + rng.below(2048) as usize,
+                target_file_size: 256 + rng.below(2048) as usize,
+                ..tiny()
+            };
+            let db = Db::open_with(dir.path(), opts).unwrap();
+            let mut model = Model::new();
+            let mut snaps: Vec<(Snapshot, Model)> = Vec::new();
+            let bound = |rng: &mut Rng| match rng.below(3) {
+                0 => Bound::Included(rng.key()),
+                1 => Bound::Excluded(rng.key()),
+                _ => Bound::Unbounded,
+            };
+            for step in 0..3000 {
+                let k = rng.key();
+                match rng.below(100) {
+                    0..=54 => {
+                        let v = rng.value();
+                        db.put(&k, &v).unwrap();
+                        model.insert(k, v);
+                    }
+                    55..=69 => {
+                        db.delete(&k).unwrap();
+                        model.remove(&k);
+                    }
+                    70..=72 => snaps.push((db.snapshot(), model.clone())),
+                    73..=75 if !snaps.is_empty() => {
+                        let i = rng.below(snaps.len() as u64) as usize;
+                        snaps.swap_remove(i);
+                    }
+                    76 => db.flush().unwrap(),
+                    77 => db.compact_all().unwrap(),
+                    _ => {
+                        let (lo, hi) = (bound(&mut rng), bound(&mut rng));
+                        let range = (
+                            lo.as_ref().map(Vec::as_slice),
+                            hi.as_ref().map(Vec::as_slice),
+                        );
+                        let (got, want) = if !snaps.is_empty() && rng.below(2) == 0 {
+                            let (snap, then) = &snaps[rng.below(snaps.len() as u64) as usize];
+                            (
+                                collect(snap.scan::<[u8]>(range).unwrap()),
+                                pairs::<[u8]>(then, range),
+                            )
+                        } else {
+                            (
+                                collect(db.scan::<[u8]>(range).unwrap()),
+                                pairs::<[u8]>(&model, range),
+                            )
+                        };
+                        assert_eq!(got, want, "seed {seed} step {step} range {range:?}");
+                    }
                 }
             }
         }

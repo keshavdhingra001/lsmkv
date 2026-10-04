@@ -3,6 +3,7 @@
 //! Write path: `Db::put` -> WAL append + fsync -> memtable insert
 //!             -> (memtable full) flush to a new SSTable + manifest edit.
 //! Read path:  `Db::get` -> memtable -> SSTables newest to oldest; first hit wins.
+//! Scans:      `Db::scan` -> a k-way merge of every source, newest version per key.
 
 mod codec;
 pub mod db;
@@ -16,5 +17,5 @@ pub mod sstable;
 mod test_util;
 pub mod wal;
 
-pub use db::{Db, Options, Snapshot, Stats, SyncMode};
+pub use db::{Db, DbIter, Options, Snapshot, Stats, SyncMode};
 pub use error::{Error, Result};
