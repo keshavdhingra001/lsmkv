@@ -10,7 +10,6 @@
 //! files) is deleted on open. Unrecognized files are left alone.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::{self, OpenOptions};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,12 +18,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
-use crate::fsutil::sync_dir;
 use crate::key::{SeqNo, MAX_SEQ};
 use crate::manifest::{Edit, Manifest, Version, MAX_LEVELS};
 use crate::memtable::{Entry, MemTable};
 use crate::sstable::filter::DEFAULT_BITS_PER_KEY;
 use crate::sstable::{ReadContext, ReadStats, SstReader, WriterOptions, DEFAULT_BLOCK_SIZE};
+use crate::vfs::{Fs, RealFs};
 use crate::wal::{Record, Wal};
 use batch::Pending;
 
@@ -64,6 +63,16 @@ pub struct Options {
     pub block_cache_bytes: usize,
     /// When a write counts as durable (DESIGN.md D11).
     pub sync_mode: SyncMode,
+    /// The filesystem every file goes through: the real one, or a simulated
+    /// disk for testing (DESIGN.md D28).
+    pub fs: Arc<dyn Fs>,
+    /// No background or periodic-sync threads: flushes and compactions run
+    /// on the writing thread, when a write needs room or on `flush` /
+    /// `compact_all`, and the WAL is synced only by `sync_wal` (and memtable
+    /// switches and close). With a single-threaded caller, every run is then
+    /// deterministic, which is what simulation testing needs (D28). Slower
+    /// writes; for testing.
+    pub inline_background: bool,
 }
 
 /// When `put`/`delete` return, relative to the disk.
@@ -91,6 +100,8 @@ impl Default for Options {
             bloom_bits_per_key: DEFAULT_BITS_PER_KEY,
             block_cache_bytes: 8 << 20,
             sync_mode: SyncMode::Always,
+            fs: RealFs::shared(),
+            inline_background: false,
         }
     }
 }
@@ -395,11 +406,12 @@ impl Db {
             )));
         }
         let dir = dir.as_ref().to_path_buf();
-        fs::create_dir_all(&dir)?;
-        let (mut manifest, mut version) = Manifest::open(&dir)?;
+        let fs = Arc::clone(&opts.fs);
+        fs.create_dir_all(&dir)?;
+        let (mut manifest, mut version) = Manifest::open_in(&*fs, &dir)?;
 
-        remove_obsolete_files(&dir, &version)?;
-        let live_logs: Vec<u64> = list_files(&dir)?
+        remove_obsolete_files(&*fs, &dir, &version)?;
+        let live_logs: Vec<u64> = list_files(&*fs, &dir)?
             .into_iter()
             .filter_map(|(f, _)| match f {
                 DbFile::Log(n) => Some(n),
@@ -417,7 +429,7 @@ impl Db {
             .unwrap_or(0);
 
         let read_ctx = Arc::new(ReadContext::new(opts.block_cache_bytes));
-        let levels = open_levels(&dir, &version, &read_ctx)?;
+        let levels = open_levels(&*fs, &dir, &version, &read_ctx)?;
 
         let memtable = MemTable::new();
         // Writes in tables are numbered up to `last_sequence`; anything newer
@@ -425,7 +437,7 @@ impl Db {
         let mut last_seq = version.last_sequence;
         for (i, &n) in live_logs.iter().enumerate() {
             let path = log_path(&dir, n);
-            let replay = Wal::replay(&path)?;
+            let replay = Wal::replay_in(&*fs, &path)?;
             for (seq, rec) in replay.records {
                 last_seq = last_seq.max(seq);
                 apply(&memtable, seq, rec);
@@ -433,10 +445,10 @@ impl Db {
             // Only the newest log gets appended to, so only it needs its torn
             // tail cut off (new writes must not land after garbage).
             let is_active = i + 1 == live_logs.len();
-            if is_active && fs::metadata(&path)?.len() > replay.valid_len {
-                let f = OpenOptions::new().write(true).open(&path)?;
+            if is_active && replay.file_len > replay.valid_len {
+                let mut f = fs.open_append(&path)?;
                 f.set_len(replay.valid_len)?;
-                f.sync_all()?;
+                f.sync()?;
             }
         }
 
@@ -453,8 +465,8 @@ impl Db {
                 n
             }
         };
-        let wal = Wal::open(&log_path(&dir, wal_number))?;
-        sync_dir(&dir)?;
+        let wal = Wal::open_in(&*fs, &log_path(&dir, wal_number))?;
+        fs.sync_dir(&dir)?;
 
         let wal = Arc::new(Mutex::new(wal));
         let current = Arc::new(SuperVersion {
@@ -521,6 +533,8 @@ impl Db {
         });
         let syncer = match opts.sync_mode {
             SyncMode::Always => None,
+            // Inline mode starts no threads: `sync_wal` is the caller's job.
+            SyncMode::Periodic(_) if opts.inline_background => None,
             SyncMode::Periodic(every) => {
                 let shared = Arc::clone(&shared);
                 Some(thread::spawn(move || {
@@ -528,16 +542,20 @@ impl Db {
                 }))
             }
         };
-        let background = {
+        let background = if opts.inline_background {
+            None
+        } else {
             let shared = Arc::clone(&shared);
-            thread::Builder::new()
-                .name("lsmkv-background".into())
-                .spawn(move || background::run(&shared))?
+            Some(
+                thread::Builder::new()
+                    .name("lsmkv-background".into())
+                    .spawn(move || background::run(&shared))?,
+            )
         };
         Ok(Self {
             shared,
             syncer,
-            background: Some(background),
+            background,
         })
     }
 
@@ -632,11 +650,35 @@ impl Db {
         st.manual_compaction = Some(0);
         self.shared.bg_work.notify_one();
         loop {
+            if st.opts.inline_background {
+                st = self.run_inline(st);
+            }
             st.check_writable()?;
             if st.manual_compaction.is_none() && !st.bg_busy {
                 return Ok(());
             }
             st = self.wait(st);
+        }
+    }
+
+    /// fsyncs the WAL now, making every acknowledged write durable. Only
+    /// useful in `Periodic` mode (in `Always` mode each write already is);
+    /// with `inline_background` there's no periodic thread, so this is how
+    /// the WAL gets synced.
+    pub fn sync_wal(&self) -> Result<()> {
+        let wal = {
+            let st = self.lock();
+            st.check_writable()?;
+            Arc::clone(&st.wal)
+        };
+        let synced = lock(&wal).sync();
+        match synced {
+            Ok(()) => {
+                self.shared.periodic_syncs.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            // As for the periodic thread: a failed fsync poisons (D7).
+            Err(e) => Err(self.lock().poison(e)),
         }
     }
 
@@ -773,6 +815,11 @@ impl Db {
             if st.current.mem.approx_size() < st.opts.memtable_size {
                 break Ok(());
             }
+            if st.opts.inline_background && (st.current.imm.is_some() || st.compaction_wanted()) {
+                // No background thread: do its work here, now.
+                st = self.run_inline(st);
+                continue;
+            }
             if st.current.imm.is_some() || l0 >= st.opts.l0_stop_trigger {
                 // The previous memtable is still being flushed, or level 0
                 // is too deep to add to: wait for the background thread.
@@ -781,6 +828,9 @@ impl Db {
                 continue;
             }
             let switched = st.switch_memtable();
+            if st.opts.inline_background && switched.is_ok() {
+                st = self.run_inline(st);
+            }
             self.shared.bg_work.notify_one();
             break switched;
         };
@@ -793,8 +843,11 @@ impl Db {
 
     /// Waits until the background thread is idle with nothing left to do:
     /// no immutable memtable and no level over its limit.
-    fn wait_for_background(&self, mut st: MutexGuard<'_, State>) -> Result<()> {
+    fn wait_for_background<'a>(&'a self, mut st: MutexGuard<'a, State>) -> Result<()> {
         loop {
+            if st.opts.inline_background {
+                st = self.run_inline(st);
+            }
             st.check_writable()?;
             if st.current.imm.is_none() && !st.bg_busy && !st.compaction_wanted() {
                 return Ok(());
@@ -805,6 +858,23 @@ impl Db {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         lock(&self.shared.state)
+    }
+
+    /// `inline_background` mode: runs flushes and compactions on this thread
+    /// until none is left, or one fails (which poisons, as on the thread).
+    fn run_inline<'a>(&'a self, mut st: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
+        while st.poisoned.is_none() {
+            let (guard, did_work) = background::run_one(&self.shared, st);
+            st = guard;
+            match did_work {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(e) => {
+                    st.poison(e);
+                }
+            }
+        }
+        st
     }
 
     fn wait<'a>(&self, st: MutexGuard<'a, State>) -> MutexGuard<'a, State> {
@@ -832,10 +902,10 @@ impl Drop for Db {
             *lock(&self.shared.stop) = true;
             self.shared.stop_signal.notify_all();
             let _ = syncer.join();
-            let st = self.lock();
-            if st.poisoned.is_none() {
-                let _ = lock(&st.wal).sync();
-            }
+        }
+        let st = self.lock();
+        if matches!(st.opts.sync_mode, SyncMode::Periodic(_)) && st.poisoned.is_none() {
+            let _ = lock(&st.wal).sync();
         }
     }
 }
@@ -871,7 +941,7 @@ fn sync_periodically(shared: &Shared, wal: &Mutex<Wal>, every: Duration) {
             if shared.fail_periodic_sync.load(Ordering::Relaxed) {
                 return Err(Error::Io(std::io::Error::other("injected fsync failure")));
             }
-            Ok(file.sync_data()?)
+            Ok(file.sync()?)
         });
         if let Err(e) = synced {
             lock(&shared.state).poison(e);
@@ -974,8 +1044,8 @@ impl State {
         let log_id = self.next_file;
         self.next_file += 1;
         let switched = self.failpoint("switch:new_log").and_then(|()| {
-            let new_wal = Wal::open(&log_path(&self.dir, log_id))?;
-            sync_dir(&self.dir)?;
+            let new_wal = Wal::open_in(&*self.opts.fs, &log_path(&self.dir, log_id))?;
+            self.opts.fs.sync_dir(&self.dir)?;
             // In `Periodic` mode the old log's tail may not be on disk yet,
             // and nothing would sync it once it's swapped out. It holds the
             // immutable memtable's writes until their table commits.
@@ -1159,10 +1229,15 @@ fn table_for_key<'a>(level: &'a [Arc<Table>], key: &[u8]) -> Option<&'a Arc<Tabl
 
 /// Opens every live table and arranges them by level, checking that levels
 /// 1+ are non-overlapping (the invariant `table_for_key` relies on).
-fn open_levels(dir: &Path, version: &Version, ctx: &Arc<ReadContext>) -> Result<Levels> {
+fn open_levels(
+    fs: &dyn Fs,
+    dir: &Path,
+    version: &Version,
+    ctx: &Arc<ReadContext>,
+) -> Result<Levels> {
     let mut levels: Levels = (0..MAX_LEVELS).map(|_| Vec::new()).collect();
     for (&id, &level) in &version.tables {
-        let reader = open_table(dir, id, ctx)?;
+        let reader = open_table(fs, dir, id, ctx)?;
         levels[level as usize].push(Arc::new(Table {
             id,
             reader: Arc::new(reader),
@@ -1189,8 +1264,8 @@ fn open_levels(dir: &Path, version: &Version, ctx: &Arc<ReadContext>) -> Result<
     Ok(levels)
 }
 
-fn open_table(dir: &Path, id: u64, ctx: &Arc<ReadContext>) -> Result<SstReader> {
-    SstReader::open_with(&table_path(dir, id), id, Arc::clone(ctx)).map_err(|e| match e {
+fn open_table(fs: &dyn Fs, dir: &Path, id: u64, ctx: &Arc<ReadContext>) -> Result<SstReader> {
+    SstReader::open_in(fs, &table_path(dir, id), id, Arc::clone(ctx)).map_err(|e| match e {
         Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => Error::Corruption(format!(
             "manifest lists table {id}, but {id:06}.sst is missing"
         )),
@@ -1220,12 +1295,12 @@ fn classify(name: &str) -> Option<DbFile> {
 }
 
 /// Engine-owned files in `dir`, sorted (logs by number, then tables, then temps).
-fn list_files(dir: &Path) -> Result<Vec<(DbFile, PathBuf)>> {
+fn list_files(fs: &dyn Fs, dir: &Path) -> Result<Vec<(DbFile, PathBuf)>> {
     let mut out = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if let Some(kind) = entry.file_name().to_str().and_then(classify) {
-            out.push((kind, entry.path()));
+    for path in fs.list(dir)? {
+        let name = path.file_name().and_then(|n| n.to_str());
+        if let Some(kind) = name.and_then(classify) {
+            out.push((kind, path));
         }
     }
     out.sort();
@@ -1233,21 +1308,21 @@ fn list_files(dir: &Path) -> Result<Vec<(DbFile, PathBuf)>> {
 }
 
 /// Deletes WALs below the log number, tables not in the version, and temp files.
-fn remove_obsolete_files(dir: &Path, version: &Version) -> Result<()> {
+fn remove_obsolete_files(fs: &dyn Fs, dir: &Path, version: &Version) -> Result<()> {
     let mut removed = false;
-    for (kind, path) in list_files(dir)? {
+    for (kind, path) in list_files(fs, dir)? {
         let obsolete = match kind {
             DbFile::Log(n) => n < version.log_number,
             DbFile::Table(id) => !version.tables.contains_key(&id),
             DbFile::Temp => true,
         };
         if obsolete {
-            fs::remove_file(&path)?;
+            fs.remove(&path)?;
             removed = true;
         }
     }
     if removed {
-        sync_dir(dir)?;
+        fs.sync_dir(dir)?;
     }
     Ok(())
 }
@@ -1255,6 +1330,7 @@ fn remove_obsolete_files(dir: &Path, version: &Version) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, OpenOptions};
     use crate::sstable::SstWriter;
     use crate::test_util::Rng;
     use std::collections::{BTreeMap, HashSet};
@@ -1283,7 +1359,7 @@ mod tests {
     }
 
     fn files(dir: &Path) -> Vec<DbFile> {
-        list_files(dir)
+        list_files(&RealFs, dir)
             .unwrap()
             .into_iter()
             .map(|(f, _)| f)
@@ -1291,7 +1367,7 @@ mod tests {
     }
 
     fn only_log(dir: &Path) -> PathBuf {
-        let logs: Vec<PathBuf> = list_files(dir)
+        let logs: Vec<PathBuf> = list_files(&RealFs, dir)
             .unwrap()
             .into_iter()
             .filter(|(f, _)| matches!(f, DbFile::Log(_)))
@@ -2374,6 +2450,7 @@ mod tests {
                 } else {
                     SyncMode::Periodic(Duration::from_millis(1))
                 },
+                ..Options::default()
             };
             let mut db = Db::open_with(dir.path(), opts.clone()).unwrap();
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();

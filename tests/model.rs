@@ -108,6 +108,7 @@ fn options() -> impl Strategy<Value = Options> {
             } else {
                 SyncMode::Periodic(Duration::from_millis(5))
             },
+            ..Options::default()
         })
 }
 

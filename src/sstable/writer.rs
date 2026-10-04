@@ -5,18 +5,18 @@
 //! `<path>`, and then the directory is fsynced. A crash at any point leaves
 //! either no file at `<path>` or a complete one, never a half-written table.
 
-use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::block::BlockBuilder;
 use super::filter::{self, DEFAULT_BITS_PER_KEY};
 use super::{Footer, DEFAULT_BLOCK_SIZE};
 use crate::codec::len_u32;
 use crate::error::{Error, Result};
-use crate::fsutil::sync_dir;
 use crate::key::{self, SeqNo};
 use crate::memtable::Entry;
+use crate::vfs::{Fs, RealFs, WritableFile};
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriterOptions {
@@ -37,7 +37,8 @@ impl Default for WriterOptions {
 }
 
 pub struct SstWriter {
-    file: BufWriter<File>,
+    fs: Arc<dyn Fs>,
+    file: BufWriter<Box<dyn WritableFile>>,
     tmp_path: PathBuf,
     final_path: PathBuf,
     block: BlockBuilder,
@@ -72,7 +73,12 @@ impl SstWriter {
     }
 
     pub fn with_options(path: &Path, opts: WriterOptions) -> Result<Self> {
-        if path.exists() {
+        Self::with_options_in(RealFs::shared(), path, opts)
+    }
+
+    /// `with_options`, writing through `fs`.
+    pub fn with_options_in(fs: Arc<dyn Fs>, path: &Path, opts: WriterOptions) -> Result<Self> {
+        if fs.exists(path) {
             return Err(Error::InvalidArgument(format!(
                 "{} already exists; sstables are immutable",
                 path.display()
@@ -80,12 +86,9 @@ impl SstWriter {
         }
         let tmp_path = tmp_path_for(path);
         // A leftover .tmp can only be from a crashed writer, so overwrite it.
-        let file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
+        let file = fs.create(&tmp_path)?;
         Ok(Self {
+            fs,
             file: BufWriter::new(file),
             tmp_path,
             final_path: path.to_path_buf(),
@@ -182,9 +185,10 @@ impl SstWriter {
         // Order matters: data must be durable BEFORE the rename makes it
         // visible, and the rename must be durable before we report success.
         self.file.flush()?;
-        self.file.get_ref().sync_all()?;
-        fs::rename(&self.tmp_path, &self.final_path)?;
-        sync_dir(self.final_path.parent().unwrap_or(Path::new("")))?;
+        self.file.get_mut().sync()?;
+        self.fs.rename(&self.tmp_path, &self.final_path)?;
+        self.fs
+            .sync_dir(self.final_path.parent().unwrap_or(Path::new("")))?;
         self.finished = true;
         Ok(())
     }
@@ -194,7 +198,7 @@ impl Drop for SstWriter {
     /// An abandoned writer (error or early return) removes its temp file.
     fn drop(&mut self) {
         if !self.finished {
-            let _ = fs::remove_file(&self.tmp_path);
+            let _ = self.fs.remove(&self.tmp_path);
         }
     }
 }

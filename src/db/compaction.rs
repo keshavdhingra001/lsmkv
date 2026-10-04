@@ -28,7 +28,7 @@
 //! levels can't change in between: only the background thread changes them,
 //! and it runs one job at a time.
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::background::JobEnv;
@@ -197,7 +197,9 @@ impl State {
         let out_level = c.out_level;
         self.failpoint("compact:after_tables")?;
 
-        let removed: HashSet<u64> = c.inputs.iter().chain(&c.next).copied().collect();
+        // Sorted, so the manifest records come out in the same order every
+        // run (a HashSet's order changes per process; D28 needs determinism).
+        let removed: BTreeSet<u64> = c.inputs.iter().chain(&c.next).copied().collect();
         let mut edits: Vec<Edit> = removed.iter().map(|&id| Edit::RemoveTable(id)).collect();
         edits.extend(outputs.iter().map(|t| Edit::AddTable {
             id: t.id,
@@ -222,7 +224,7 @@ impl State {
         // Readers still holding the old SuperVersion keep reading the inputs:
         // an unlinked file stays readable through a descriptor that's already
         // open (POSIX), and the descriptor closes with the last `Arc<Table>`.
-        let _ = remove_obsolete_files(&self.dir, &self.version);
+        let _ = remove_obsolete_files(&*self.opts.fs, &self.dir, &self.version);
         Ok(())
     }
 
@@ -294,7 +296,7 @@ impl CompactionJob {
                     writer.finish()?;
                     outputs.push(Arc::new(Table {
                         id,
-                        reader: Arc::new(open_table(&env.dir, id, &env.read_ctx)?),
+                        reader: Arc::new(open_table(&*env.fs, &env.dir, id, &env.read_ctx)?),
                     }));
                 }
             }
@@ -303,7 +305,7 @@ impl CompactionJob {
                 let path = table_path(&env.dir, id);
                 current = Some((
                     id,
-                    SstWriter::with_options(&path, env.writer)?,
+                    SstWriter::with_options_in(Arc::clone(&env.fs), &path, env.writer)?,
                     0,
                     Vec::new(),
                 ));
@@ -317,7 +319,7 @@ impl CompactionJob {
             writer.finish()?;
             outputs.push(Arc::new(Table {
                 id,
-                reader: Arc::new(open_table(&env.dir, id, &env.read_ctx)?),
+                reader: Arc::new(open_table(&*env.fs, &env.dir, id, &env.read_ctx)?),
             }));
         }
         Ok(outputs)

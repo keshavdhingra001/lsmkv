@@ -13,7 +13,6 @@ struct ReadmeDoctests;
 mod codec;
 pub mod db;
 pub mod error;
-mod fsutil;
 pub mod key;
 pub mod manifest;
 pub mod memtable;
@@ -22,6 +21,7 @@ pub mod server;
 pub mod sstable;
 #[cfg(test)]
 mod test_util;
+pub mod vfs;
 pub mod wal;
 
 pub use db::{Db, DbIter, Options, Snapshot, Stats, SyncMode, Transaction, WriteBatch};

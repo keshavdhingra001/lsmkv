@@ -21,9 +21,11 @@ use crate::key::{SeqNo, Shadowed};
 use crate::manifest::Edit;
 use crate::memtable::MemTable;
 use crate::sstable::{ReadContext, SstReader, SstWriter, WriterOptions};
+use crate::vfs::Fs;
 
 /// What a job needs from `State`, copied out so it can run with no lock held.
 pub(super) struct JobEnv {
+    pub fs: Arc<dyn Fs>,
     pub dir: PathBuf,
     pub writer: WriterOptions,
     pub target_file_size: usize,
@@ -46,16 +48,8 @@ pub(super) fn run(shared: &Shared) {
             st = shared.bg_work.wait(st).expect("db lock poisoned");
             continue;
         }
-        st.bg_busy = true;
-        let (guard, did_work) = if st.current.imm.is_some() {
-            flush(shared, st)
-        } else if let Some(c) = st.pick_compaction() {
-            compact(shared, st, c)
-        } else {
-            (st, Ok(false))
-        };
+        let (guard, did_work) = run_one(shared, st);
         st = guard;
-        st.bg_busy = false;
         match did_work {
             Ok(true) => {}
             Ok(false) => {
@@ -72,6 +66,25 @@ pub(super) fn run(shared: &Shared) {
         // Stalled writers and `flush`/`compact_all` callers re-check.
         shared.turn.notify_all();
     }
+}
+
+/// Runs the next job, if there is one: a flush first, otherwise the most
+/// urgent compaction. Returns whether there was one. The background thread
+/// loops on this; in `inline_background` mode the writing thread calls it.
+pub(super) fn run_one<'a>(
+    shared: &'a Shared,
+    mut st: MutexGuard<'a, State>,
+) -> (MutexGuard<'a, State>, Result<bool>) {
+    st.bg_busy = true;
+    let (mut st, did_work) = if st.current.imm.is_some() {
+        flush(shared, st)
+    } else if let Some(c) = st.pick_compaction() {
+        compact(shared, st, c)
+    } else {
+        (st, Ok(false))
+    };
+    st.bg_busy = false;
+    (st, did_work)
 }
 
 /// Writes the immutable memtable to a new level-0 table.
@@ -107,7 +120,7 @@ fn write_table(env: &JobEnv, imm: &MemTable, table_id: u64) -> Result<SstReader>
     #[cfg(test)]
     std::thread::sleep(env.slow);
     let path = table_path(&env.dir, table_id);
-    let mut writer = SstWriter::with_options(&path, env.writer)?;
+    let mut writer = SstWriter::with_options_in(Arc::clone(&env.fs), &path, env.writer)?;
     // Overwritten versions no reader can see stay behind. Tombstones all go
     // in: older tables may hold what they delete.
     let mut shadowed = Shadowed::new(env.oldest_snapshot);
@@ -118,7 +131,7 @@ fn write_table(env: &JobEnv, imm: &MemTable, table_id: u64) -> Result<SstReader>
         }
     }
     writer.finish()?;
-    open_table(&env.dir, table_id, &env.read_ctx)
+    open_table(&*env.fs, &env.dir, table_id, &env.read_ctx)
 }
 
 /// One compaction: start (lock held), merge (no lock), finish (lock held).
@@ -149,6 +162,7 @@ fn compact<'a>(
 impl State {
     pub(super) fn job_env(&self) -> JobEnv {
         JobEnv {
+            fs: Arc::clone(&self.opts.fs),
             dir: self.dir.clone(),
             writer: self.writer_options(),
             target_file_size: self.opts.target_file_size,
@@ -188,7 +202,7 @@ impl State {
             imm: None,
             levels,
         });
-        let _ = remove_obsolete_files(&self.dir, &self.version);
+        let _ = remove_obsolete_files(&*self.opts.fs, &self.dir, &self.version);
         Ok(())
     }
 }

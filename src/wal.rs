@@ -25,13 +25,13 @@
 //! op = [kind u8][key_len u32][val_len u32][key][value]     (kind 1 or 2)
 //! ```
 
-use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, ErrorKind, Write};
 use std::path::Path;
 
 use crate::codec::{len_u32, read_u32, read_u64};
 use crate::error::{Error, Result};
 use crate::key::SeqNo;
+use crate::vfs::{Fs, RealFs, SyncHandle, WritableFile};
 
 pub const HEADER_LEN: usize = 4 + 1 + 8 + 4 + 4;
 pub const KIND_PUT: u8 = 1;
@@ -71,18 +71,25 @@ pub struct Replay {
     /// before appending again (otherwise new writes land after garbage and
     /// become unreachable on the next replay).
     pub valid_len: u64,
+    /// The file's whole length, garbage included.
+    pub file_len: u64,
 }
 
 pub struct Wal {
-    file: BufWriter<File>,
+    file: BufWriter<Box<dyn WritableFile>>,
     /// Successful `sync` calls, so callers can report real fsyncs.
     syncs: u64,
 }
 
 impl Wal {
-    /// Opens (or creates) the log for appending.
+    /// Opens (or creates) the log for appending, on the real filesystem.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Self::open_in(&RealFs, path)
+    }
+
+    /// Opens (or creates) the log for appending, on `fs`.
+    pub fn open_in(fs: &dyn Fs, path: &Path) -> Result<Self> {
+        let file = fs.open_append(path)?;
         Ok(Self {
             file: BufWriter::new(file),
             syncs: 0,
@@ -164,15 +171,15 @@ impl Wal {
     /// Pushes buffered bytes to the OS and returns a second handle to the
     /// same file. fsync acts on the file, not the handle, so a caller can
     /// fsync the clone without holding whatever lock guards this `Wal`.
-    pub fn sync_handle(&mut self) -> Result<File> {
+    pub fn sync_handle(&mut self) -> Result<Box<dyn SyncHandle>> {
         self.file.flush()?;
-        Ok(self.file.get_ref().try_clone()?)
+        Ok(self.file.get_ref().sync_handle()?)
     }
 
     /// Pushes buffered bytes to the OS, then forces them to the disk.
     pub fn sync(&mut self) -> Result<()> {
         self.file.flush()?;
-        self.file.get_ref().sync_data()?;
+        self.file.get_mut().sync()?;
         self.syncs += 1;
         Ok(())
     }
@@ -190,7 +197,12 @@ impl Wal {
     /// - A complete bad record with more data after it can't come from a crash,
     ///   so it's reported as `Error::Corruption` instead (DESIGN.md D2).
     pub fn replay(path: &Path) -> Result<Replay> {
-        let buf = match std::fs::read(path) {
+        Self::replay_in(&RealFs, path)
+    }
+
+    /// `replay`, on `fs`.
+    pub fn replay_in(fs: &dyn Fs, path: &Path) -> Result<Replay> {
+        let buf = match fs.read(path) {
             Ok(buf) => buf,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Replay::default()),
             Err(e) => return Err(e.into()),
@@ -221,6 +233,7 @@ impl Wal {
         Ok(Replay {
             records,
             valid_len: pos as u64,
+            file_len: buf.len() as u64,
         })
     }
 }
@@ -327,7 +340,7 @@ fn decode_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
+    use std::fs::{self, OpenOptions};
 
     fn put(k: &str, v: &str) -> Record {
         Record::Put {

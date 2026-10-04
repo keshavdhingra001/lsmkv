@@ -31,13 +31,13 @@
 //!   record with more data after it is corruption.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+
 use std::io::Write;
 use std::path::Path;
 
 use crate::codec::{read_u32, read_u64};
 use crate::error::{Error, Result};
-use crate::fsutil::sync_dir;
+use crate::vfs::{Fs, RealFs, WritableFile};
 
 pub const MANIFEST_FILE: &str = "MANIFEST";
 const RECORD_LEN: usize = 4 + 1 + 8;
@@ -137,7 +137,7 @@ impl Version {
 }
 
 pub struct Manifest {
-    file: File,
+    file: Box<dyn WritableFile>,
     /// Bytes of valid records, used to undo a failed append.
     len: u64,
 }
@@ -146,19 +146,24 @@ impl Manifest {
     /// Opens the manifest in `dir`, creating one for a fresh database, and
     /// returns the current `Version`.
     pub fn open(dir: &Path) -> Result<(Self, Version)> {
+        Self::open_in(&RealFs, dir)
+    }
+
+    /// `open`, on `fs`.
+    pub fn open_in(fs: &dyn Fs, dir: &Path) -> Result<(Self, Version)> {
         let path = dir.join(MANIFEST_FILE);
-        let buf = match fs::read(&path) {
+        let buf = match fs.read(&path) {
             Ok(buf) => buf,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(e.into()),
         };
 
         let (mut version, valid_len) = replay(&buf)?;
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = fs.open_append(&path)?;
         if valid_len < buf.len() as u64 {
             // Cut the torn tail so new edits aren't appended after garbage.
             file.set_len(valid_len)?;
-            file.sync_all()?;
+            file.sync()?;
         }
         let mut manifest = Self {
             file,
@@ -168,7 +173,7 @@ impl Manifest {
             // Fresh, or a crash before the first record was durable: either
             // way nothing was ever committed, so start the history now.
             manifest.append(&[Edit::Format(FORMAT_VERSION)])?;
-            sync_dir(dir)?;
+            fs.sync_dir(dir)?;
             version.format = FORMAT_VERSION;
         } else if version.format < FORMAT_VERSION {
             // Upgrade before anything new is written: from here on, an
@@ -190,7 +195,7 @@ impl Manifest {
         match self
             .file
             .write_all(&buf)
-            .and_then(|()| self.file.sync_data())
+            .and_then(|()| self.file.sync())
         {
             Ok(()) => {
                 self.len += buf.len() as u64;
@@ -277,6 +282,7 @@ fn replay(buf: &[u8]) -> Result<(Version, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, OpenOptions};
 
     fn reopen(dir: &Path) -> Version {
         Manifest::open(dir).unwrap().1

@@ -1,8 +1,6 @@
 //! Reads an SSTable: footer -> filter and index (both kept in memory) -> at
 //! most one block per lookup.
 
-use std::fs::File;
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -13,6 +11,7 @@ use crate::codec::{read_u32, read_u64};
 use crate::error::{Error, Result};
 use crate::key::{self, SeqNo};
 use crate::memtable::{Entry, ScanEntry};
+use crate::vfs::{Fs, ReadableFile, RealFs};
 
 #[derive(Debug)]
 struct IndexEntry {
@@ -24,7 +23,7 @@ struct IndexEntry {
 
 #[derive(Debug)]
 pub struct SstReader {
-    file: File,
+    file: Box<dyn ReadableFile>,
     path: PathBuf,
     index: Vec<IndexEntry>,
     /// `None` for tables written without a filter: every lookup is a "maybe".
@@ -49,10 +48,15 @@ impl SstReader {
     /// and counters) is shared with the database's other tables; `id` must be
     /// unique among them, since it keys this table's blocks in the cache.
     pub fn open_with(path: &Path, id: u64, ctx: Arc<ReadContext>) -> Result<Self> {
+        Self::open_in(&RealFs, path, id, ctx)
+    }
+
+    /// `open_with`, reading through `fs`.
+    pub fn open_in(fs: &dyn Fs, path: &Path, id: u64, ctx: Arc<ReadContext>) -> Result<Self> {
         let corrupt = |what: String| Error::Corruption(format!("{}: {what}", path.display()));
 
-        let file = File::open(path)?;
-        let file_len = file.metadata()?.len();
+        let file = fs.open_read(path)?;
+        let file_len = file.size()?;
         if file_len < FOOTER_LEN as u64 {
             return Err(corrupt(format!(
                 "file is {file_len} bytes, shorter than the footer"
