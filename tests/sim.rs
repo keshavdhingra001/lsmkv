@@ -4,7 +4,7 @@
 //! several "epochs". An epoch opens the database, checks it, arms a fault,
 //! runs random operations (puts, deletes, batches, transactions, flushes,
 //! compactions, reads, WAL syncs) until one fails or the epoch ends, and then
-//! either cuts the power or just closes (a process exit: the page cache stays).
+//! cuts the power, kills the process (the page cache stays), or just closes.
 //!
 //! **The check after every reopen:** the database must hold the last state
 //! known to be durable, plus some prefix of the operations after it, applied
@@ -237,8 +237,11 @@ fn run(seed: u64, verbose: bool) -> Result<Summary, String> {
         unsure.clear();
 
         // Arm this epoch's fault.
+        // 60% power cut, 10% process kill (the page cache survives), 20%
+        // failed fsync, 10% nothing; each at a random point.
         let fault = rng.below(10);
-        let cut_power = fault < 7;
+        let cut_power = fault < 6;
+        let kill = fault == 6;
         match fault {
             0..=6 => sim.crash_after(1 + rng.below(500)),
             7..=8 => sim.fail_sync_after(1 + rng.below(40)),
@@ -317,6 +320,12 @@ fn run(seed: u64, verbose: bool) -> Result<Summary, String> {
             sim.power_cut();
             summary.power_cuts += 1;
             say("  power cut".into());
+        } else if kill {
+            // kill -9: no clean close, but the OS keeps what it was handed.
+            sim.crash_now();
+            drop(db);
+            sim.process_restart();
+            say("  process killed".into());
         } else {
             // A process exit: whatever reached the OS stays. A clean close
             // syncs the WAL in Periodic mode, unless the database was poisoned.

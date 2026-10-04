@@ -76,6 +76,7 @@ impl Engine for Lsmkv {
             } else {
                 lsmkv::SyncMode::Periodic(Duration::from_secs(1))
             },
+            ..lsmkv::Options::default()
         };
         Self(lsmkv::Db::open_with(dir, opts).unwrap())
     }

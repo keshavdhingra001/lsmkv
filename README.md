@@ -2,11 +2,16 @@
 
 An LSM-tree key-value storage engine written from scratch in Rust, in the style of LevelDB and RocksDB: a write-ahead log
 with group commit, a lock-free skiplist memtable, checksummed SSTables with bloom filters and a block cache,
-leveled compaction on a background thread, snapshots, range scans, and crash recovery that has survived
-300 rounds of `kill -9`.
+leveled compaction on a background thread, snapshots, range scans, atomic batches, optimistic transactions,
+and a Redis-protocol server, so `redis-cli` talks to it.
+
+Its crash safety is tested two ways: real `kill -9`s of a running process (SOAK_LINE), and a
+**deterministic simulation** that runs the engine on a simulated disk and cuts the power at random points. The
+simulation found a real bug the crash tests never could (a manifest commit torn by a power cut), and catches 9 of
+10 planted durability bugs that `kill -9` misses entirely. See [how it's tested](#how-its-tested).
 
 About 9,800 lines of Rust (8,100 in `src/`, unit tests included). Three runtime dependencies: `crc32fast`, `crossbeam-skiplist` and `thiserror`.
-Every design decision, with the alternatives and the reasoning, is in [DESIGN.md](DESIGN.md) (D1–D24).
+Every design decision, with the alternatives and the reasoning, is in [DESIGN.md](DESIGN.md) (D1–D28).
 
 ```rust,no_run
 fn main() -> lsmkv::Result<()> {
@@ -23,6 +28,21 @@ fn main() -> lsmkv::Result<()> {
         let (key, value) = item?;
         println!("{key:?} = {value:?}");
     }
+
+    let mut batch = lsmkv::WriteBatch::new(); // all or nothing, even across a crash
+    batch.put(b"a", b"1").put(b"b", b"2").delete(b"user:1");
+    db.write(batch)?;
+
+    let mut tx = db.transaction(); // snapshot isolation, first committer wins
+    let balance = tx.get_for_update(b"a")?;
+    tx.put(b"a", b"0");
+    tx.put(b"b", b"3");
+    match tx.commit() {
+        Ok(()) => {}
+        Err(lsmkv::Error::Conflict(_)) => { /* someone else wrote "a" first: retry */ }
+        Err(e) => return Err(e),
+    }
+    let _ = balance;
     Ok(())
 }
 ```
@@ -50,6 +70,10 @@ flowchart LR
 - **Reads** take no lock beyond copying an `Arc<SuperVersion>`: an immutable bundle of memtables and tables.
   So reads never wait for writes, flushes or compactions (D12).
 - **Every version carries a sequence number,** so snapshots and scans read a consistent point in time (D18, D21).
+- **Atomic batches** are one WAL record under one checksum, applied and published as a unit (D25). **Transactions**
+  read at a snapshot and buffer their writes. At commit, the write-group leader rejects any whose keys changed since
+  the snapshot (optimistic concurrency, snapshot isolation; `get_for_update` blocks write skew, D26).
+- **All file I/O goes through an `Fs` trait** (like RocksDB's `Env`), so tests can swap in a simulated disk (D28).
 - **Recovery** replays the manifest (the list of live tables), then the live WALs. A torn WAL tail is cut off;
   corruption anywhere else refuses to open (D2, D6). A failed fsync poisons the database instead of
   pretending (fsyncgate, D7).
@@ -135,31 +159,68 @@ shown; up to 0.5 s) is level-0 backpressure: when the writer outruns compaction,
 
 ## How it's tested
 
-- **148 tests** (`cargo test`, ~10 s): unit tests per component, plus:
+- **184 tests** (`cargo test`, about 25 s): unit tests per component, plus:
   - **Crash injection** at every step of a flush and a compaction (failpoints), and every-byte corruption
-    and truncation tests on WAL records, blocks, the index, the footer and the manifest.
-  - **A `kill -9` harness** (`tests/kill9.rs`): a child process writes from 4 threads and is killed at
-    random moments, round after round, against one directory. After each kill, every key must hold
-    exactly its last acknowledged value (or the one in-flight write's). The long run: **300 rounds,
-    1,022,073 acknowledged operations, none lost** (`cargo test --release --test kill9 -- --ignored`).
+    and truncation tests on WAL records, batches, blocks, the index, the footer and the manifest.
+  - **A `kill -9` harness** (`tests/kill9.rs`): a child process writes (puts, deletes and atomic batches)
+    from 4 threads and is killed at random moments, round after round, against one directory. After each
+    kill, every key must hold exactly its last acknowledged value, and an in-flight batch must be there
+    whole or not at all. Long run: SOAK_DETAIL (`cargo test --release --test kill9 -- --ignored`).
+  - **Deterministic simulation** (`tests/sim.rs`): the engine runs single-threaded on `SimFs`, a
+    simulated disk that tracks what was fsynced. The test cuts the power at a random I/O (keeping a random
+    torn prefix of unsynced data) or fails an fsync, reopens, and requires the durable state plus a
+    prefix of later operations: nothing acknowledged lost in `Always` mode, no holes in `Periodic` mode.
+    A seed replays exactly. Long run: SIM_DETAIL (`LSMKV_SIM_SEEDS=20000 cargo test --release --test sim`).
+    - **It found a real bug:** a compaction's manifest commit, torn by a power cut, could apply its
+      "remove inputs" records without its "add outputs" records, losing data. `kill -9` can't tear a
+      write, so the crash harness, the fuzzer and every unit test had missed it. Commits now carry a
+      group header and apply whole or not at all (D28).
+    - **Planted durability bugs** (a missing fsync, a missing directory fsync, an ack before the fsync, ...):
+      the simulation caught 9 of 10, the `kill -9` harness 0 of 10 (the 10th is a harmless equivalent).
   - **A model-based fuzz test** (`tests/model.rs`, proptest): random options and random sequences of
-    every operation (including close and reopen), checked against a `BTreeMap`, with failures shrunk
-    to minimal cases. 5,000 cases pass.
-  - **Staged concurrency tests:** test-only hooks hold a flush or a write group in place, so races
-    are tested deterministically instead of hoping a random run hits them.
-- **Mutation-checked:** about 100 bugs planted across M5–M10 (off-by-ones, dropped fsyncs, wrong lock
-  scopes, a tombstone dropped too early, a lost wakeup), each checked to make the tests fail. Every
+    every operation (batches, transactions racing direct writes, close and reopen), checked against a
+    `BTreeMap`, with failures shrunk to minimal cases. 5,000 cases pass.
+  - **Concurrency:** staged tests (test-only hooks hold a flush or a write group in place), readers
+    that must never see half a batch, and bank transfers between accounts that must never create or
+    lose money.
+  - **The Redis server** over real sockets: pipelining across reads, `MULTI`/`EXEC`, `WATCH`, 8 clients
+    incrementing one counter, and a fuzzed protocol parser.
+- **Mutation-checked:** about 140 bugs planted across M5–M15, each checked to make the tests fail. Every
   survivor led to a new or fixed test, or is explained as equivalent; DESIGN.md lists them.
 
 ## Running it
 
 ```bash
-cargo test                                              # everything, ~10 s
-cargo test --release --test kill9 -- --ignored          # 300 crash rounds, ~90 s
-PROPTEST_CASES=5000 cargo test --release --test model   # long fuzz run, ~40 s
-cargo run --release --example demo                      # the demo below, a few seconds
-cargo run -- ./data                                     # REPL
+cargo test                                                   # everything, about 25 s
+cargo test --release --test kill9 -- --ignored               # 300 crash rounds, ~90 s
+LSMKV_SIM_SEEDS=20000 cargo test --release --test sim        # long simulation run
+PROPTEST_CASES=5000 cargo test --release --test model        # long fuzz run, ~40 s
+cargo run --release --example demo                           # the demo below, a few seconds
+cargo run -- ./data                                          # REPL
+cargo run --release --bin lsmkv-server -- --dir ./data       # Redis-protocol server on port 6380
 ```
+
+A failing simulation seed replays exactly, step by step:
+
+```bash
+LSMKV_SIM_SEED=44 cargo test --test sim -- --nocapture
+```
+
+### The Redis-protocol server
+
+`lsmkv-server` speaks RESP2, Redis's protocol, on 127.0.0.1:6380 by default. Clients like `redis-cli` or
+`valkey-cli` (`sudo pacman -S valkey` on Arch) connect with `-p 6380`. Commands map onto engine features:
+
+| command | in lsmkv |
+|---|---|
+| `GET SET DEL EXISTS PING ECHO` | plain reads and writes |
+| `MSET` / `MGET` | one atomic batch / all keys read at one snapshot |
+| `INCR INCRBY DECR` | a transaction, retried on conflict: concurrent increments never lose one |
+| `MULTI` … `EXEC` | the queued commands run as one transaction |
+| `WATCH k` | `EXEC` returns nil if `k` changed since: `get_for_update` underneath |
+| `SCAN KEYS DBSIZE RANGE INFO` | range scans and engine stats |
+
+It's thread-per-connection and handles pipelining. Kill it with `kill -9` and restart: nothing acknowledged is lost.
 
 Benchmarks (they write under `target/`, on the real disk):
 
@@ -167,6 +228,7 @@ Benchmarks (they write under `target/`, on the real disk):
 cargo run --release --example durability   # sync modes and group commit
 cargo run --release --example concurrency  # readers + a writer
 cargo run --release --example scan         # scans and compaction memory
+cargo run --release --example server_bench # load test against a running lsmkv-server
 cd bench && cargo run --release            # vs RocksDB (first build compiles RocksDB: ~7 min)
 ```
 
@@ -230,35 +292,45 @@ done
 
 ## Known limits
 
-- **Power loss isn't tested directly.** `kill -9` keeps the OS page cache. Durability under power loss is argued
-  from fsync ordering (D22), not tested with a fault-injecting filesystem.
+- **The power-loss simulation models the disk, not the kernel.** `SimFs` tears writes as prefixes (never
+  scattered sectors) and treats directory changes as durable only after a directory fsync. It runs the
+  engine single-threaded. Threads are covered by the `kill -9` harness and the concurrency tests; a real
+  fault-injecting filesystem (LazyFS) would be the next step.
 - **No compression, no prefix compression in blocks.** Blocks store full keys, and a lookup scans its block
   linearly (RocksDB uses restart points for a binary search inside each block).
 - **One background thread** does all flushes and compactions, and level-0 compaction always rewrites into
   level 1 (no trivial move for sequential keys, so `fillseq` write amplification is 2.3 vs RocksDB's 1.0).
-- **Forward scans only**, no reverse iteration. No atomic multi-key batches, no transactions.
+- **Forward scans only,** no reverse iteration. Transactions are snapshot isolation, not serializable
+  (`get_for_update` covers write skew for the keys you name), and have no transactional `scan`.
 - **The memtable switch** (a new WAL, a directory fsync and the old WAL's fsync) runs under the state lock,
   which shows up as write tail latency.
+- **The server** has no AUTH or TLS (it binds to localhost), and `SCAN` cursors re-scan from the start.
 - **Linux/POSIX only:** compaction deletes table files that readers may still have open.
 
-Not built (Tier 3 ideas): MVCC transactions, atomic write batches, a RESP (Redis protocol) server,
-compression, deterministic simulation testing, Raft replication.
+Not built: compression, column families, Raft replication, serializable transactions.
 
 ## Layout
 
 ```text
-src/wal.rs              write-ahead log: records, CRCs, torn tails
+src/wal.rs              write-ahead log: records, batches, CRCs, torn tails
 src/memtable.rs         skiplist memtable and its range iterator
 src/key.rs              sequence numbers, internal key order, garbage rule
 src/sstable/            block, writer, reader + iterator, bloom filter, LRU block cache
-src/manifest.rs         the list of live files, as an edit log
+src/manifest.rs         the list of live files, as an edit log with atomic groups
+src/vfs.rs              the Fs trait: the real filesystem, and SimFs (a simulated disk)
 src/db.rs               Db: writer queue, read path, recovery, SuperVersion
-src/db/background.rs    background thread: flush
+src/db/background.rs    background flush (a thread, or inline for simulation)
 src/db/compaction.rs    leveled compaction
 src/db/iter.rs          merging iterator, range scans
+src/db/batch.rs         write batches, transactions, conflict checks
 src/db/snapshot.rs      snapshots
+src/resp.rs             RESP2 protocol parser and encoder
+src/server.rs           the Redis-protocol server's commands
+src/bin/lsmkv-server.rs the server binary
 tests/kill9.rs          kill -9 crash harness
+tests/sim.rs            deterministic simulation with power cuts
 tests/model.rs          proptest model test
+tests/server.rs         the server over real sockets
 examples/               demo and benchmarks
 bench/                  lsmkv vs RocksDB (separate crate)
 ```

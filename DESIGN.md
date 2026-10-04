@@ -580,6 +580,7 @@ Tier 3, approved together with M14 and M15 in one "go".
   - `kill -9` can't tear a write, so the 300-round crash soak, 5,000 fuzz cases and every unit test missed it.
   - **Fix:** a commit of several edits is now a `Group(n)` header record followed by its n edits, in one write. Replay applies a group whole or not at all, and an incomplete group at the tail is a torn tail, cut off (`a_commit_torn_anywhere_applies_whole_or_not_at_all` cuts a commit at every byte; it failed before the fix). That's the same idea as WAL batches (D25).
   - **Format 4.** A format-3 build refuses the directory (it accepts no later format record above 3) instead of misreading a group header as a torn tail.
+- **It found a second bug, in a 20,000-seed run (seed 14676): recovery didn't make what it replayed durable.** A process exits with an acknowledged `Periodic` write only in the page cache. The next open replays it and serves it. Then an fsync of that WAL fails (or the power dies), the kernel drops the dirty pages, and a write the database had already served is gone. LevelDB and RocksDB persist recovered data during open. Fix: recovery fsyncs every WAL it replays (`recovered_writes_survive_a_later_power_cut`, which uses the new `SimFs::process_restart`, a `kill -9` that keeps the page cache). The simulation now also kills the process in 10% of epochs.
 - **Verified by planting 10 durability bugs, each judged by the simulation and by the kill -9 harness:**
 
   | planted bug | simulation | kill -9 harness |

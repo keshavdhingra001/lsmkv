@@ -5,8 +5,9 @@
 //!    reopen and check that every acknowledged write is there.
 //! 3. A snapshot keeps its view through overwrites, a delete and a full compaction.
 //! 4. A range scan.
-//! 5. Engine stats: levels, write amplification, bloom filter and cache hits.
-//! 6. A short benchmark.
+//! 5. An atomic batch, and a transaction that loses to a concurrent write.
+//! 6. Engine stats: levels, write amplification, bloom filter and cache hits.
+//! 7. A short benchmark.
 //!
 //! Usage: `cargo run --release --example demo -- [dir]` (default `target/demo`).
 
@@ -15,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use lsmkv::{Db, Options, SyncMode};
+use lsmkv::{Db, Error, Options, SyncMode, WriteBatch};
 
 fn options() -> Options {
     Options {
@@ -144,7 +145,39 @@ fn main() -> lsmkv::Result<()> {
     let count = db.iter()?.count();
     println!("full scan: {count} keys in {:.2?}", t.elapsed());
 
-    step(5, "stats (counters since the reopen in step 2)");
+    step(5, "an atomic batch, then a transaction that conflicts");
+    let mut batch = WriteBatch::new();
+    batch.put(b"acct:alice", b"100").put(b"acct:bob", b"50");
+    db.write(batch)?;
+    println!("batch: alice=100, bob=50 written together (one WAL record)");
+    let transfer = |db: &Db, amount: u64, meddle: bool| -> lsmkv::Result<()> {
+        let mut tx = db.transaction();
+        let read =
+            |v: Option<Vec<u8>>| -> u64 { String::from_utf8(v.unwrap()).unwrap().parse().unwrap() };
+        let alice = read(tx.get_for_update(b"acct:alice")?);
+        let bob = read(tx.get_for_update(b"acct:bob")?);
+        tx.put(b"acct:alice", (alice - amount).to_string().as_bytes());
+        tx.put(b"acct:bob", (bob + amount).to_string().as_bytes());
+        if meddle {
+            // Another writer changes alice's balance after the snapshot.
+            db.put(b"acct:alice", b"90")?;
+            println!("  (meanwhile, another writer sets alice=90)");
+        }
+        tx.commit()
+    };
+    match transfer(&db, 30, true) {
+        Err(Error::Conflict(why)) => println!("transfer of 30: conflict, nothing applied ({why})"),
+        other => println!("transfer of 30: {other:?}"),
+    }
+    transfer(&db, 30, false)?;
+    let show = |k: &[u8]| String::from_utf8(db.get(k).unwrap().unwrap()).unwrap();
+    println!(
+        "retried: alice={}, bob={} (total still 140)",
+        show(b"acct:alice"),
+        show(b"acct:bob")
+    );
+
+    step(6, "stats (counters since the reopen in step 2)");
     for i in (0..n).step_by(97) {
         db.get(user(i).as_bytes())?;
         db.get(format!("nobody:{i}").as_bytes())?;
@@ -161,7 +194,7 @@ fn main() -> lsmkv::Result<()> {
     );
     drop(db);
 
-    step(6, "short benchmark (Periodic sync, one thread)");
+    step(7, "short benchmark (Periodic sync, one thread)");
     let db = Db::open_with(
         &dir,
         Options {

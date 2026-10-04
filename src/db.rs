@@ -445,11 +445,17 @@ impl Db {
             // Only the newest log gets appended to, so only it needs its torn
             // tail cut off (new writes must not land after garbage).
             let is_active = i + 1 == live_logs.len();
+            let mut f = fs.open_append(&path)?;
             if is_active && replay.file_len > replay.valid_len {
-                let mut f = fs.open_append(&path)?;
                 f.set_len(replay.valid_len)?;
-                f.sync()?;
             }
+            // What was just replayed will be served from now on, so it must
+            // be durable: some of it may only have been in the page cache
+            // (an unsynced `Periodic` write, or a group whose fsync never
+            // finished). Without this, a later power cut or failed fsync
+            // could take back writes this database already served (D28; the
+            // simulation found it).
+            f.sync()?;
         }
 
         let wal_number = match live_logs.last() {
@@ -2984,6 +2990,44 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- M15: recovery makes what it replays durable ----
+
+    /// A write that's only in the page cache when the process dies (here an
+    /// acknowledged `Periodic` write) is replayed by the next open and
+    /// served from then on. So it must be durable from then on too: a power
+    /// cut right after the reopen must not take it back.
+    #[test]
+    fn recovered_writes_survive_a_later_power_cut() {
+        use crate::vfs::SimFs;
+        let sim = SimFs::new(1);
+        let opts = Options {
+            sync_mode: SyncMode::Periodic(Duration::from_secs(3600)),
+            fs: Arc::new(sim.clone()),
+            inline_background: true,
+            ..Options::default()
+        };
+        let dir = Path::new("/sim/db");
+        let db = Db::open_with(dir, opts.clone()).unwrap();
+        db.put(b"k", b"acknowledged, not yet synced").unwrap();
+        sim.crash_now(); // kill -9: no final sync...
+        drop(db);
+        sim.process_restart(); // ...but the page cache survives.
+
+        let db = Db::open_with(dir, opts.clone()).unwrap();
+        assert!(
+            db.get(b"k").unwrap().is_some(),
+            "replayed from the page cache"
+        );
+        sim.crash_now();
+        drop(db);
+        sim.power_cut();
+        let db = Db::open_with(dir, opts).unwrap();
+        assert!(
+            db.get(b"k").unwrap().is_some(),
+            "a write the reopened database served was lost by a power cut"
+        );
     }
 
     // ---- M9: range scans ----

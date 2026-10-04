@@ -390,6 +390,17 @@ impl SimFs {
         s.record("power_cut", Path::new(""), 0);
     }
 
+    /// The process dies but the machine doesn't (a `kill -9`): everything
+    /// keeps working again, and the page cache, unsynced data included, is
+    /// still there. Call it with nothing open, after `crash_now`.
+    pub fn process_restart(&self) {
+        let mut s = self.lock();
+        s.crashed = false;
+        s.crash_at = None;
+        s.fail_sync_at = None;
+        s.record("process_restart", Path::new(""), 0);
+    }
+
     /// Paths and sizes of every file, as the program sees them.
     pub fn files(&self) -> Vec<(PathBuf, usize)> {
         let s = self.lock();

@@ -28,34 +28,44 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M15** Deterministic simulation + power-loss testing (simulated disk behind an `Fs` trait) *(Claude; found and fixed a real torn-manifest-commit bug; format 4)*
 Not planned: compression, column families, Raft.
 
-## ▶ RESUME HERE (handover 2026-10-05, after M12: Tier 2 complete)
+## ▶ RESUME HERE (handover 2026-10-05, after M15: Tier 3 done)
 
-**State:** M0–M12 are done. All of Tier 2 is built, measured and documented. 145 unit tests + the kill -9 harness + the proptest model test + 2 doc tests pass, clippy clean, everything pushed to `main` at https://github.com/keshavdhingra001/lsmkv (still **private**).
+**State:** M0–M15 are done and pushed to `main`: https://github.com/keshavdhingra001/lsmkv (**public** since 2026-10-05).
+All three planned Tier 3 milestones are built: M13 batches + transactions, M14 Redis-protocol server, M15 deterministic simulation.
+184 tests pass (`cargo test`, about 25 s), clippy clean.
 
-**Open with the owner:**
-1. **The repo is public** (owner approved 2026-10-05).
-2. **The review questions (M1–M11, 71 in all) are unanswered.** They need to be able to defend this in interviews. Suggested order: M8, M7, M9, M10, then the rest. Run them as a quiz, one at a time, and record the answers here.
-3. Tier 3 is optional. If wanted, the cheapest high-signal items: atomic write batches (sequence numbers already exist), level-0 trivial moves (fixes `fillseq` write amp 2.28 vs 1.00), a RESP server.
+**What the owner does next (the plan they stated): study the project in a new chat.**
+1. **The review-question quiz** is the priority: 95 questions, M1–M15, below. Ask them one at a time, have the owner answer in their own words, correct and explain, and record each answer and a short verdict under its question. Suggested order (what interviewers probe most): M2 (WAL), M4 (flush/recovery), M7 (group commit), M8 (concurrency/snapshots), M15 (power loss + the bug it found), M13 (transactions), then the rest.
+2. For each milestone, it helps to open the code alongside: the "Code map" below says where each piece lives, and DESIGN.md has a decision index (D1–D28).
+3. The headline stories to be able to tell, start to finish:
+   - **The two bugs the simulation found** (D28): the torn manifest commit (seed 44, the `Group(n)` fix), and recovery serving un-fsynced WAL data (seed 14676, fsync on replay). Why `kill -9` can't find either.
+   - **Sim vs kill -9:** 9 of 10 planted durability bugs caught by the simulation, 0 of 10 by kill -9 (D28's table).
+   - **Compaction memory** 265 → 24 MiB (D20). **RocksDB comparison** and why the first run wasn't trusted (D24).
+4. Optional: install `valkey` (`sudo pacman -S valkey`) and try `valkey-cli -p 6380` against `cargo run --release --bin lsmkv-server`. The server was tested with a socket-level RESP client, not yet with the real `redis-cli`/`valkey-cli`, so do that once.
 
 **Commands:**
-- Everything: `cargo fmt && cargo clippy --all-targets && cargo test` (about 10 s).
-- Demo: `cargo run --release --example demo` (a few seconds; its output is in the README).
-- Soak: `cargo test --release --test kill9 -- --ignored` (300 rounds, ~90 s). Fuzz: `PROPTEST_CASES=5000 cargo test --release --test model` (~40 s).
-- Benchmarks: `examples/{durability,concurrency,scan}.rs`; vs RocksDB: `cd bench && cargo run --release` (the first build compiles RocksDB, ~7 min; **never run `cargo clippy` in `bench/`**, it recompiles the C++ again).
-- REPL: `cargo run -- ./data` (`scan [from [to]]`, `snap`/`sget`/`sscan`/`unsnap`, `stats`).
+- Everything: `cargo fmt && cargo clippy --all-targets && cargo test`.
+- Demo: `cargo run --release --example demo`. REPL: `cargo run -- ./data`. Server: `cargo run --release --bin lsmkv-server -- --dir ./data`.
+- Crash soak: `cargo test --release --test kill9 -- --ignored` (300 rounds; `LSMKV_CRASH_ROUNDS=10000` for more).
+- Simulation: `LSMKV_SIM_SEEDS=20000 cargo test --release --test sim`; replay one seed: `LSMKV_SIM_SEED=44 cargo test --test sim -- --nocapture`.
+- Fuzz: `PROPTEST_CASES=5000 cargo test --release --test model`.
+- Benchmarks: `examples/{durability,concurrency,scan,server_bench}.rs`; vs RocksDB: `cd bench && cargo run --release` (never `cargo clippy` in `bench/`: it recompiles RocksDB's C++, ~7 min).
 
 **Environment gotchas:**
 - Pushing: `SSH_AUTH_SOCK=$(ls ~/.ssh/agent/s.* | head -1) git push`. If that fails, the owner runs `ssh-add ~/.ssh/id_ed25519`.
-- Other sessions (lob, ember) run cargo on this machine. Cargo's package-cache lock is shared, so their `cargo add`/`fetch` can block our builds for minutes, and their builds skew benchmarks. The scratchpad mutation runner builds with `cargo test --no-run` first so lock waits aren't scored; check `uptime` before benchmarking.
-- Mutation checks: run under `timeout`, `touch` restored files, clean `/tmp/.tmp*` lsmkv dirs after killed tests, and close the "diagnose-crash" sessions that aborting test binaries open. If a session dies mid-run, look for `*.bak` files in `src/` and restore them.
-- Don't `pkill -f <pattern>` where the pattern appears in the same command line: it kills the shell running it (happened again in M11).
+- **Long runs must be detached** (`setsid nohup bash -c '...' &`): a session restart kills background tasks (it killed the 10k soak twice).
+- **Never clean `/tmp/.tmp*` while a long test runs:** that cleanup deleted the live soak's database once (looked like a recovery bug; it wasn't). Long soaks now use `TMPDIR=$PWD/target/soak-tmp`.
+- **`pkill -f` / `pgrep -f` patterns match the shell running them** (happened 3 times). Use `pgrep -x name`, or the bracket trick: `pgrep -f "kill9-[0-9a-f]"`.
+- Other sessions (lob, ember) run cargo here: the shared package-cache lock can stall builds, and their CPU skews benchmarks. The mutation runner builds with `--no-run` first, so lock waits aren't scored as "caught".
+- Mutation checks: the scratchpad runner (`mutate.py <json> [test args]`) restores and `touch`es files. If a session dies mid-run, look for `*.bak` in `src/` and restore.
 - `/tmp` is tmpfs: benchmark on the real disk (`target/`). No `perf`, `ptrace` restricted.
 
-**Code map:** `src/wal.rs` (log), `src/key.rs` (sequence numbers, internal key order, `Shadowed` garbage rule), `src/memtable.rs` (skiplist + `MemIter`),
-`src/sstable/{block,writer,reader,filter,cache,mod}.rs` (reader has `SstIter`), `src/manifest.rs`,
-`src/db.rs` (`Db`, writer queue, `SuperVersion`, recovery, most tests), `src/db/background.rs` (flush), `src/db/compaction.rs`,
-`src/db/iter.rs` (`MergeIter`, `LevelIter`, `DbIter`), `src/db/snapshot.rs`, `src/main.rs` (REPL),
-`tests/kill9.rs` (crash harness), `tests/model.rs` (proptest), `examples/{demo,durability,concurrency,scan}.rs`, `bench/` (vs RocksDB).
+**Code map:** `src/wal.rs` (log, batch records), `src/key.rs` (sequence numbers, internal key order), `src/memtable.rs` (skiplist + `MemIter`),
+`src/sstable/{block,writer,reader,filter,cache,mod}.rs`, `src/manifest.rs` (edit log, `Group(n)` commits, format 4), `src/vfs.rs` (`Fs`, `RealFs`, `SimFs`),
+`src/db.rs` (`Db`, writer queue, `SuperVersion`, recovery, inline mode), `src/db/background.rs` (flush, `run_one`), `src/db/compaction.rs`,
+`src/db/iter.rs` (`MergeIter`, `DbIter`), `src/db/batch.rs` (`WriteBatch`, `Transaction`, conflict check), `src/db/snapshot.rs`,
+`src/resp.rs` + `src/server.rs` + `src/bin/lsmkv-server.rs` (Redis protocol), `src/main.rs` (REPL),
+`tests/{kill9,sim,model,server}.rs`, `examples/{demo,durability,concurrency,scan,server_bench}.rs`, `bench/` (vs RocksDB).
 
 ## Current status
 
@@ -100,7 +110,13 @@ Harness bug found: libtest's unterminated `test <name> ... ` line swallowed the 
 **2026-10-05: M11 and M12 done; Tier 2 complete.** M11: `bench/` crate vs RocksDB 11.8 with matched settings. After fairness fixes (stats level, static levels, native builds): writes even, RocksDB better on compaction and tail latency, lsmkv faster on single-threaded point reads (unprofiled). M12: README rewrite (mermaid architecture, every result table, test strategy, limits, real demo output, the snippet doc-tested), DESIGN.md decision index + "Not done", `examples/demo.rs`.
 Mistakes on the way: a non-terminating `shuffled` helper hung a benchmark for 44 minutes (fixed in both copies); running clippy in `bench/` recompiled RocksDB.
 
-**Next step:** see RESUME HERE (repo visibility, the review-question quiz, optional Tier 3).
+**2026-10-05: M13–M15 done (Tier 3).** The owner approved one combined consult ("go"). M13: atomic batches (one WAL record, format 3), optimistic transactions with `get_for_update` (15 mutants caught). M14: `lsmkv-server`, RESP2 with MULTI/EXEC/WATCH on transactions (11 mutants caught). M15: every file operation through an `Fs` trait, `SimFs` with power cuts and fsync failures, inline background mode, a deterministic simulation test. **It found a real bug: a power cut could tear a multi-edit manifest commit and lose data; fixed with `Group(n)` commits (format 4).** Planted durability bugs: simulation 9/10, kill -9 0/10.
+Mistakes on the way: a `/tmp` cleanup deleted a live soak's database (not an engine bug); the first inline mode flushed eagerly and masked two planted bugs; a recursive glob was exponential (replaced); the first pipelining test was too small to split commands across reads.
+
+A 20,000-seed release run found a second real bug (seed 14676): recovery replayed WALs without fsyncing them, so a later failed fsync or power cut could take back writes the reopened database had already served. Fixed (recovery fsyncs replayed WALs), with a unit test and a process-kill fault in the simulation.
+**Left running at handover (detached):** a 20,000-seed simulation rerun on the final code (`target/sim20k-final.log`), and the 10,000-round kill -9 soak started in M13 (`target/soak10k.log`, built from M13-era code). Check both first thing; if they passed, put the numbers in the README where it says SOAK_LINE / SOAK_DETAIL / SIM_DETAIL, and rerun the demo for the README's demo output (it gained a transactions step).
+
+**Next step:** see RESUME HERE (the quiz in a new chat).
 
 ## M1 review questions (owner answers)
 1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?
