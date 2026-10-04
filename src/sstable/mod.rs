@@ -20,6 +20,7 @@
 //! See DESIGN.md D5 for the reasoning.
 
 pub mod block;
+pub mod filter;
 mod reader;
 mod writer;
 
