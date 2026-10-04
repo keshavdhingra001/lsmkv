@@ -19,16 +19,31 @@ use crate::memtable::{Entry, MemTable};
 use crate::sstable::{SstReader, SstWriter};
 use crate::wal::{Record, Wal};
 
+mod compaction;
+
+/// Tuning knobs. Defaults follow LevelDB.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// Flush the memtable to an SSTable once its approximate size reaches this.
     pub memtable_size: usize,
+    /// Compact level 0 into level 1 once level 0 has this many tables.
+    pub l0_compaction_trigger: usize,
+    /// Size limit for level 1. Each deeper level's limit is
+    /// `level_size_multiplier` times the one above it.
+    pub level1_max_bytes: u64,
+    pub level_size_multiplier: u64,
+    /// Compaction output is split into tables of roughly this size.
+    pub target_file_size: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             memtable_size: 4 << 20,
+            l0_compaction_trigger: 4,
+            level1_max_bytes: 10 << 20,
+            level_size_multiplier: 10,
+            target_file_size: 2 << 20,
         }
     }
 }
@@ -45,6 +60,22 @@ pub struct Stats {
     /// Bytes per level, index = level.
     pub level_bytes: Vec<u64>,
     pub log_number: u64,
+    /// Key + value bytes written by callers since open.
+    pub user_bytes: u64,
+    /// SSTable bytes written by flushes since open.
+    pub flush_bytes: u64,
+    /// SSTable bytes written by compactions since open.
+    pub compaction_bytes: u64,
+}
+
+impl Stats {
+    /// SSTable bytes written per user byte (WAL writes not counted).
+    pub fn write_amplification(&self) -> f64 {
+        if self.user_bytes == 0 {
+            return 0.0;
+        }
+        (self.flush_bytes + self.compaction_bytes) as f64 / self.user_bytes as f64
+    }
 }
 
 /// A live table: its file number plus an open reader.
@@ -78,6 +109,12 @@ pub struct Db {
     next_file: u64,
     /// Set after a WAL or manifest write fails; see `Error::Poisoned`.
     poisoned: Option<String>,
+    /// Per level: largest key of the last table compacted out of it, so
+    /// successive compactions rotate through the key space.
+    compact_pointer: Vec<Option<Vec<u8>>>,
+    user_bytes: u64,
+    flush_bytes: u64,
+    compaction_bytes: u64,
     /// Test-only crash injection: the named failpoint returns an error.
     #[cfg(test)]
     fail_at: Option<&'static str>,
@@ -161,6 +198,10 @@ impl Db {
             levels,
             next_file,
             poisoned: None,
+            compact_pointer: vec![None; MAX_LEVELS],
+            user_bytes: 0,
+            flush_bytes: 0,
+            compaction_bytes: 0,
             #[cfg(test)]
             fail_at: None,
         })
@@ -203,7 +244,13 @@ impl Db {
         Ok(None)
     }
 
-    /// Writes the memtable to a new SSTable and starts a fresh WAL.
+    /// Flushes the memtable, then compacts until no level is over its limit.
+    pub fn flush(&mut self) -> Result<()> {
+        self.flush_memtable()?;
+        self.maybe_compact()
+    }
+
+    /// Writes the memtable to a new level-0 SSTable and starts a fresh WAL.
     ///
     /// Steps, ordered so a crash after any of them loses nothing:
     /// 1. Write the table (tmp + fsync + rename). Unlisted, so a crash leaves an orphan.
@@ -217,7 +264,7 @@ impl Db {
     /// A failure before the commit point leaves the database usable; the
     /// orphans are cleaned up on the next open. A failure at or after it
     /// poisons the database (see `Error::Poisoned`).
-    pub fn flush(&mut self) -> Result<()> {
+    fn flush_memtable(&mut self) -> Result<()> {
         self.check_writable()?;
         if self.memtable.is_empty() {
             return Ok(());
@@ -241,9 +288,6 @@ impl Db {
         sync_dir(&self.dir)?;
         self.failpoint("flush:after_new_log")?;
 
-        // Commit point. If the manifest write fails, it may still have reached
-        // the disk, in which case the current WAL is now obsolete. Writing
-        // more to it would lose data on the next open, so poison instead.
         let edits = [
             Edit::AddTable {
                 id: table_id,
@@ -251,17 +295,9 @@ impl Db {
             },
             Edit::SetLogNumber(log_id),
         ];
-        let committed = self
-            .failpoint("flush:manifest")
-            .and_then(|()| self.manifest.append(&edits))
-            .and_then(|()| self.failpoint("flush:after_manifest"));
-        if let Err(e) = committed {
-            return Err(self.poison(e));
-        }
-        for edit in edits {
-            self.version.apply(edit).map_err(Error::Corruption)?;
-        }
+        self.commit(&edits, "flush")?;
 
+        self.flush_bytes += reader.file_size();
         self.levels[0].insert(
             0,
             Table {
@@ -288,6 +324,9 @@ impl Db {
                 .map(|l| l.iter().map(|t| t.reader.file_size()).sum())
                 .collect(),
             log_number: self.wal_number,
+            user_bytes: self.user_bytes,
+            flush_bytes: self.flush_bytes,
+            compaction_bytes: self.compaction_bytes,
         }
     }
 
@@ -302,9 +341,35 @@ impl Db {
         if let Err(e) = self.wal.append(&rec).and_then(|()| self.wal.sync()) {
             return Err(self.poison(e));
         }
+        self.user_bytes += match &rec {
+            Record::Put { key, value } => (key.len() + value.len()) as u64,
+            Record::Delete { key } => key.len() as u64,
+        };
         apply(&mut self.memtable, rec);
         if self.memtable.approx_size() >= self.opts.memtable_size {
             self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// The commit point shared by flush and compaction: one durable manifest
+    /// write. If it fails, the edits may still have reached the disk (for a
+    /// flush, that makes the current WAL obsolete), so the in-memory state can
+    /// no longer be trusted to match the disk: poison.
+    fn commit(&mut self, edits: &[Edit], op: &'static str) -> Result<()> {
+        let (at, after) = match op {
+            "flush" => ("flush:manifest", "flush:after_manifest"),
+            _ => ("compact:manifest", "compact:after_manifest"),
+        };
+        let committed = self
+            .failpoint(at)
+            .and_then(|()| self.manifest.append(edits))
+            .and_then(|()| self.failpoint(after));
+        if let Err(e) = committed {
+            return Err(self.poison(e));
+        }
+        for &edit in edits {
+            self.version.apply(edit).map_err(Error::Corruption)?;
         }
         Ok(())
     }
@@ -461,6 +526,18 @@ mod tests {
     fn small() -> Options {
         Options {
             memtable_size: 1024,
+            ..Options::default()
+        }
+    }
+
+    /// Small enough that a few thousand writes reach levels 2-4.
+    fn tiny() -> Options {
+        Options {
+            memtable_size: 512,
+            l0_compaction_trigger: 2,
+            level1_max_bytes: 4096,
+            level_size_multiplier: 3,
+            target_file_size: 1024,
         }
     }
 
@@ -565,7 +642,9 @@ mod tests {
             for i in 0..n {
                 db.put(&key(i), format!("v{i}").as_bytes()).unwrap();
             }
-            assert!(db.stats().tables > 5, "{:?}", db.stats());
+            let st = db.stats();
+            // ~32 flushes: level 0 kept under its trigger by compaction into L1.
+            assert!(st.level_files[0] < 4 && st.level_files[1] > 0, "{st:?}");
             for i in 0..n {
                 assert_eq!(db.get(&key(i)).unwrap(), Some(format!("v{i}").into_bytes()));
             }
@@ -716,6 +795,116 @@ mod tests {
         }
     }
 
+    /// Entries stored across all live tables (all versions, plus tombstones).
+    fn stored_entries(db: &Db) -> u64 {
+        db.levels
+            .iter()
+            .flatten()
+            .map(|t| t.reader.entry_count())
+            .sum()
+    }
+
+    #[test]
+    fn compaction_bounds_level0_and_fills_deep_levels() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = 4000;
+        {
+            let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+            for i in 0..n {
+                db.put(&key(i), &key(i)).unwrap();
+                assert!(
+                    db.stats().level_files[0] < 2,
+                    "L0 over trigger after put {i}"
+                );
+            }
+            let st = db.stats();
+            assert!(st.level_files[3] > 0, "never reached L3: {st:?}");
+            assert!(st.write_amplification() > 1.0, "{st:?}");
+            assert_keys(&db, 0..n, "before reopen");
+        }
+        // Reopen re-validates that levels 1+ don't overlap.
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
+        assert_keys(&db, 0..n, "after reopen");
+    }
+
+    #[test]
+    fn overwritten_versions_are_garbage_collected() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+        for round in 0..40 {
+            for i in 0..100 {
+                db.put(&key(i), format!("r{round}").as_bytes()).unwrap();
+            }
+        }
+        // 4000 versions were written; compaction keeps few stale ones.
+        assert!(stored_entries(&db) < 800, "{} stored", stored_entries(&db));
+        db.compact_all().unwrap();
+        assert_eq!(stored_entries(&db), 100);
+        for i in 0..100 {
+            assert_eq!(db.get(&key(i)).unwrap(), Some(b"r39".to_vec()));
+        }
+    }
+
+    #[test]
+    fn compact_all_drops_deleted_data_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+        for i in 0..1000 {
+            db.put(&key(i), &key(i)).unwrap();
+        }
+        for i in 0..1000 {
+            db.delete(&key(i)).unwrap();
+        }
+        db.compact_all().unwrap();
+        assert_eq!(stored_entries(&db), 0, "{:?}", db.stats());
+        assert_eq!(db.stats().tables, 0);
+        assert_eq!(db.get(&key(5)).unwrap(), None);
+        drop(db);
+        let tables = files(dir.path())
+            .into_iter()
+            .filter(|f| matches!(f, DbFile::Table(_)))
+            .count();
+        assert_eq!(tables, 0, "deleted tables left on disk");
+    }
+
+    #[test]
+    fn tombstone_survives_while_older_data_is_deeper() {
+        let dir = tempfile::tempdir().unwrap();
+        place_table(dir.path(), 10, 3, &[("a", Some("old"))]);
+        let mut db = Db::open_with(dir.path(), tiny()).unwrap();
+        db.delete(b"a").unwrap();
+        db.flush().unwrap();
+        db.put(b"b", b"1").unwrap();
+        db.flush().unwrap(); // L0 hits the trigger (2): L0 -> L1
+        assert_eq!(db.stats().level_files[..2], [0, 1], "{:?}", db.stats());
+        // Dropping the tombstone in L1 would resurrect "old" from L3.
+        assert_eq!(db.get(b"a").unwrap(), None);
+        drop(db);
+        assert_eq!(
+            Db::open_with(dir.path(), tiny())
+                .unwrap()
+                .get(b"a")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn lone_table_moves_down_without_rewriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(dir.path()).unwrap();
+        db.put(b"a", b"1").unwrap();
+        db.compact_all().unwrap(); // flush, then 6 trivial moves to the bottom
+        let st = db.stats();
+        assert_eq!(st.level_files, vec![0, 0, 0, 0, 0, 0, 1]);
+        assert_eq!(st.compaction_bytes, 0, "a trivial move rewrote data");
+        drop(db);
+        assert_eq!(
+            Db::open(dir.path()).unwrap().get(b"a").unwrap(),
+            Some(b"1".to_vec())
+        );
+    }
+
     const FLUSH_FAILPOINTS: [&str; 4] = [
         "flush:after_table",
         "flush:after_new_log",
@@ -835,6 +1024,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let opts = Options {
                 memtable_size: 64 + rng.below(4000) as usize,
+                l0_compaction_trigger: 2 + rng.below(4) as usize,
+                level1_max_bytes: 512 + rng.below(8192),
+                level_size_multiplier: 2 + rng.below(9),
+                target_file_size: 256 + rng.below(4096) as usize,
             };
             let mut db = Db::open_with(dir.path(), opts.clone()).unwrap();
             let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
