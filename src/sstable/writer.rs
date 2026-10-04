@@ -12,6 +12,7 @@ use super::block::BlockBuilder;
 use super::{Footer, DEFAULT_BLOCK_SIZE};
 use crate::codec::len_u32;
 use crate::error::{Error, Result};
+use crate::fsutil::sync_dir;
 use crate::memtable::Entry;
 
 pub struct SstWriter {
@@ -133,7 +134,7 @@ impl SstWriter {
         self.file.flush()?;
         self.file.get_ref().sync_all()?;
         fs::rename(&self.tmp_path, &self.final_path)?;
-        sync_parent_dir(&self.final_path)?;
+        sync_dir(self.final_path.parent().unwrap_or(Path::new("")))?;
         self.finished = true;
         Ok(())
     }
@@ -152,14 +153,4 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
     PathBuf::from(s)
-}
-
-/// fsync the directory so the rename (a directory entry change) survives a crash.
-fn sync_parent_dir(path: &Path) -> Result<()> {
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    File::open(parent)?.sync_all()?;
-    Ok(())
 }
