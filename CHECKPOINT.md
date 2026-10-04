@@ -52,4 +52,4 @@ The owner asked to keep building, so M2 went ahead before the M1 answers came in
 - [x] Rust 1.99.0 installed
 - [x] GitHub: private repo https://github.com/keshavdhingra001/lsmkv (SSH remote, key ~/.ssh/id_ed25519)
 - [x] Git email links to GitHub account keshavdhingra001
-- [ ] D2: mid-log WAL corruption: Tier 1 default is stop silently; owner to confirm or choose fail-loud
+- [x] D2: mid-log WAL corruption fails loud (owner approved 2026-10-04)

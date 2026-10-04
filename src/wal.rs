@@ -89,10 +89,11 @@ impl Wal {
     /// Reads the whole log and decodes records front to back.
     ///
     /// - Missing file => empty `Replay` (fresh database).
-    /// - Stops (without an error) at the first record that is incomplete, has a
-    ///   bad checksum, or has an unknown `kind`. A crash mid-append leaves
-    ///   exactly that kind of torn tail. (Mid-log corruption: see DESIGN.md D2.)
-    /// - `valid_len` is the offset just past the last good record.
+    /// - A torn tail (what a crash mid-append leaves) is tolerated: replay stops
+    ///   there and `valid_len` marks where the good data ends. A torn tail is an
+    ///   incomplete last record, a bad last record, or an all-zero tail.
+    /// - A complete bad record with more data after it can't come from a crash,
+    ///   so it's reported as `Error::Corruption` instead (DESIGN.md D2).
     pub fn replay(path: &Path) -> Result<Replay> {
         let buf = match std::fs::read(path) {
             Ok(buf) => buf,
@@ -102,9 +103,25 @@ impl Wal {
 
         let mut records = Vec::new();
         let mut pos = 0;
-        while let Some((rec, len)) = decode(&buf[pos..]) {
-            records.push(rec);
-            pos += len;
+        loop {
+            match decode(&buf[pos..]) {
+                Decoded::Record(rec, len) => {
+                    records.push(rec);
+                    pos += len;
+                }
+                Decoded::Incomplete => break,
+                Decoded::Bad(len) => {
+                    let rest = &buf[pos + len..];
+                    let is_tail = rest.is_empty() || buf[pos..].iter().all(|&b| b == 0);
+                    if is_tail {
+                        break;
+                    }
+                    return Err(Error::Corruption(format!(
+                        "wal record at offset {pos} is invalid but {} bytes follow it",
+                        rest.len()
+                    )));
+                }
+            }
         }
         Ok(Replay {
             records,
@@ -113,12 +130,20 @@ impl Wal {
     }
 }
 
+enum Decoded {
+    /// A valid record and its encoded length.
+    Record(Record, usize),
+    /// Not enough bytes for the header, or for the length the header claims.
+    Incomplete,
+    /// Complete per its header, but the checksum or contents are wrong.
+    /// Carries the encoded length so the caller can see what follows it.
+    Bad(usize),
+}
+
 /// Decodes one record from the front of `buf`.
-/// Returns the record and its encoded length, or `None` if `buf` doesn't start
-/// with a complete, valid record.
-fn decode(buf: &[u8]) -> Option<(Record, usize)> {
+fn decode(buf: &[u8]) -> Decoded {
     if buf.len() < HEADER_LEN {
-        return None;
+        return Decoded::Incomplete;
     }
     let crc = read_u32(buf, 0);
     let kind = buf[4];
@@ -126,12 +151,17 @@ fn decode(buf: &[u8]) -> Option<(Record, usize)> {
     let val_len = read_u32(buf, 9) as usize;
 
     // Lengths come from disk and may be garbage, so guard the addition too.
-    let total = HEADER_LEN.checked_add(key_len)?.checked_add(val_len)?;
+    let Some(total) = HEADER_LEN
+        .checked_add(key_len)
+        .and_then(|n| n.checked_add(val_len))
+    else {
+        return Decoded::Incomplete;
+    };
     if buf.len() < total {
-        return None;
+        return Decoded::Incomplete;
     }
     if crc32fast::hash(&buf[4..total]) != crc {
-        return None;
+        return Decoded::Bad(total);
     }
 
     let key = buf[HEADER_LEN..HEADER_LEN + key_len].to_vec();
@@ -141,9 +171,9 @@ fn decode(buf: &[u8]) -> Option<(Record, usize)> {
             value: buf[HEADER_LEN + key_len..total].to_vec(),
         },
         KIND_DELETE if val_len == 0 => Record::Delete { key },
-        _ => return None,
+        _ => return Decoded::Bad(total),
     };
-    Some((rec, total))
+    Decoded::Record(rec, total)
 }
 
 fn read_u32(buf: &[u8], at: usize) -> u32 {
@@ -295,6 +325,41 @@ mod tests {
         let r = Wal::replay(&path).unwrap();
         assert!(r.records.is_empty());
         assert_eq!(r.valid_len, 0);
+    }
+
+    #[test]
+    fn mid_log_corruption_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        write_all(&path, &[put("a", "1"), put("b", "2"), put("c", "3")]);
+
+        // Flip the value byte of the MIDDLE record ("b" -> record 2 of 3).
+        let rec_len = HEADER_LEN + 2;
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[2 * rec_len - 1] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+
+        match Wal::replay(&path) {
+            Err(Error::Corruption(msg)) => assert!(msg.contains(&format!("offset {rec_len}"))),
+            other => panic!("expected Corruption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_filled_tail_is_tolerated() {
+        // Some filesystems extend the file with zeros on a crash.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        write_all(&path, &[put("a", "1"), put("b", "2")]);
+        let good_len = fs::metadata(&path).unwrap().len();
+
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend([0u8; 64]);
+        fs::write(&path, &bytes).unwrap();
+
+        let r = Wal::replay(&path).unwrap();
+        assert_eq!(r.records, vec![put("a", "1"), put("b", "2")]);
+        assert_eq!(r.valid_len, good_len);
     }
 
     #[test]

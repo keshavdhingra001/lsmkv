@@ -19,9 +19,11 @@ get ─────────> MemTable ──miss──> SSTables newest-firs
 ### D2: Torn-tail handling
 - **What:** Replay stops at the first invalid record. `Db::open` truncates the file to the last valid offset before appending.
 - **Why:** Without truncation, new writes land after garbage and are lost on the next replay (see the `writes_after_torn_tail_are_not_lost` test).
-- **Mid-log corruption (decided for Tier 1, pending owner review):** treated the same as a torn tail; replay stops and later records are dropped.
-  A crash can only tear the *last* record, so a bad record followed by good ones means disk corruption, not a crash.
-  The alternative is to fail `open` loudly in that case (LevelDB has both modes: `paranoid_checks`). Revisit at M10 with the crash harness.
+- **Mid-log corruption (decided 2026-10-04: fail loud):** a complete record with a bad checksum or contents *followed by more data* returns `Error::Corruption` with the offset, and `Db::open` refuses to start, leaving the log untouched.
+  A crash can only tear the *last* record, so data after a bad record means disk corruption, not a crash. This mirrors RocksDB's default `kTolerateCorruptedTailRecords`.
+- **Zero-filled tails are tolerated:** some filesystems extend a file with zeros on a crash, which would otherwise look like corruption.
+- **Known limit:** a corrupted *length* field that points past EOF looks like a torn tail, so it's tolerated silently. Fixing that needs a header checksum or LevelDB-style fixed-size blocks (Tier 3).
+- **Revisit at M7:** with group commit, several unsynced records can be torn at once. The tail rule still holds, because they're all at the end.
 
 ### D3: Memtable structure
 - **What:** `BTreeMap<Vec<u8>, Entry>` for now.

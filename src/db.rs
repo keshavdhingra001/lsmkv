@@ -90,6 +90,27 @@ mod tests {
     }
 
     #[test]
+    fn open_refuses_mid_log_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut db = Db::open(dir.path()).unwrap();
+            db.put(b"a", b"1").unwrap();
+            db.put(b"b", b"2").unwrap();
+        }
+        let wal_path = dir.path().join(WAL_FILE);
+        let mut bytes = std::fs::read(&wal_path).unwrap();
+        bytes[crate::wal::HEADER_LEN] ^= 0xFF; // corrupt the first record's key
+        std::fs::write(&wal_path, &bytes).unwrap();
+
+        assert!(matches!(
+            Db::open(dir.path()),
+            Err(crate::Error::Corruption(_))
+        ));
+        // The log must be left untouched for a human to inspect.
+        assert_eq!(std::fs::read(&wal_path).unwrap(), bytes);
+    }
+
+    #[test]
     fn writes_after_torn_tail_are_not_lost() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join(WAL_FILE);
