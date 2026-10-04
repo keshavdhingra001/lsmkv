@@ -16,6 +16,9 @@
 //!   level could hold an older version of its key. Dropping it earlier would
 //!   bring that version back.
 //! - Commit: one manifest write adds the outputs and removes the inputs.
+//! - The bottom level never compacts on its own. `compact_all` ends by
+//!   rewriting it in place (RocksDB's `bottommost_level_compaction = kForce`),
+//!   which drops what snapshots kept there and have since released.
 //!
 //! Three phases, so the slow part holds no lock: `start_compaction` (state
 //! lock held) picks the inputs and copies out what the merge needs;
@@ -37,13 +40,17 @@ use crate::manifest::{Edit, MAX_LEVELS};
 use crate::memtable::Entry;
 use crate::sstable::SstWriter;
 
-/// Table ids to merge from `level` and from `level + 1`.
+/// Table ids to merge from `level` and from `out_level`, into `out_level`.
 #[derive(Debug)]
 pub(super) struct Compaction {
     level: usize,
+    /// `level + 1`, or `level` itself for the bottom level's in-place rewrite.
+    out_level: usize,
     inputs: Vec<u64>,
     next: Vec<u64>,
 }
+
+const BOTTOM: usize = MAX_LEVELS - 1;
 
 /// A compaction's merge, with everything it reads copied out of `State`.
 pub(super) struct CompactionJob {
@@ -67,12 +74,11 @@ impl State {
         if let Some(from) = self.manual_compaction {
             // Lowest non-empty level from where the request got to, so a
             // table flushed meanwhile into level 0 can't keep it going forever.
-            match (from..MAX_LEVELS - 1).find(|&l| !self.current.levels[l].is_empty()) {
-                Some(level) => {
-                    self.manual_compaction = Some(level);
-                    return Some(self.compaction_for(level));
-                }
-                None => self.manual_compaction = None,
+            let level = (from..=BOTTOM).find(|&l| !self.current.levels[l].is_empty());
+            // The bottom level is rewritten once, and that ends the request.
+            self.manual_compaction = level.filter(|&l| l < BOTTOM);
+            if let Some(level) = level {
+                return Some(self.compaction_for(level));
             }
         }
         self.pick_level().map(|level| self.compaction_for(level))
@@ -116,6 +122,14 @@ impl State {
     /// Chooses the input tables for compacting `level` (which must be non-empty).
     fn compaction_for(&self, level: usize) -> Compaction {
         let tables = &self.current.levels[level];
+        if level == BOTTOM {
+            return Compaction {
+                level,
+                out_level: level,
+                inputs: tables.iter().map(|t| t.id).collect(),
+                next: Vec::new(),
+            };
+        }
         let inputs: Vec<&Arc<Table>> = if level == 0 {
             tables.iter().collect()
         } else {
@@ -139,6 +153,7 @@ impl State {
 
         Compaction {
             level,
+            out_level: level + 1,
             inputs: inputs.iter().map(|t| t.id).collect(),
             next,
         }
@@ -148,12 +163,12 @@ impl State {
     /// manifest edit); anything else becomes a job to run without the lock.
     pub(super) fn start_compaction(&mut self, c: Compaction) -> Result<Option<CompactionJob>> {
         self.check_writable()?;
-        if c.inputs.len() == 1 && c.next.is_empty() {
+        if c.inputs.len() == 1 && c.next.is_empty() && c.out_level > c.level {
             self.trivial_move(c.level, c.inputs[0])?;
             return Ok(None);
         }
         let mut tables = Vec::new();
-        for (level, ids) in [(c.level, &c.inputs), (c.level + 1, &c.next)] {
+        for (level, ids) in [(c.level, &c.inputs), (c.out_level, &c.next)] {
             for id in ids {
                 let table = self.current.levels[level]
                     .iter()
@@ -177,7 +192,7 @@ impl State {
         outputs: Vec<Arc<Table>>,
     ) -> Result<()> {
         let c = job.c;
-        let out_level = c.level + 1;
+        let out_level = c.out_level;
         self.failpoint("compact:after_tables")?;
 
         let removed: HashSet<u64> = c.inputs.iter().chain(&c.next).copied().collect();
@@ -188,7 +203,7 @@ impl State {
         }));
         self.commit(&edits, "compact")?;
 
-        if c.level > 0 {
+        if c.level > 0 && out_level > c.level {
             self.compact_pointer[c.level] = self.current.levels[c.level]
                 .iter()
                 .find(|t| t.id == c.inputs[0])
@@ -257,7 +272,7 @@ impl CompactionJob {
 
         let env = &self.env;
         let mut shadowed = Shadowed::new(env.oldest_snapshot);
-        let deeper = &self.current.levels[self.c.level + 2..];
+        let deeper = &self.current.levels[self.c.out_level + 1..];
         let mut outputs: Vec<Arc<Table>> = Vec::new();
         // (table id, writer, bytes so far, last user key written)
         let mut current: Option<(u64, SstWriter, usize, Vec<u8>)> = None;

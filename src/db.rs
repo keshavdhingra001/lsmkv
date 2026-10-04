@@ -9,7 +9,7 @@
 //! both. Anything else the engine owns (orphans from a crash mid-flush, `.tmp`
 //! files) is deleted on open. Unrecognized files are left alone.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +28,9 @@ use crate::wal::{Record, Wal};
 
 mod background;
 mod compaction;
+mod snapshot;
+
+pub use snapshot::Snapshot;
 
 /// Tuning knobs. Defaults follow LevelDB.
 #[derive(Debug, Clone)]
@@ -103,6 +106,10 @@ pub struct Stats {
     pub log_number: u64,
     /// Sequence number of the newest write readers can see.
     pub last_sequence: SeqNo,
+    /// Live `Snapshot` handles, and the oldest one's sequence number (the
+    /// versions it can see are being kept).
+    pub snapshots: usize,
+    pub oldest_snapshot: Option<SeqNo>,
     /// Writes (puts and deletes) acknowledged since open.
     pub writes: u64,
     /// WAL write groups since open: each one a single append-and-sync for
@@ -213,6 +220,8 @@ struct ReadView {
     current: Arc<SuperVersion>,
     /// `State::last_seq`, as of the last group applied.
     last_seq: SeqNo,
+    /// Live snapshots: sequence number -> how many handles read at it.
+    snapshots: BTreeMap<SeqNo, usize>,
 }
 
 /// A write group is cut off at this many bytes of records, so one writer's
@@ -427,6 +436,7 @@ impl Db {
         let view = Arc::new(Mutex::new(ReadView {
             current: Arc::clone(&current),
             last_seq,
+            snapshots: BTreeMap::new(),
         }));
         let state = State {
             dir: dir.clone(),
@@ -882,6 +892,14 @@ impl State {
 
     fn stats(&self) -> Stats {
         let r = &self.read_ctx.stats;
+        // One lock, taken and released here. Inside the struct literal below,
+        // a guard would live to the end of the whole statement, and a second
+        // `lock(&self.view)` there would deadlock on it.
+        let (snapshots, oldest_snapshot) = {
+            let view = lock(&self.view);
+            let oldest = view.snapshots.keys().next().copied();
+            (view.snapshots.values().sum(), oldest)
+        };
         Stats {
             memtable_entries: self.current.mem.len(),
             memtable_bytes: self.current.mem.approx_size(),
@@ -896,6 +914,8 @@ impl State {
                 .collect(),
             log_number: self.wal_number,
             last_sequence: self.last_seq,
+            snapshots,
+            oldest_snapshot,
             writes: self.writes,
             write_groups: self.write_groups,
             wal_syncs: self.wal_syncs,
@@ -929,11 +949,13 @@ impl State {
         });
     }
 
-    /// The oldest snapshot any reader may still read at: versions it can't
-    /// see, and nothing newer can, may be dropped. Reads always use the
-    /// latest snapshot for now, so it's `last_seq`.
+    /// The oldest snapshot any reader may still read at: the oldest live
+    /// `Snapshot`, or the latest write if there is none (what `get` reads
+    /// at). Versions only an older reader could see may be dropped.
     fn oldest_snapshot(&self) -> SeqNo {
-        self.last_seq
+        let view = lock(&self.view);
+        let oldest = view.snapshots.keys().next().copied();
+        oldest.map_or(self.last_seq, |s| s.min(self.last_seq))
     }
 
     fn writer_options(&self) -> WriterOptions {
@@ -1561,10 +1583,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path()).unwrap();
         db.put(b"a", b"1").unwrap();
-        db.compact_all().unwrap(); // flush, then 6 trivial moves to the bottom
+        // Flush, then 6 trivial moves to the bottom, then the one rewrite
+        // `compact_all` does at the bottom (D18).
+        db.compact_all().unwrap();
         let st = db.stats();
         assert_eq!(st.level_files, vec![0, 0, 0, 0, 0, 0, 1]);
-        assert_eq!(st.compaction_bytes, 0, "a trivial move rewrote data");
+        assert_eq!(
+            st.compaction_bytes, st.flush_bytes,
+            "a trivial move rewrote data"
+        );
         drop(db);
         assert_eq!(
             Db::open(dir.path()).unwrap().get(b"a").unwrap(),
@@ -2575,5 +2602,165 @@ mod tests {
         // power cut before the flush finished could lose more than the
         // interval allows.
         assert_eq!(db.stats().wal_syncs, 1, "{:?}", db.stats());
+    }
+
+    // ---- M8: snapshots ----
+
+    #[test]
+    fn snapshot_reads_a_point_in_time_through_flush_and_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
+        for i in 0..100 {
+            db.put(&key(i), b"old").unwrap();
+        }
+        let snap = db.snapshot();
+        assert_eq!(snap.sequence(), 100);
+        for i in 0..100 {
+            if i % 2 == 0 {
+                db.put(&key(i), b"new").unwrap();
+            } else {
+                db.delete(&key(i)).unwrap();
+            }
+        }
+        db.put(b"born-later", b"x").unwrap();
+        db.compact_all().unwrap();
+
+        for i in 0..100 {
+            assert_eq!(snap.get(&key(i)).unwrap(), Some(b"old".to_vec()), "{i}");
+            let now = (i % 2 == 0).then(|| b"new".to_vec());
+            assert_eq!(db.get(&key(i)).unwrap(), now, "{i}");
+        }
+        assert_eq!(snap.get(b"born-later").unwrap(), None);
+        let st = db.stats();
+        assert_eq!((st.snapshots, st.oldest_snapshot), (1, Some(100)));
+        // Both versions of every key are still stored, for the snapshot.
+        let kept = stored_entries(&db);
+        assert!(kept >= 200, "{kept}");
+
+        // Once it's gone, compaction may drop what only it could see:
+        // the old values, and the tombstones with the keys they deleted.
+        drop(snap);
+        assert_eq!(db.stats().snapshots, 0);
+        db.compact_all().unwrap();
+        assert_eq!(stored_entries(&db), 51, "50 new values and born-later");
+    }
+
+    /// Section 1's surviving mutation: a compaction may split its output
+    /// only between user keys. Snapshots keep many big versions of one key
+    /// alive, more than one output table holds, so a split would put that
+    /// key in two tables of one level: reads would miss versions, and a
+    /// reopen would refuse the overlapping tables.
+    #[test]
+    fn one_keys_versions_never_span_two_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let db = Db::open_with(dir.path(), tiny()).unwrap();
+            let mut snaps = Vec::new();
+            for v in 0..20u8 {
+                db.put(b"hot", &[v; 200]).unwrap();
+                db.put(&key(v as usize), b"filler").unwrap();
+                snaps.push(db.snapshot());
+            }
+            db.compact_all().unwrap();
+            let st = db.stats();
+            assert!(st.level_files[6] > 1, "too few tables to split: {st:?}");
+            for (v, snap) in snaps.iter().enumerate() {
+                assert_eq!(snap.get(b"hot").unwrap(), Some(vec![v as u8; 200]));
+            }
+        }
+        Db::open_with(dir.path(), tiny()).expect("levels overlap after reopen");
+    }
+
+    /// A writer sets a = i, then b = i, for i = 1, 2, ... So in any
+    /// consistent view, b <= a. Readers read a, then b, through one
+    /// snapshot; separate gets could see a newer b than a.
+    #[test]
+    fn reads_through_one_snapshot_agree_under_concurrent_writes() {
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open_with(dir.path(), tiny()).unwrap());
+        let done = Arc::new(AtomicBool::new(false));
+        let num = |v: Option<Vec<u8>>| v.map_or(0, |v| u64::from_be_bytes(v.try_into().unwrap()));
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let (db, done) = (Arc::clone(&db), Arc::clone(&done));
+                thread::spawn(move || {
+                    let mut checks = 0u64;
+                    while !done.load(Ordering::Acquire) {
+                        let snap = db.snapshot();
+                        let a = num(snap.get(b"a").unwrap());
+                        thread::yield_now(); // let the writer get ahead
+                        let b = num(snap.get(b"b").unwrap());
+                        assert!(b <= a, "b = {b} but a = {a} in one snapshot");
+                        checks += 1;
+                    }
+                    checks
+                })
+            })
+            .collect();
+        for i in 1..=3000u64 {
+            db.put(b"a", &i.to_be_bytes()).unwrap();
+            db.put(b"b", &i.to_be_bytes()).unwrap();
+        }
+        done.store(true, Ordering::Release);
+        let checks: u64 = readers.into_iter().map(|r| r.join().unwrap()).sum();
+        assert!(checks > 100, "only {checks} checks");
+        assert!(db.stats().compaction_bytes > 0, "{:?}", db.stats());
+    }
+
+    /// Random writes, snapshots taken and dropped, flushes and compactions;
+    /// every live snapshot is checked against a copy of the model taken with it.
+    #[test]
+    fn randomized_snapshots_match_a_model() {
+        for seed in 1..=10u64 {
+            let mut rng = Rng::new(seed);
+            let dir = tempfile::tempdir().unwrap();
+            let opts = Options {
+                memtable_size: 256 + rng.below(2048) as usize,
+                target_file_size: 256 + rng.below(2048) as usize,
+                ..tiny()
+            };
+            let db = Db::open_with(dir.path(), opts).unwrap();
+            let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            let mut snaps: Vec<(Snapshot, BTreeMap<Vec<u8>, Vec<u8>>)> = Vec::new();
+            for step in 0..3000 {
+                let k = rng.key();
+                match rng.below(100) {
+                    0..=49 => {
+                        let v = rng.value();
+                        db.put(&k, &v).unwrap();
+                        model.insert(k, v);
+                    }
+                    50..=64 => {
+                        db.delete(&k).unwrap();
+                        model.remove(&k);
+                    }
+                    65..=69 => snaps.push((db.snapshot(), model.clone())),
+                    70..=73 if !snaps.is_empty() => {
+                        let i = rng.below(snaps.len() as u64) as usize;
+                        snaps.swap_remove(i);
+                    }
+                    74 => db.flush().unwrap(),
+                    75 => db.compact_all().unwrap(),
+                    _ if !snaps.is_empty() => {
+                        let i = rng.below(snaps.len() as u64) as usize;
+                        let (snap, then) = &snaps[i];
+                        assert_eq!(
+                            snap.get(&k).unwrap().as_ref(),
+                            then.get(&k),
+                            "seed {seed} step {step} key {k:?} at {}",
+                            snap.sequence()
+                        );
+                    }
+                    _ => assert_eq!(db.get(&k).unwrap().as_ref(), model.get(&k)),
+                }
+            }
+            db.compact_all().unwrap();
+            for (snap, then) in &snaps {
+                for (k, v) in then {
+                    assert_eq!(snap.get(k).unwrap().as_ref(), Some(v), "seed {seed}");
+                }
+            }
+        }
     }
 }

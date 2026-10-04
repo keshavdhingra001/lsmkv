@@ -6,7 +6,12 @@ use std::io::{self, BufRead, Write};
 fn main() -> lsmkv::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "./data".into());
     let db = lsmkv::Db::open(&dir)?;
-    println!("lsmkv @ {dir}  (put <k> <v> | get <k> | del <k> | flush | compact | stats | quit)");
+    println!(
+        "lsmkv @ {dir}  (put <k> <v> | get <k> | del <k> | snap | sget <k> | unsnap \
+         | flush | compact | stats | quit)"
+    );
+    // At most one snapshot, for trying point-in-time reads by hand.
+    let mut snap: Option<lsmkv::Snapshot> = None;
 
     let stdin = io::stdin();
     loop {
@@ -26,6 +31,22 @@ fn main() -> lsmkv::Result<()> {
                 Some(v) => println!("{}", String::from_utf8_lossy(&v)),
                 None => println!("(nil)"),
             },
+            ["snap"] => {
+                let s = db.snapshot();
+                println!("snapshot at seq {}", s.sequence());
+                snap = Some(s);
+            }
+            ["sget", k] => match &snap {
+                Some(s) => match s.get(k.as_bytes())? {
+                    Some(v) => println!("{}", String::from_utf8_lossy(&v)),
+                    None => println!("(nil)"),
+                },
+                None => println!("no snapshot (use snap)"),
+            },
+            ["unsnap"] => {
+                snap = None;
+                println!("OK");
+            }
             ["del", k] => {
                 db.delete(k.as_bytes())?;
                 println!("OK");
@@ -48,6 +69,9 @@ fn main() -> lsmkv::Result<()> {
                     "  writes: {} in {} groups, {} WAL fsyncs | flushing: {} versions",
                     s.writes, s.write_groups, s.wal_syncs, s.immutable_entries
                 );
+                if let Some(oldest) = s.oldest_snapshot {
+                    println!("  snapshots: {} live, oldest at seq {oldest}", s.snapshots);
+                }
                 println!(
                     "  backpressure: {} slowdowns, {} stalls ({} ms waiting)",
                     s.write_slowdowns,
