@@ -24,7 +24,7 @@ get ─────────> MemTable ──miss──> SSTables newest-firs
 - **Zero-filled tails are tolerated:** some filesystems extend a file with zeros on a crash, which would otherwise look like corruption.
 - **Known limit:** a corrupted *length* field that points past EOF looks like a torn tail, so it's tolerated silently. Fixing that needs a header checksum or LevelDB-style fixed-size blocks (Tier 3).
 - **In-process write failures:** these are handled by poisoning (D7), so a partial record is never followed by more appends.
-- **Revisit at M7:** with group commit, several unsynced records can be torn at once. The tail rule still holds, because they're all at the end.
+- **Group commit (M7, D11):** a group's records are appended together and synced once, so a crash can tear several of them at once. The tail rule still holds: they're all at the end of the log, and none of them was acknowledged before the fsync.
 
 ### D3: Memtable structure
 - **What:** `BTreeMap<Vec<u8>, Entry>` for now.
@@ -126,4 +126,64 @@ get ─────────> MemTable ──miss──> SSTables newest-firs
   - A 4-thread test.
   - Mutation checks, each caught: dropping the table id from the key, FIFO instead of LRU, evicting the most recent entry, a stale tail pointer (now a clean failure via a debug assertion instead of an infinite eviction loop), and caching before the CRC check.
 
-<!-- Add D11+ as milestones land: fsync policy (M7), concurrency (M8)... -->
+### D11: Durability modes and group commit (approved 2026-10-04)
+- **API:** `put`, `delete`, `get`, `flush` and `compact_all` take `&self`, and `Db` is `Send + Sync`, so threads share it as `Arc<Db>`. Internally, the M6 engine became a private `State` behind one `Mutex`, and `Db` is a thin handle that adds the writer queue.
+- **Modes** (`Options::sync_mode`, set for the whole database):
+  - `Always` (default): fsync the WAL before acknowledging. Survives power loss.
+  - `Periodic(d)`: acknowledge once the bytes reach the OS (`write`, no fsync); a background thread fsyncs every `d`. It survives a process crash (`kill -9`: the kernel already holds the bytes) but not a power cut or kernel crash, which can lose up to about `d` of acknowledged writes. This is Cassandra's `commitlog_sync: periodic`.
+  - Per-write `sync` flags (LevelDB's `WriteOptions::sync`) were rejected for now: one setting is easier to reason about and to measure.
+- **Group commit** (LevelDB's `DBImpl::Write` design):
+  - Each write joins a FIFO queue under the state lock and waits on a `Condvar`.
+  - The writer at the front, when no group is in flight, becomes the **leader**. It takes queued records up to 1 MiB, sets `writing`, and **releases the state lock**. Then it appends them all, does one fsync (or one flush to the OS in `Periodic` mode), and re-takes the lock.
+  - It then applies the group to the memtable in queue order (the WAL's order, so a replay rebuilds exactly this memtable), posts each follower's result, and wakes everyone.
+  - Writers that arrive during the fsync queue up and form the next group, so the more writers wait, the bigger the groups get, and fsync cost is shared automatically.
+  - The 1 MiB cap keeps one writer's latency from stretching behind an unbounded group.
+- **Why the state lock is released during I/O:** that's the whole point. Holding it would serialize writers on the fsync just like before, and block readers too.
+- **WAL lock:** the WAL has its own `Mutex`.
+  - Lock order is state, then WAL; nothing takes the state lock while holding the WAL, so they can't deadlock.
+  - Flush and compaction (`exclusive()`) wait until no group is in flight before switching the WAL. Otherwise a leader's records would go into a log the manifest just retired, and they'd be lost on reopen even though they were acknowledged (`flush_waits_for_the_group_in_flight`).
+- **Failures:**
+  - If a group's append or fsync fails, the leader gets the I/O error, every follower gets `Poisoned`, and nothing in the group is acknowledged.
+  - Writers already queued behind it are refused too. The failed group may have left a partial record at the log's end, and appending after it would turn a torn tail into mid-log corruption (D2).
+  - A failed periodic fsync also poisons the database. Before the poison, writes in that window were already acknowledged; that's the trade-off `Periodic` makes.
+- **Periodic thread:**
+  - It waits with `wait_timeout_while`, which checks the stop flag before sleeping. A plain `wait_timeout` lost the wakeup when `Drop` signalled before the thread was waiting, and the drop then hung for a full interval: a real bug, found by a hung test run and pinned by `drop_right_after_open_does_not_wait_out_the_interval`.
+  - It never takes the state lock on its normal path (an atomic counter instead), so a long flush or compaction can't delay it. A probe showed the interval stretching from 100 ms to 177 ms during compactions before this change.
+  - It holds the WAL lock only to clone the file handle (`try_clone`, a `dup`), then fsyncs the clone with no lock held. fsync acts on the file, not the descriptor, so writers keep appending during the fsync.
+  - `Drop` stops the thread and does one final fsync, so a clean close loses nothing in either mode.
+- **Measured** (`cargo run --release --example durability`; a laptop NVMe SSD under btrfs; 100-byte values; 3 s per run; ops/sec ranges over 2–3 runs):
+
+  | mode | threads | ops/sec | p50 | p99 | max | writes per fsync |
+  |---|---:|---:|---:|---:|---:|---:|
+  | Always | 1 | 1,330–1,350 | 0.68 ms | 1.4 ms | 28 ms | 1.0 |
+  | Always | 4 | ~3,300 | 1.3 ms | 2.4 ms | 30–49 ms | 2.5 |
+  | Always | 16 | 7,300–12,800 | 1.4 ms | 2.5–3.0 ms | 51 ms | 10.4 |
+  | Periodic(100ms) | 1 | ~335,000 | 1.5 µs | 3.5 µs | 140 ms | – |
+  | Periodic(100ms) | 4 | ~230,000 | 8 µs | 17 µs | 450 ms | – |
+  | Periodic(100ms) | 16 | ~220,000 | 24 µs | 64 µs | 570 ms | – |
+
+  - Group commit gives 16 writers 5–9.5x the single-writer throughput at the same p50: a group of about 10 shares each fsync. (The first 16-thread run measured 7.3k; later runs 12.2–12.8k on unchanged code: disk variance.)
+  - `Periodic` is about 250x faster for one writer: the fsync, not the engine, is the cost of durability.
+  - **The max column is M8's job:** flush and compaction still run inline under the state lock, so every writer stalls behind them (140–570 ms).
+  - **`Periodic` gets slower with more threads:** with no fsync to hide behind, coordination cost dominates (two lock round-trips per write and `notify_all` waking every waiter). LevelDB uses one condition variable per writer to wake only the next leader. That's an M8 item.
+  - Benchmarks must run on a real disk: on tmpfs (this machine's `/tmp`) fsync is free and `Always` would look like `Periodic`.
+- **Verified by:**
+  - Fsyncs are counted by the WAL itself (`Wal::sync_count`), so the stats can't claim fsyncs that didn't happen.
+  - `kill_9_loses_no_acknowledged_write` (`tests/kill9.rs`): a child process writes from 4 threads with small memtables (flushes and compactions mid-flight) and prints each acknowledged key. The parent `kill -9`s it after 2,000, 3,500 or 5,000 acks, in both modes, then reopens and finds every acknowledged key.
+  - Staged deterministic tests (a test-only slow-WAL delay holds a leader for 150 ms): flush waits for the group in flight; groups apply in queue order; a failed group fails every member; writers behind a failed group are refused; the periodic thread keeps syncing while the state lock is held.
+  - Mutation checks, each caught:
+    - `Always` never fsyncing
+    - followers acknowledged when their group's fsync fails
+    - flush not waiting for the group in flight
+    - the group never applied to the memtable
+    - the memtable applied in reverse of WAL order
+    - no grouping
+    - the leader ignoring a poison set while its group waited
+    - the leader logging only its own record
+    - `Periodic` acknowledging before the bytes reach the OS (`kill -9` lost 25 of 2,000 acknowledged writes)
+    - the lost wakeup
+    - the periodic thread taking the state lock
+  - Two mutations survived the first round of tests (the uncounted fsync, and three races the randomized test couldn't hit reliably). That's why the staged tests exist.
+- **Not covered:** power-loss durability. It needs a VM or a fault-injecting filesystem (LazyFS, dm-log-writes); see M10.
+
+<!-- Add D12+ as milestones land: concurrency (M8)... -->
