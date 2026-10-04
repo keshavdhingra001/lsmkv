@@ -20,89 +20,39 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M9** Range scans: merging iterator across memtable + levels *(Claude; 145 unit tests; 20 mutants, 19 caught + 1 equivalent; owner review pending)*
 - [x] **M10** Crash-injection harness (random kill -9, verify no acked write lost) + model-based fuzz test *(Claude; 300-round soak: 1.02M acked ops, none lost; 5,000 fuzz cases; harness and fuzzer each mutation-checked; owner review pending)*
 - [x] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB *(Claude; `bench/` crate, RocksDB 11.8; writes even, lsmkv faster on single-threaded reads (unprofiled), RocksDB better compaction and tails)*
-- [ ] **M12** DESIGN.md complete, README with results
+- [x] **M12** DESIGN.md complete, README with results *(Claude; README rewrite with mermaid diagram + all results, DESIGN index + final pass, `examples/demo.rs`)*
 
 ### Tier 3: Stretch (pick 2–3 later)
 MVCC, atomic batches, RESP server, compression, deterministic simulation testing, Raft.
 
-## ▶ RESUME HERE (handover 2026-10-04, after M8)
+## ▶ RESUME HERE (handover 2026-10-05, after M12: Tier 2 complete)
 
-**State:** M0–M8 are done. 129 unit tests + the kill -9 integration test pass, clippy clean, everything pushed to `main`
-at https://github.com/keshavdhingra001/lsmkv (private; owner said keep it private "not yet").
+**State:** M0–M12 are done. All of Tier 2 is built, measured and documented. 145 unit tests + the kill -9 harness + the proptest model test + 2 doc tests pass, clippy clean, everything pushed to `main` at https://github.com/keshavdhingra001/lsmkv (still **private**).
 
-**Progress:** 9 of 13 milestones (M0–M8). By effort, about 70%: M8 was the biggest; M9–M11 are medium, M12 is small.
-
-**Open with the owner (not blocking, but raise them):**
-- 52 review questions (M1–M8, below) are unanswered. CLAUDE.md says to answer them before the next milestone; the owner chose to build through to the end first. Offer the quiz at the end, after the demo (M8 and M7 first): they need to be able to defend this in interviews.
-- The repo stays private until the owner says otherwise.
+**Open with the owner:**
+1. **Make the repo public?** The Tier 1 gate said "not yet"; ask again now that Tier 2 is done. Don't do it without an explicit yes.
+2. **The review questions (M1–M11, 71 in all) are unanswered.** They need to be able to defend this in interviews. Suggested order: M8, M7, M9, M10, then the rest. Run them as a quiz, one at a time, and record the answers here.
+3. Tier 3 is optional. If wanted, the cheapest high-signal items: atomic write batches (sequence numbers already exist), level-0 trivial moves (fixes `fillseq` write amp 2.28 vs 1.00), a RESP server.
 
 **Commands:**
-- Everything: `cargo fmt && cargo clippy --all-targets && cargo test` (about 4 s; includes `tests/kill9.rs`).
-- Benchmarks (release, on the real disk under `target/`):
-  - `cargo run --release --example concurrency`: readers + one writer (about 15 s).
-  - `cargo run --release --example durability -- [dir] [secs] [Always|Periodic] [threads]`: write modes (about 20 s for all rows).
-  - Before/after against an old commit: `git archive <commit> | tar -x -C target/old`, copy the example in, build with its own `CARGO_TARGET_DIR`. Both examples use only API that M7 had.
-- REPL: `cargo run -- ./data`. `stats` shows writes/groups/fsyncs, backpressure, snapshots, reads, cache and bloom counters; `snap` / `sget k` / `unsnap` try a snapshot.
-
-**Owner's plan for the next session (2026-10-04):** take the project from here to finished, M9 through M12, and end with a demo run. To keep it moving:
-1. **Open with ONE design consult covering M9–M12** (a table per milestone, each with a recommendation), and get a single "go". After that, build straight through, milestone by milestone. Stop again only if a measurement or bug contradicts an approved decision.
-2. Keep the usual rhythm per milestone: sections, tests, mutation checks (with the runner's cleanup and `touch` fixes), commit `M<n>: ...`, push, DESIGN.md entries (D19+), and review questions in this file.
-3. Finish with the demo (below), then ask the owner about making the repo public.
-
-**M9: range scans. Decisions to propose:**
-- **API:** `db.scan(range)` and `snapshot.scan(range)` returning an iterator of `(key, value)`. Forward only, or reverse too? Owned or borrowed results?
-- **Merging iterator:** a heap (k-way merge) over the memtable range, the immutable memtable, each L0 table, and one "level iterator" per deeper level (it walks that level's tables in order). Newest source wins per user key; hide versions above the snapshot, shadowed versions and tombstones.
-- **Streaming table iterator:** `SstReader::entries()` loads a whole table. Replace it with a block-at-a-time iterator (through the cache or not?). Decide whether compaction switches to the same streaming merge: it currently builds a `BTreeMap` of all inputs, i.e. the whole bottom level in memory during `compact_all`.
-- **Lifetime:** the iterator holds an `Arc<SuperVersion>` (tables stay open, as for `get`) plus a snapshot number. An open iterator must pin versions like a `Snapshot`, or compaction could drop what it's about to read.
-- **Skiplist range:** `crossbeam_skiplist::SkipMap::range` over internal keys.
-- **Proof:** a model-based randomized test (scans at random snapshots vs a `BTreeMap`), plus scan throughput. Add `scan` to the REPL.
-
-**M10: crash harness and fuzzing. Decisions to propose:**
-- **Crash loop:** extend `tests/kill9.rs` into many rounds. Random kill times, both sync modes, small memtables (flushes and compactions mid-flight), snapshots and deletes in the mix. After each crash, check that every acknowledged write is present with its latest acknowledged value (unacknowledged writes may or may not be there). Run time: a short version in `cargo test`, and a long one as `#[ignore]` (`cargo test -- --ignored`)?
-- **Model-based fuzz:** random op sequences (put/delete/get/scan/snapshot/flush/compact/reopen) against a model. Seeds with no new dependency, or `proptest` (shrinking)? `cargo-fuzz` needs nightly; skip or optional?
-- **Power loss** (LazyFS / dm-log-writes) stays out of scope unless cheap; say so in DESIGN.md.
-
-**M11: benchmarks vs RocksDB. Decisions to propose:**
-- **How:** the `rocksdb` crate (it builds librocksdb from C++: check for clang/libclang and cmake first, and expect a slow first build), or RocksDB's own `db_bench` if installable.
-- **Workloads,** in db_bench terms: `fillseq`, `fillrandom`, `readrandom`, `readwhilewriting`, and a range scan. Same settings on both sides: 4 MiB memtable, 10-bit bloom filters, no compression, matched WAL sync modes.
-- **Metrics:** ops/sec, p50/p99 latency, write amplification (ours from `Stats`, RocksDB's from its compaction statistics). Fold the existing `durability` and `concurrency` examples in, or keep them.
-- **Honesty:** report where RocksDB wins and why (compression off, its memtable/arena, its compaction tuning).
-
-**M12: documentation and the demo. Decisions to propose:**
-- **README:** what it is, architecture diagram, the design decisions in brief (pointing to DESIGN.md), results tables (M7 durability, M8 concurrency, M11 vs RocksDB), how to run the tests and benchmarks, and known limits.
-- **DESIGN.md:** a final pass (consistent structure, the Tier 3 list as "not done").
-- **Demo run:** a scripted, repeatable demo, e.g. `examples/demo.rs` or `demo.sh`:
-  1. Write a batch.
-  2. `kill -9` the writer mid-run, reopen, and show every acknowledged write recovered.
-  3. A snapshot read surviving overwrites and a compaction.
-  4. A range scan.
-  5. `stats` (levels, write amplification, bloom/cache hits).
-  6. A short benchmark.
-  Then run it live in the chat, and show the REPL by hand. Decide whether to record it (asciinema or a GIF) for the README.
-
-**Working agreement (see CLAUDE.md):** Claude writes each milestone in sections, tests it (including
-mutation checks that the tests can fail), commits `M<n>: ...` and pushes, explains it, and asks review questions.
-Consult the owner on design decisions before coding, and record them in DESIGN.md as D19+.
+- Everything: `cargo fmt && cargo clippy --all-targets && cargo test` (about 10 s).
+- Demo: `cargo run --release --example demo` (a few seconds; its output is in the README).
+- Soak: `cargo test --release --test kill9 -- --ignored` (300 rounds, ~90 s). Fuzz: `PROPTEST_CASES=5000 cargo test --release --test model` (~40 s).
+- Benchmarks: `examples/{durability,concurrency,scan}.rs`; vs RocksDB: `cd bench && cargo run --release` (the first build compiles RocksDB, ~7 min; **never run `cargo clippy` in `bench/`**, it recompiles the C++ again).
+- REPL: `cargo run -- ./data` (`scan [from [to]]`, `snap`/`sget`/`sscan`/`unsnap`, `stats`).
 
 **Environment gotchas:**
-- Pushing over SSH from Claude's shell: `SSH_AUTH_SOCK=$(ls ~/.ssh/agent/s.* | head -1) git push`.
-  If that fails, the owner must run `ssh-add ~/.ssh/id_ed25519` (the key has a passphrase).
-- Rust 1.99.0 is installed. If rustup is slow (the hotspot's route to the Fastly CDN), prefix the command with
-  `RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup`. crates.io downloads work fine.
-- Mutation checks: a mutation can turn a test into an infinite loop. Run them under `timeout 120 cargo test`, and check for an abort (no "test result" line) as well as FAILED.
-- **After restoring a mutated file, `touch` it.** A backup made before the mutant's build carries an older mtime, so cargo treats the restored source as unchanged and keeps running the *mutant* binary. In M8 this showed up as "every concurrent-writer test hangs" right after the D17 mutation run; the engine was fine. The scratchpad runner (`mutate.py`) now calls `os.utime` after each restore.
-- **A killed test leaves its tempdirs in `/tmp` (tmpfs).** A mutant that loops on flushing wrote 1.3 GB each and filled `/tmp` (7.7 GB) in M8. After killing tests, delete `/tmp/.tmp*` dirs that hold lsmkv files (a `MANIFEST`, `.log`, `.sst`); the scratchpad mutation runner now does this after every mutant.
-- **Aborting test binaries trigger Omarchy's crash notifier,** which opens a separate "diagnose-crash" Claude session per SIGABRT of `lsmkv-*`. During mutation runs those are expected; tell the owner they can close them.
-- `/tmp` is tmpfs: fine for tests, but run benchmarks on the real disk (`target/bench-*`, the default for both examples).
-- `ptrace` is restricted (gdb/eu-stack can't attach) and there's no `perf` or `/usr/bin/time`. To find a hung test, look for libtest's "has been running for over 60 seconds", or run tests one at a time under `timeout`. For context switches and CPU time, use Python's `resource.getrusage(RUSAGE_CHILDREN)` around a child process.
-- Don't `pkill -f <pattern>` where the pattern appears in the same command line: it kills the shell running it.
+- Pushing: `SSH_AUTH_SOCK=$(ls ~/.ssh/agent/s.* | head -1) git push`. If that fails, the owner runs `ssh-add ~/.ssh/id_ed25519`.
+- Other sessions (lob, ember) run cargo on this machine. Cargo's package-cache lock is shared, so their `cargo add`/`fetch` can block our builds for minutes, and their builds skew benchmarks. The scratchpad mutation runner builds with `cargo test --no-run` first so lock waits aren't scored; check `uptime` before benchmarking.
+- Mutation checks: run under `timeout`, `touch` restored files, clean `/tmp/.tmp*` lsmkv dirs after killed tests, and close the "diagnose-crash" sessions that aborting test binaries open. If a session dies mid-run, look for `*.bak` files in `src/` and restore them.
+- Don't `pkill -f <pattern>` where the pattern appears in the same command line: it kills the shell running it (happened again in M11).
+- `/tmp` is tmpfs: benchmark on the real disk (`target/`). No `perf`, `ptrace` restricted.
 
-**Code map:** `src/wal.rs` (log), `src/key.rs` (sequence numbers, internal key order, `Shadowed` garbage rule), `src/memtable.rs` (skiplist),
-`src/sstable/{block,writer,reader,filter,cache,mod}.rs`, `src/manifest.rs` (format record, last sequence),
-`src/db.rs` (`Db` handle, writer queue with per-writer condvars, `make_room` + memtable switch, `SuperVersion` + `ReadView`, recovery, most tests),
-`src/db/background.rs` (background thread, flush job), `src/db/compaction.rs` (pick / start / run unlocked / finish),
-`src/db/snapshot.rs` (`Snapshot`), `src/codec.rs`, `src/fsutil.rs`, `src/test_util.rs` (Rng), `src/main.rs` (REPL),
-`tests/kill9.rs` (real-process crash test), `examples/{durability,concurrency}.rs` (benchmarks).
+**Code map:** `src/wal.rs` (log), `src/key.rs` (sequence numbers, internal key order, `Shadowed` garbage rule), `src/memtable.rs` (skiplist + `MemIter`),
+`src/sstable/{block,writer,reader,filter,cache,mod}.rs` (reader has `SstIter`), `src/manifest.rs`,
+`src/db.rs` (`Db`, writer queue, `SuperVersion`, recovery, most tests), `src/db/background.rs` (flush), `src/db/compaction.rs`,
+`src/db/iter.rs` (`MergeIter`, `LevelIter`, `DbIter`), `src/db/snapshot.rs`, `src/main.rs` (REPL),
+`tests/kill9.rs` (crash harness), `tests/model.rs` (proptest), `examples/{demo,durability,concurrency,scan}.rs`, `bench/` (vs RocksDB).
 
 ## Current status
 
@@ -144,9 +94,10 @@ Measured: a 300-round soak checked 1,022,073 acknowledged operations with none l
 Mutation-checked separately: the harness alone catches 3 of 5 crash-only bugs (the other 2 can't show under `kill -9` and are caught by unit tests); the fuzzer alone catches 7 of 7 planted bugs from earlier milestones after a gap it exposed (no snapshot `get`s) was fixed.
 Harness bug found: libtest's unterminated `test <name> ... ` line swallowed the child's first output line.
 
-**Next step:**
-1. Owner works through the review questions (M1–M8, below).
-2. M9 (range scans) needs a design consult; see RESUME HERE.
+**2026-10-05: M11 and M12 done; Tier 2 complete.** M11: `bench/` crate vs RocksDB 11.8 with matched settings. After fairness fixes (stats level, static levels, native builds): writes even, RocksDB better on compaction and tail latency, lsmkv faster on single-threaded point reads (unprofiled). M12: README rewrite (mermaid architecture, every result table, test strategy, limits, real demo output, the snippet doc-tested), DESIGN.md decision index + "Not done", `examples/demo.rs`.
+Mistakes on the way: a non-terminating `shuffled` helper hung a benchmark for 44 minutes (fixed in both copies); running clippy in `bench/` recompiled RocksDB.
+
+**Next step:** see RESUME HERE (repo visibility, the review-question quiz, optional Tier 3).
 
 ## M1 review questions (owner answers)
 1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?

@@ -5,6 +5,11 @@
 //! Read path:  `Db::get` -> memtable -> SSTables newest to oldest; first hit wins.
 //! Scans:      `Db::scan` -> a k-way merge of every source, newest version per key.
 
+// Compiles and runs the README's Rust example as a doc test.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 mod codec;
 pub mod db;
 pub mod error;

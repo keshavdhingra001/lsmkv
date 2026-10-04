@@ -4,10 +4,47 @@ Living document. Every non-obvious decision gets a short entry: **what**, **alte
 
 ## Architecture
 
+```text
+put/delete ─> writer queue ─> leader: WAL append + one fsync per group ─> memtable (lock-free skiplist)
+                                                                             │ full: switch (new WAL)
+                                                                             v
+                          background thread: flush immutable memtable ─> L0 tables ─> compaction ─> L1 … L6
+get / scan / snapshot ─> copy Arc<SuperVersion> (memtable, immutable memtable, levels) ─> read with no lock
+                         get:  memtables, then L0 newest first, then one table per level (bloom -> index -> block)
+                         scan: k-way merge of every source, newest visible version per key
 ```
-put/delete ──> WAL (append + fsync) ──> MemTable (BTreeMap of (key, seq)) ──flush──> SSTable L0 ──compact──> L1..Ln
-get ─────────> MemTable ──miss──> SSTables newest-first (bloom filter -> index -> block)
-```
+
+The README has the overview and the results. The rest of this file is the decisions, in the order they were made.
+Later milestones changed some early decisions; those entries say so, and point at the one that replaced them.
+
+## Decision index
+
+| # | Decision | Milestone |
+|---|---|---|
+| D1 | WAL record format: CRC32 over each record | M2 |
+| D2 | A torn WAL tail is cut off; corruption mid-log refuses to open | M2 |
+| D3 | Memtable: `BTreeMap` (replaced by D13) | M1 |
+| D4 | WAL replay reads the whole log at once | M2 |
+| D5 | SSTable: 4 KiB CRC'd blocks, filter, index of last keys, footer | M3 |
+| D6 | Flush, manifest (edit log) and recovery; one commit point | M4 |
+| D7 | A failed WAL or manifest write poisons the database (fsyncgate) | M4 |
+| D8 | Leveled compaction, LevelDB-style; tombstones dropped only at the safe level | M5 |
+| D9 | Bloom filters, 10 bits per key, double hashing | M6 |
+| D10 | Shared LRU block cache; compactions and scans don't fill it | M6 |
+| D11 | Sync modes `Always` / `Periodic`, group commit | M7 |
+| D12 | Reads without the state lock: an immutable SuperVersion | M8 |
+| D13 | Memtable: crossbeam lock-free skiplist | M8 |
+| D14 | Immutable memtable, background flush | M8 |
+| D15 | Background compaction in three phases; background errors poison | M8 |
+| D16 | Level-0 slowdown and stop triggers | M8 |
+| D17 | One condition variable per writer | M8 |
+| D18 | Sequence numbers, internal key order, snapshots | M8 |
+| D19 | Scan API: forward, owned pairs, one point in time | M9 |
+| D20 | Heap merge over streaming sources; compaction streams too | M9 |
+| D21 | An open scan pins files, not a sequence number | M9 |
+| D22 | Crash harness: many `kill -9`s, one directory, an exact checker | M10 |
+| D23 | Model-based fuzzing with proptest | M10 |
+| D24 | Benchmark methodology vs RocksDB | M11 |
 
 ## Decisions
 
@@ -29,6 +66,7 @@ get ─────────> MemTable ──miss──> SSTables newest-firs
 ### D3: Memtable structure
 - **What:** `BTreeMap<Vec<u8>, Entry>` for now.
 - **Later:** A skiplist for concurrent reads (M8).
+- **Superseded by D13 (M8):** the memtable is now a crossbeam `SkipMap` keyed by (user key, sequence number).
 
 ### D4: Replay reads the whole log into memory
 - **What:** `Wal::replay` does one `fs::read` and decodes from the buffer.
@@ -37,7 +75,7 @@ get ─────────> MemTable ──miss──> SSTables newest-firs
 
 ### D5: SSTable format (approved 2026-10-04)
 - **Layout:** `[data blocks][filter block][index block][footer]`. Full byte layout is in `src/sstable/mod.rs` and `block.rs`.
-- **Data blocks:** about 4 KiB target (one OS page, one disk read), entries `[kind][key_len][val_len][key][value]`, then a CRC32 trailer. Tombstones are stored, because they must shadow older tables.
+- **Data blocks:** about 4 KiB target (one OS page, one disk read), entries `[kind][key_len][val_len][key][value]`, then a CRC32 trailer. (Since M8, each entry also carries its sequence number and the index stores each block's last (key, seq); see D18.) Tombstones are stored, because they must shadow older tables.
 - **Index:** one entry per block, holding the block's *last* key, offset and size. It's kept in memory, so `get` is a binary search (`partition_point`) plus exactly one block read. A per-key index was rejected because it's about the size of the data itself.
 - **Filter block:** reserved and empty in M3, so M6 bloom filters dropped in without a format change (see D9).
 - **Footer (52 B):** five u64 fields, a CRC32 and an 8-byte magic `LSMKVSST`. This is a change from the proposed 48 B: the footer is the root of trust (every offset comes from it), so it gets its own CRC.
@@ -470,3 +508,14 @@ The owner approved the combined M9–M12 proposal in one "go".
   - **The run-to-run variance is large** (RocksDB `overwrite` 179k vs 318k; one run had a ~1 ms p99.9 from a stall). Two runs aren't enough for fine distinctions; differences under ~20% shouldn't be read as real.
   - **Not compared:** compression, prefix-compressed blocks, multiple background threads, column families, and RocksDB's tuning for large datasets that don't fit in memory. Here 129 MiB of tables sit mostly in the OS page cache.
 - **A benchmark bug on the way:** `shuffled(i, n)` cycle-walks a permutation of `0..2^k` until it lands below `n`. That only terminates when the input is already below `n`. Called with `i * 7 + 3`, it looped forever (a 44-minute hung run). `examples/scan.rs` had the same latent bug. Both now reduce the input mod `n` first.
+
+## Not done
+
+These were scoped as Tier 3 (stretch) and not built:
+- **Reverse iteration:** every source would need `prev`, and blocks would need restart points to walk backwards cheaply.
+- **Atomic write batches and transactions (MVCC):** sequence numbers (D18) are the groundwork. A batch would take consecutive numbers and publish them together, as a write group already does.
+- **Compression and prefix-compressed blocks:** blocks store full keys and are searched linearly.
+- **Trivial moves out of level 0** (RocksDB's 1.00 write amplification on sequential keys, D24), and more than one background thread.
+- **A network server** (RESP, so `redis-cli` could talk to it).
+- **Deterministic simulation testing** (a simulated disk and clock, to replay every interleaving and crash point from a seed), and power-loss testing with a fault-injecting filesystem (D22).
+- **Replication (Raft).**
