@@ -45,8 +45,14 @@ fn main() -> lsmkv::Result<()> {
                     s.memtable_entries, s.memtable_bytes, s.log_number, s.last_sequence
                 );
                 println!(
-                    "  writes: {} in {} groups, {} WAL fsyncs",
-                    s.writes, s.write_groups, s.wal_syncs
+                    "  writes: {} in {} groups, {} WAL fsyncs | flushing: {} versions",
+                    s.writes, s.write_groups, s.wal_syncs, s.immutable_entries
+                );
+                println!(
+                    "  backpressure: {} slowdowns, {} stalls ({} ms waiting)",
+                    s.write_slowdowns,
+                    s.write_stalls,
+                    s.stall_micros / 1000
                 );
                 println!(
                     "  write amplification: {:.2} ({} user bytes -> {} flushed + {} compacted)",

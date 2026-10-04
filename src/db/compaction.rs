@@ -1,4 +1,4 @@
-//! Leveled compaction (DESIGN.md D8).
+//! Leveled compaction (DESIGN.md D8), run by the background thread (D15).
 //!
 //! - Level 0 compacts when it has `l0_compaction_trigger` tables. ALL level-0
 //!   tables go in at once: they overlap, so moving only some of them down
@@ -16,12 +16,21 @@
 //!   level could hold an older version of its key. Dropping it earlier would
 //!   bring that version back.
 //! - Commit: one manifest write adds the outputs and removes the inputs.
+//!
+//! Three phases, so the slow part holds no lock: `start_compaction` (state
+//! lock held) picks the inputs and copies out what the merge needs;
+//! `CompactionJob::run` (no lock) merges and writes the outputs;
+//! `finish_compaction` (lock held again) commits and installs them. The
+//! levels can't change in between: only the background thread changes them,
+//! and it runs one job at a time.
 
 use std::collections::{BTreeMap, HashSet};
-
 use std::sync::Arc;
 
-use super::{open_table, remove_obsolete_files, table_for_key, table_path, State, Table};
+use super::background::JobEnv;
+use super::{
+    open_table, remove_obsolete_files, table_for_key, table_path, State, SuperVersion, Table,
+};
 use crate::error::Result;
 use crate::key::{InternalKey, Shadowed};
 use crate::manifest::{Edit, MAX_LEVELS};
@@ -30,34 +39,52 @@ use crate::sstable::SstWriter;
 
 /// Table ids to merge from `level` and from `level + 1`.
 #[derive(Debug)]
-struct Compaction {
+pub(super) struct Compaction {
     level: usize,
     inputs: Vec<u64>,
     next: Vec<u64>,
 }
 
-impl State {
-    /// Runs compactions until no level is over its limit.
-    pub(super) fn maybe_compact(&mut self) -> Result<()> {
-        while let Some(level) = self.pick_level() {
-            let c = self.compaction_for(level);
-            self.run(c)?;
-        }
-        Ok(())
-    }
+/// A compaction's merge, with everything it reads copied out of `State`.
+pub(super) struct CompactionJob {
+    c: Compaction,
+    /// The input tables: the input level's (level 0's newest first), then
+    /// the next level's.
+    tables: Vec<Arc<Table>>,
+    /// The levels as of the start, to check what lies below the output level.
+    current: Arc<SuperVersion>,
+    env: JobEnv,
+}
 
-    /// Flushes, then pushes every table down to the bottom level, which drops
-    /// every overwritten value and every tombstone. Like RocksDB's
-    /// `CompactRange` over the whole key space.
-    pub(super) fn compact_all(&mut self) -> Result<()> {
-        self.flush_memtable()?;
-        for level in 0..MAX_LEVELS - 1 {
-            while !self.current.levels[level].is_empty() {
-                let c = self.compaction_for(level);
-                self.run(c)?;
+impl State {
+    /// The next compaction for the background thread, if any: a step of a
+    /// requested `compact_all` first, otherwise the most urgent level.
+    pub(super) fn pick_compaction(&mut self) -> Option<Compaction> {
+        #[cfg(test)]
+        if self.pause_compactions {
+            return None;
+        }
+        if let Some(from) = self.manual_compaction {
+            // Lowest non-empty level from where the request got to, so a
+            // table flushed meanwhile into level 0 can't keep it going forever.
+            match (from..MAX_LEVELS - 1).find(|&l| !self.current.levels[l].is_empty()) {
+                Some(level) => {
+                    self.manual_compaction = Some(level);
+                    return Some(self.compaction_for(level));
+                }
+                None => self.manual_compaction = None,
             }
         }
-        Ok(())
+        self.pick_level().map(|level| self.compaction_for(level))
+    }
+
+    /// Whether the background thread has compaction work it would start now.
+    pub(super) fn compaction_wanted(&self) -> bool {
+        #[cfg(test)]
+        if self.pause_compactions {
+            return false;
+        }
+        self.manual_compaction.is_some() || self.pick_level().is_some()
     }
 
     /// The level whose score (fullness relative to its limit) is highest,
@@ -117,77 +144,40 @@ impl State {
         }
     }
 
-    fn run(&mut self, c: Compaction) -> Result<()> {
+    /// Phase 1, lock held. A trivial move is done right here (it's only a
+    /// manifest edit); anything else becomes a job to run without the lock.
+    pub(super) fn start_compaction(&mut self, c: Compaction) -> Result<Option<CompactionJob>> {
         self.check_writable()?;
         if c.inputs.len() == 1 && c.next.is_empty() {
-            return self.trivial_move(c.level, c.inputs[0]);
+            self.trivial_move(c.level, c.inputs[0])?;
+            return Ok(None);
         }
-        let out_level = c.level + 1;
-
-        // Merge every version into internal key order: per key, newest first.
-        // Sequence numbers are unique, so no two inputs hold the same version.
-        let mut merged: BTreeMap<InternalKey, Entry> = BTreeMap::new();
-        for (level, ids) in [(c.level, &c.inputs), (out_level, &c.next)] {
+        let mut tables = Vec::new();
+        for (level, ids) in [(c.level, &c.inputs), (c.level + 1, &c.next)] {
             for id in ids {
                 let table = self.current.levels[level]
                     .iter()
                     .find(|t| t.id == *id)
                     .expect("compaction input is live");
-                for (key, seq, entry) in table.reader.entries()? {
-                    merged.insert(InternalKey { user_key: key, seq }, entry);
-                }
+                tables.push(Arc::clone(table));
             }
         }
+        Ok(Some(CompactionJob {
+            c,
+            tables,
+            current: Arc::clone(&self.current),
+            env: self.job_env(),
+        }))
+    }
 
-        // Write the outputs. Not live until the commit, so a crash before it
-        // only leaves orphan files, which the next open deletes.
-        let oldest_snapshot = self.oldest_snapshot();
-        let mut shadowed = Shadowed::new(oldest_snapshot);
-        let deeper = &self.current.levels[out_level + 1..];
-        let mut outputs: Vec<Arc<Table>> = Vec::new();
-        // (table id, writer, bytes so far, last user key written)
-        let mut current: Option<(u64, SstWriter, usize, Vec<u8>)> = None;
-        for (InternalKey { user_key: key, seq }, entry) in merged {
-            if shadowed.check(&key, seq) {
-                continue;
-            }
-            let shadows_nothing = !deeper.iter().any(|l| table_for_key(l, &key).is_some());
-            if entry == Entry::Tombstone && seq <= oldest_snapshot && shadows_nothing {
-                continue;
-            }
-            // A full table ends at the first new user key.
-            if let Some((_, _, size, last)) = &current {
-                if *size >= self.opts.target_file_size && *last != key {
-                    let (id, writer, _, _) = current.take().expect("just checked");
-                    writer.finish()?;
-                    outputs.push(Arc::new(Table {
-                        id,
-                        reader: open_table(&self.dir, id, &self.read_ctx)?,
-                    }));
-                }
-            }
-            if current.is_none() {
-                let id = self.next_file;
-                self.next_file += 1;
-                current = Some((
-                    id,
-                    SstWriter::with_options(&table_path(&self.dir, id), self.writer_options())?,
-                    0,
-                    Vec::new(),
-                ));
-            }
-            let (_, writer, size, last) = current.as_mut().expect("just set");
-            writer.add(&key, seq, &entry)?;
-            *size += key.len() + entry_len(&entry);
-            *last = key;
-        }
-        if let Some((id, writer, _, _)) = current.take() {
-            writer.finish()?;
-            outputs.push(Arc::new(Table {
-                id,
-                reader: open_table(&self.dir, id, &self.read_ctx)?,
-            }));
-        }
+    /// Phase 3, lock held: commit the outputs in place of the inputs.
+    pub(super) fn finish_compaction(
+        &mut self,
+        job: CompactionJob,
+        outputs: Vec<Arc<Table>>,
+    ) -> Result<()> {
+        let c = job.c;
+        let out_level = c.level + 1;
         self.failpoint("compact:after_tables")?;
 
         let removed: HashSet<u64> = c.inputs.iter().chain(&c.next).copied().collect();
@@ -211,8 +201,7 @@ impl State {
         }
         levels[out_level].extend(outputs);
         levels[out_level].sort_by(|a, b| a.smallest().cmp(b.smallest()));
-        let mem = Arc::clone(&self.current.mem);
-        self.install(mem, levels);
+        self.install_levels(levels);
         // Readers still holding the old SuperVersion keep reading the inputs:
         // an unlinked file stays readable through a descriptor that's already
         // open (POSIX), and the descriptor closes with the last `Arc<Table>`.
@@ -244,9 +233,76 @@ impl State {
         let next = &mut levels[level + 1];
         let at = next.partition_point(|t| t.smallest() < table.smallest());
         next.insert(at, table);
-        let mem = Arc::clone(&self.current.mem);
-        self.install(mem, levels);
+        self.install_levels(levels);
         Ok(())
+    }
+}
+
+impl CompactionJob {
+    /// Phase 2, no lock held: merge the inputs and write the outputs.
+    /// `new_file` hands out file numbers (it takes the state lock briefly).
+    /// The outputs aren't live until `finish_compaction` commits them, so a
+    /// crash before that only leaves orphan files, which the next open deletes.
+    pub(super) fn run(&self, mut new_file: impl FnMut() -> u64) -> Result<Vec<Arc<Table>>> {
+        #[cfg(test)]
+        std::thread::sleep(self.env.slow);
+        // Merge every version into internal key order: per key, newest first.
+        // Sequence numbers are unique, so no two inputs hold the same version.
+        let mut merged: BTreeMap<InternalKey, Entry> = BTreeMap::new();
+        for table in &self.tables {
+            for (key, seq, entry) in table.reader.entries()? {
+                merged.insert(InternalKey { user_key: key, seq }, entry);
+            }
+        }
+
+        let env = &self.env;
+        let mut shadowed = Shadowed::new(env.oldest_snapshot);
+        let deeper = &self.current.levels[self.c.level + 2..];
+        let mut outputs: Vec<Arc<Table>> = Vec::new();
+        // (table id, writer, bytes so far, last user key written)
+        let mut current: Option<(u64, SstWriter, usize, Vec<u8>)> = None;
+        for (InternalKey { user_key: key, seq }, entry) in merged {
+            if shadowed.check(&key, seq) {
+                continue;
+            }
+            let shadows_nothing = !deeper.iter().any(|l| table_for_key(l, &key).is_some());
+            if entry == Entry::Tombstone && seq <= env.oldest_snapshot && shadows_nothing {
+                continue;
+            }
+            // A full table ends at the first new user key.
+            if let Some((_, _, size, last)) = &current {
+                if *size >= env.target_file_size && *last != key {
+                    let (id, writer, _, _) = current.take().expect("just checked");
+                    writer.finish()?;
+                    outputs.push(Arc::new(Table {
+                        id,
+                        reader: open_table(&env.dir, id, &env.read_ctx)?,
+                    }));
+                }
+            }
+            if current.is_none() {
+                let id = new_file();
+                let path = table_path(&env.dir, id);
+                current = Some((
+                    id,
+                    SstWriter::with_options(&path, env.writer)?,
+                    0,
+                    Vec::new(),
+                ));
+            }
+            let (_, writer, size, last) = current.as_mut().expect("just set");
+            writer.add(&key, seq, &entry)?;
+            *size += key.len() + entry_len(&entry);
+            *last = key;
+        }
+        if let Some((id, writer, _, _)) = current.take() {
+            writer.finish()?;
+            outputs.push(Arc::new(Table {
+                id,
+                reader: open_table(&env.dir, id, &env.read_ctx)?,
+            }));
+        }
+        Ok(outputs)
     }
 }
 

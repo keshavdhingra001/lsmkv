@@ -220,6 +220,69 @@ The owner approved the whole proposal ("go"). Each entry is filled in as its sec
   - A `get` now clones the value out of the map (it returned a reference before); `Db::get` copied it anyway.
   - Nothing is ever removed from a memtable, so epoch reclamation has nothing to do until the whole memtable drops.
 
+### D14: Immutable memtable and background flush (approved 2026-10-04)
+- **Before:** the leader whose group filled the memtable flushed it inline, holding the state lock: every writer (and, before D12, every reader) waited for a whole table write plus a manifest fsync.
+- **The switch** (`State::switch_memtable`, LevelDB's `MakeRoomForWrite`): before taking its group, a leader checks for room. If the memtable is full, it creates a new WAL, fsyncs the directory, fsyncs the old WAL, makes the full memtable *immutable* and installs a fresh one. Then it wakes the background thread and goes on writing. All of this happens under the state lock, but it's only file creation and two fsyncs, no table write.
+  - **It needs no group in flight,** like M7's flush: the leader is the only possible group, and `Db::flush` waits for `writing == false`.
+  - **Why sync the old WAL:** it holds the immutable memtable's writes until their table commits. In `Periodic` mode its tail may not be on disk yet, and once it's swapped out, the periodic thread syncs only the new WAL. Without this, a power cut during a slow flush could lose more than one interval of writes (`switch_syncs_the_old_log_even_in_periodic_mode`, which counts fsyncs with the WAL's own counter).
+- **One immutable memtable at most** (LevelDB). If the new memtable fills before the old one is flushed, the leader waits: a *stall*, counted in `write_stalls` and `stall_micros`. RocksDB allows several (`max_write_buffer_number`), which absorbs bursts at the cost of memory and longer recovery.
+- **Reads** check the memtable, then the immutable memtable, then the tables. Every version in the immutable memtable is older than every version in the active one, so D18's "first visible version wins" still holds.
+- **The flush job** (`background.rs`):
+  1. Write the table with no lock held.
+  2. **Commit:** one manifest write adds the table, sets the log number to the active WAL (retiring the old one) and records the immutable memtable's last sequence number.
+  3. Install the table in place of the immutable memtable in one step, so a reader finds each version in exactly one of them. Then delete the old WAL.
+- **Recovery is unchanged:** a crash between the switch and the commit leaves two live WALs, and M4's recovery already replays both, oldest first.
+- **File numbers:** the switch takes the log number first, then the flush takes the table number. A flush used to take table N and log N+1; now it's log N, table N+1 (the leftovers test changed accordingly).
+
+### D15: Background compaction, and errors (approved 2026-10-04)
+- **One background thread** (`background::run`), one job at a time, flush first (LevelDB). It waits on a condition variable that a switch, a `compact_all` request or `Drop` signals.
+- **Compaction in three phases:**
+  1. `start_compaction`, lock held: pick the inputs, clone their `Arc<Table>`s and the current SuperVersion, and copy out the settings. A trivial move is only a manifest edit, so it's done right here.
+  2. `CompactionJob::run`, no lock: merge and write the outputs. File numbers come from a closure that takes the lock briefly.
+  3. `finish_compaction`, lock held: commit, install, and delete the inputs.
+- **The levels can't change during phase 2,** because only the background thread changes them, and it runs one job at a time. Writers only touch the memtables, so `finish_compaction` keeps whatever memtables are current.
+- **The oldest snapshot is taken at phase 1.** A snapshot created during the merge has a newer number than that, so it can't need a version the merge drops.
+- **Still under the lock:** manifest fsyncs at commit time, about 1–5 ms. LevelDB releases its mutex for this too, relying on a single manifest writer. Possible here for the same reason, but not done yet.
+- **`flush()` and `compact_all()`:**
+  - `flush()` switches the memtable, then waits until the background thread is idle with nothing to do (no immutable memtable, no level over its limit).
+  - `compact_all()` sets a request that the background thread works through level by level.
+  - The request only moves *down* the levels (`manual_compaction` remembers how far it got), so tables flushed meanwhile can't keep it going forever (mutation: restart from level 0 each step, caught).
+- **Errors poison** (LevelDB's sticky `bg_error_`). A failed switch, flush or compaction poisons the database: writes are refused, reads work, and a reopen recovers from the disk.
+  - **This replaces M4's "a failure before the commit is retryable".** A background job has no caller to hand a retryable error to. Retrying automatically would mean telling transient failures from persistent ones, and fsyncgate (D7) says not to trust a retry after a failed fsync anyway.
+  - **A refused write is never logged:** the leader checks for poison after making room, so a write that gets an error was never acknowledged *and* is not in the WAL. The crash tests used to expect "the failing write's record is durable" (inline flush failed after logging it); now they expect exactly the acknowledged writes.
+- **`Drop`** stops the thread after its current job. An unflushed immutable memtable is still in its WAL, so nothing is lost.
+
+### D16: Level-0 backpressure (approved 2026-10-04)
+- **Why:** with compaction in the background, writers can outrun it. Level 0 would grow without bound, and every read checks every level-0 table.
+- **What** (LevelDB's triggers, now `Options`):
+  - **Compaction trigger (4):** L0 compaction starts.
+  - **Slowdown (8):** each write group's leader first sleeps 1 ms, once. Spreading many small delays avoids one long stall later.
+  - **Stop (12):** a leader that needs a memtable switch waits until compaction brings L0 back under the trigger. Writes into a memtable that still has room aren't blocked: the stop applies at the switch.
+- **Options must satisfy compaction <= slowdown <= stop** (`open_with` refuses otherwise). With stop below the compaction trigger, writes would stop at a level-0 size that never triggers the compaction that would let them continue.
+- **Counted** in `Stats`: `write_slowdowns`, `write_stalls`, `stall_micros` (also shown by the REPL's `stats`).
+
+### Verification for D14–D16
+- **Staged tests**, each with a test-only `slow_background` delay holding the job in place for 400 ms:
+  - `writes_and_reads_continue_while_a_flush_runs`: 50 puts and every get finish in under 100 ms while the flush runs. The test watches the read view, not `stats` (which takes the state lock). A second fill stalls, and its wait is counted.
+  - `writes_and_reads_continue_while_a_compaction_runs`: the same during a 4-table L0 compaction.
+  - `deep_level_0_slows_then_stops_writes_until_compaction_catches_up`: with compactions paused (test hook), L0 reaches the stop trigger and the writer stops, with slowdowns counted. Unpausing lets it finish.
+- **Crash tests:** every switch, flush and compaction failpoint poisons; reopening recovers exactly the acknowledged writes, with no orphans.
+- **Mutation checks, each caught:**
+  - the flush retiring the active WAL
+  - the switch not syncing the old WAL (it survived until the WAL counted its own fsyncs, as M7 already did for groups)
+  - reads skipping the immutable memtable
+  - the flush leaving the immutable memtable installed
+  - switching while a flush is pending
+  - no stop trigger
+  - no slowdown
+  - the flush writing its table while holding the lock (first caught only indirectly, until the test stopped probing through the state lock)
+  - the compaction merging while holding the lock
+  - background errors not poisoning
+  - the manual compaction restarting from level 0
+  - `flush()` returning mid-job
+  - the switch forgetting the immutable memtable's last sequence number
+- **Early numbers** (D11's benchmark, same machine): max write latency fell from 140/450/570 ms to 22/140/199 ms for `Periodic` with 1/4/16 threads, and from 28–51 ms to 27–30 ms for `Always`. `Periodic` throughput rose to 422k/329k/246k ops/s (from 335k/230k/220k). The proper before/after measurement is section 5.
+
 ### D18: Sequence numbers and the internal key order (approved 2026-10-04)
 - **What:** every write gets the next sequence number (`SeqNo`, a `u64`; 0 means "before any write"). Every stored version carries it: WAL records, memtable keys and table entries. A read picks a snapshot number and sees, per key, the newest version at or below it.
 - **Order:** versions sort by user key ascending, then by seq **descending**, so a key's newest version comes first and a lookup stops at the first version it may see (LevelDB's internal key order).

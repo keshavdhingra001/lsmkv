@@ -15,19 +15,18 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::fsutil::sync_dir;
-use crate::key::{SeqNo, Shadowed};
+use crate::key::SeqNo;
 use crate::manifest::{Edit, Manifest, Version, MAX_LEVELS};
 use crate::memtable::{Entry, MemTable};
 use crate::sstable::filter::DEFAULT_BITS_PER_KEY;
-use crate::sstable::{
-    ReadContext, ReadStats, SstReader, SstWriter, WriterOptions, DEFAULT_BLOCK_SIZE,
-};
+use crate::sstable::{ReadContext, ReadStats, SstReader, WriterOptions, DEFAULT_BLOCK_SIZE};
 use crate::wal::{Record, Wal};
 
+mod background;
 mod compaction;
 
 /// Tuning knobs. Defaults follow LevelDB.
@@ -37,6 +36,12 @@ pub struct Options {
     pub memtable_size: usize,
     /// Compact level 0 into level 1 once level 0 has this many tables.
     pub l0_compaction_trigger: usize,
+    /// With this many level-0 tables, each write first sleeps 1 ms, handing
+    /// the background thread time to catch up (DESIGN.md D16).
+    pub l0_slowdown_trigger: usize,
+    /// With this many level-0 tables, a write that needs a fresh memtable
+    /// waits until compaction brings level 0 back down.
+    pub l0_stop_trigger: usize,
     /// Size limit for level 1. Each deeper level's limit is
     /// `level_size_multiplier` times the one above it.
     pub level1_max_bytes: u64,
@@ -69,6 +74,8 @@ impl Default for Options {
         Self {
             memtable_size: 4 << 20,
             l0_compaction_trigger: 4,
+            l0_slowdown_trigger: 8,
+            l0_stop_trigger: 12,
             level1_max_bytes: 10 << 20,
             level_size_multiplier: 10,
             target_file_size: 2 << 20,
@@ -85,6 +92,8 @@ pub struct Stats {
     /// Versions in the memtable (each write adds one).
     pub memtable_entries: usize,
     pub memtable_bytes: usize,
+    /// Versions in the immutable memtable waiting to be flushed (0 if none).
+    pub immutable_entries: usize,
     /// Total live tables across all levels.
     pub tables: usize,
     /// Tables per level, index = level.
@@ -99,8 +108,15 @@ pub struct Stats {
     /// WAL write groups since open: each one a single append-and-sync for
     /// one or more writes.
     pub write_groups: u64,
-    /// WAL fsyncs since open (by write groups, or by the periodic thread).
+    /// WAL fsyncs since open (by write groups, memtable switches, or the
+    /// periodic thread).
     pub wal_syncs: u64,
+    /// Write groups delayed 1 ms because level 0 reached the slowdown trigger.
+    pub write_slowdowns: u64,
+    /// Write groups that had to wait for the background thread (a flush
+    /// still running, or level 0 at the stop trigger), and the total wait.
+    pub write_stalls: u64,
+    pub stall_micros: u64,
     /// Key + value bytes written by callers since open.
     pub user_bytes: u64,
     /// SSTable bytes written by flushes since open.
@@ -155,7 +171,11 @@ type Levels = Vec<Vec<Arc<Table>>>;
 /// reading it safely: its memtable and tables stay alive (and their files
 /// open) for as long as the reader holds the `Arc`.
 struct SuperVersion {
+    /// Takes new writes.
     mem: Arc<MemTable>,
+    /// Full, and waiting for the background thread to flush it (D14). Every
+    /// version in it is older than every version in `mem`.
+    imm: Option<Arc<MemTable>>,
     levels: Levels,
 }
 
@@ -165,10 +185,12 @@ impl SuperVersion {
     /// than every version in an older one, so the first version found that
     /// the snapshot may see is the answer.
     fn get(&self, key: &[u8], snapshot: SeqNo) -> Result<Option<Vec<u8>>> {
-        match self.mem.get(key, snapshot) {
-            Some((_, Entry::Value(v))) => return Ok(Some(v)),
-            Some((_, Entry::Tombstone)) => return Ok(None),
-            None => {}
+        for mem in std::iter::once(&self.mem).chain(&self.imm) {
+            match mem.get(key, snapshot) {
+                Some((_, Entry::Value(v))) => return Ok(Some(v)),
+                Some((_, Entry::Tombstone)) => return Ok(None),
+                None => {}
+            }
         }
         let level0 = self.levels[0].iter();
         let deeper = self.levels[1..]
@@ -215,6 +237,8 @@ pub struct Db {
     shared: Arc<Shared>,
     /// The background fsync thread in `SyncMode::Periodic`.
     syncer: Option<JoinHandle<()>>,
+    /// The flush and compaction thread (`background.rs`).
+    background: Option<JoinHandle<()>>,
 }
 
 struct Shared {
@@ -223,9 +247,14 @@ struct Shared {
     /// What readers read. Its own lock, held only to copy out an `Arc` and a
     /// number, so a reader never waits behind a write, flush or compaction.
     view: Arc<Mutex<ReadView>>,
-    /// Writers wait here for their turn to lead or for their leader to finish
-    /// their write; flush and compaction wait here for a group to finish.
+    /// Notified whenever a write group or a background job finishes, or the
+    /// database is poisoned. Writers wait here for their turn to lead or for
+    /// their leader to finish their write; stalled leaders and `flush` /
+    /// `compact_all` callers wait here for the background thread.
     turn: Condvar,
+    /// Wakes the background thread: a memtable was switched, a manual
+    /// compaction was requested, or the `Db` is closing.
+    bg_work: Condvar,
     /// Set when the `Db` is dropped, to stop the periodic sync thread.
     stop: Mutex<bool>,
     stop_signal: Condvar,
@@ -259,6 +288,15 @@ struct State {
     /// see everything up to here. A group in flight has numbers above it,
     /// and becomes visible all at once when it's applied (DESIGN.md D18).
     last_seq: SeqNo,
+    /// `last_seq` when the immutable memtable was switched out: its newest write.
+    imm_last_seq: SeqNo,
+    /// The `Db` is closing: the background thread exits.
+    stopping: bool,
+    /// The background thread is running a job.
+    bg_busy: bool,
+    /// A `compact_all` in progress: the lowest level it may still have to
+    /// push down.
+    manual_compaction: Option<usize>,
     /// Block cache and read counters, shared by every open table.
     read_ctx: Arc<ReadContext>,
     /// Set after a WAL or manifest write fails; see `Error::Poisoned`.
@@ -279,6 +317,9 @@ struct State {
     user_bytes: u64,
     flush_bytes: u64,
     compaction_bytes: u64,
+    write_slowdowns: u64,
+    write_stalls: u64,
+    stall_micros: u64,
     /// Test-only crash injection: the named failpoint returns an error.
     #[cfg(test)]
     fail_at: Option<&'static str>,
@@ -286,6 +327,13 @@ struct State {
     /// WAL, so concurrent writers reliably pile up into groups.
     #[cfg(test)]
     slow_wal: Duration,
+    /// Test-only slow disk for the background thread: every flush and
+    /// compaction sleeps this long, with no lock held, before its I/O.
+    #[cfg(test)]
+    slow_background: Duration,
+    /// Test-only: the background thread flushes but doesn't compact.
+    #[cfg(test)]
+    pause_compactions: bool,
 }
 
 impl Db {
@@ -298,6 +346,16 @@ impl Db {
     /// 2. Delete files the manifest says aren't live (leftovers from a crash).
     /// 3. Replay the live WALs, oldest first, into a fresh memtable.
     pub fn open_with(dir: impl AsRef<Path>, opts: Options) -> Result<Self> {
+        // Otherwise writes could stop at a level-0 size that never triggers
+        // the compaction that would let them continue.
+        if !(opts.l0_compaction_trigger <= opts.l0_slowdown_trigger
+            && opts.l0_slowdown_trigger <= opts.l0_stop_trigger)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "level-0 triggers must satisfy compaction ({}) <= slowdown ({}) <= stop ({})",
+                opts.l0_compaction_trigger, opts.l0_slowdown_trigger, opts.l0_stop_trigger
+            )));
+        }
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         let (mut manifest, mut version) = Manifest::open(&dir)?;
@@ -363,6 +421,7 @@ impl Db {
         let wal = Arc::new(Mutex::new(wal));
         let current = Arc::new(SuperVersion {
             mem: Arc::new(memtable),
+            imm: None,
             levels,
         });
         let view = Arc::new(Mutex::new(ReadView {
@@ -380,6 +439,10 @@ impl Db {
             version,
             next_file,
             last_seq,
+            imm_last_seq: 0,
+            stopping: false,
+            bg_busy: false,
+            manual_compaction: None,
             read_ctx,
             poisoned: None,
             compact_pointer: vec![None; MAX_LEVELS],
@@ -393,16 +456,24 @@ impl Db {
             user_bytes: 0,
             flush_bytes: 0,
             compaction_bytes: 0,
+            write_slowdowns: 0,
+            write_stalls: 0,
+            stall_micros: 0,
             #[cfg(test)]
             fail_at: None,
             #[cfg(test)]
             slow_wal: Duration::ZERO,
+            #[cfg(test)]
+            slow_background: Duration::ZERO,
+            #[cfg(test)]
+            pause_compactions: false,
         };
         let shared = Arc::new(Shared {
             dir,
             state: Mutex::new(state),
             view,
             turn: Condvar::new(),
+            bg_work: Condvar::new(),
             stop: Mutex::new(false),
             stop_signal: Condvar::new(),
             periodic_syncs: AtomicU64::new(0),
@@ -418,12 +489,21 @@ impl Db {
                 }))
             }
         };
-        Ok(Self { shared, syncer })
+        let background = {
+            let shared = Arc::clone(&shared);
+            thread::Builder::new()
+                .name("lsmkv-background".into())
+                .spawn(move || background::run(&shared))?
+        };
+        Ok(Self {
+            shared,
+            syncer,
+            background: Some(background),
+        })
     }
 
     /// Writes `key = value`. Returns once the write is as durable as the
-    /// `SyncMode` promises. If this write fills the memtable, it also
-    /// flushes; an `Err` from that flush still leaves the write itself logged.
+    /// `SyncMode` promises. An `Err` means the write was not logged.
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.write(Record::Put {
             key: key.to_vec(),
@@ -449,15 +529,41 @@ impl Db {
         current.get(key, snapshot)
     }
 
-    /// Flushes the memtable, then compacts until no level is over its limit.
+    /// Flushes the memtable, and returns once the background thread has
+    /// written it and compacted until no level is over its limit.
     pub fn flush(&self) -> Result<()> {
-        self.exclusive().flush()
+        let mut st = self.lock();
+        // Like a write group's leader: no group may be appending to the WAL
+        // being sealed, and an older immutable memtable must be flushed first.
+        loop {
+            st.check_writable()?;
+            if !st.writing && st.current.imm.is_none() {
+                break;
+            }
+            st = self.wait(st);
+        }
+        if !st.current.mem.is_empty() {
+            st.switch_memtable()?;
+            self.shared.bg_work.notify_one();
+        }
+        self.wait_for_background(st)
     }
 
     /// Flushes, then pushes every table down to the bottom level, which drops
-    /// every overwritten value and every tombstone.
+    /// every overwritten value and every tombstone no snapshot needs. Like
+    /// RocksDB's `CompactRange` over the whole key space.
     pub fn compact_all(&self) -> Result<()> {
-        self.exclusive().compact_all()
+        self.flush()?;
+        let mut st = self.lock();
+        st.manual_compaction = Some(0);
+        self.shared.bg_work.notify_one();
+        loop {
+            st.check_writable()?;
+            if st.manual_compaction.is_none() && !st.bg_busy {
+                return Ok(());
+            }
+            st = self.wait(st);
+        }
     }
 
     pub fn stats(&self) -> Stats {
@@ -488,12 +594,13 @@ impl Db {
             st = self.wait(st);
         }
 
+        let (mut st, room) = self.make_room(st);
         let group = st.take_group();
         // Numbered in queue order. Only one group is ever in flight, so the
         // numbers right after the last applied write are free.
         let first_seq = st.last_seq + 1;
         // The database may have been poisoned while this group waited.
-        let ready = st.check_writable();
+        let ready = room.and_then(|()| st.check_writable());
         let injected = st.failpoint("wal:sync");
         let sync = st.opts.sync_mode == SyncMode::Always;
         #[cfg(test)]
@@ -535,15 +642,63 @@ impl Db {
         result
     }
 
-    /// The state lock, once no write group is in flight. Flush and compaction
-    /// switch the WAL and memtable, which must never happen while a leader is
-    /// appending to the old WAL: its records would land in a retired log.
-    fn exclusive(&self) -> MutexGuard<'_, State> {
-        let mut st = self.lock();
-        while st.writing {
+    /// Run by a leader before it takes its group: makes sure the memtable has
+    /// room, switching a full one out for the background thread to flush
+    /// (DESIGN.md D14, D16). It may release the state lock to wait; the
+    /// caller stays the leader throughout, since its write is still at the
+    /// front of the queue and no group is in flight.
+    fn make_room<'a>(
+        &'a self,
+        mut st: MutexGuard<'a, State>,
+    ) -> (MutexGuard<'a, State>, Result<()>) {
+        let mut slowed = false;
+        let mut stalled_since = None;
+        let room = loop {
+            if let Err(e) = st.check_writable() {
+                break Err(e);
+            }
+            let l0 = st.current.levels[0].len();
+            if !slowed && l0 >= st.opts.l0_slowdown_trigger {
+                // A 1 ms delay on many writes, instead of one long stall
+                // later: hands the background thread time to compact.
+                slowed = true;
+                st.write_slowdowns += 1;
+                drop(st);
+                thread::sleep(Duration::from_millis(1));
+                st = self.lock();
+                continue;
+            }
+            if st.current.mem.approx_size() < st.opts.memtable_size {
+                break Ok(());
+            }
+            if st.current.imm.is_some() || l0 >= st.opts.l0_stop_trigger {
+                // The previous memtable is still being flushed, or level 0
+                // is too deep to add to: wait for the background thread.
+                stalled_since.get_or_insert_with(Instant::now);
+                st = self.wait(st);
+                continue;
+            }
+            let switched = st.switch_memtable();
+            self.shared.bg_work.notify_one();
+            break switched;
+        };
+        if let Some(since) = stalled_since {
+            st.write_stalls += 1;
+            st.stall_micros += since.elapsed().as_micros() as u64;
+        }
+        (st, room)
+    }
+
+    /// Waits until the background thread is idle with nothing left to do:
+    /// no immutable memtable and no level over its limit.
+    fn wait_for_background(&self, mut st: MutexGuard<'_, State>) -> Result<()> {
+        loop {
+            st.check_writable()?;
+            if st.current.imm.is_none() && !st.bg_busy && !st.compaction_wanted() {
+                return Ok(());
+            }
             st = self.wait(st);
         }
-        st
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -561,9 +716,16 @@ impl Db {
 }
 
 impl Drop for Db {
-    /// Stops the periodic sync thread, then syncs the WAL once more, so a
-    /// clean close never loses an acknowledged write in any mode.
+    /// Stops the background thread (after the job it's on, if any; an
+    /// unflushed memtable is still in its WAL), then the periodic sync
+    /// thread, then syncs the WAL once more, so a clean close never loses an
+    /// acknowledged write in any mode.
     fn drop(&mut self) {
+        if let Some(background) = self.background.take() {
+            self.lock().stopping = true;
+            self.shared.bg_work.notify_all();
+            let _ = background.join();
+        }
         if let Some(syncer) = self.syncer.take() {
             *lock(&self.shared.stop) = true;
             self.shared.stop_signal.notify_all();
@@ -611,6 +773,8 @@ fn sync_periodically(shared: &Shared, wal: &Mutex<Wal>, every: Duration) {
         });
         if let Err(e) = synced {
             lock(&shared.state).poison(e);
+            // Writers stalled on the background thread must see it.
+            shared.turn.notify_all();
             return;
         }
         shared.periodic_syncs.fetch_add(1, Ordering::Relaxed);
@@ -675,91 +839,44 @@ impl State {
         }
         // Now the whole group is visible, at once.
         lock(&self.view).last_seq = self.last_seq;
-        // The leader pays for the flush; its followers' writes are done.
-        if self.current.mem.approx_size() >= self.opts.memtable_size {
-            self.flush()?;
-        }
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<()> {
-        self.flush_memtable()?;
-        self.maybe_compact()
-    }
-
-    /// Writes the memtable to a new level-0 SSTable and starts a fresh WAL.
+    /// Makes the memtable immutable, for the background thread to flush,
+    /// and starts a fresh one with a fresh WAL (DESIGN.md D14).
     ///
-    /// Steps, ordered so a crash after any of them loses nothing:
-    /// 1. Write the table (tmp + fsync + rename). Unlisted, so a crash leaves an orphan.
-    /// 2. Create the new WAL. Empty, so a crash leaves a harmless extra log.
-    /// 3. **Commit point:** one manifest write adds the table and retires the
-    ///    old WAL. Before this, recovery replays the old WAL; after it, the table
-    ///    is live.
-    /// 4. Switch in-memory state, then delete the now-obsolete WAL (best effort;
-    ///    the next open retries).
-    ///
-    /// A failure before the commit point leaves the database usable; the
-    /// orphans are cleaned up on the next open. A failure at or after it
-    /// poisons the database (see `Error::Poisoned`).
-    ///
-    /// Callers hold the state lock with no write group in flight, so no
-    /// leader is appending to the WAL being retired.
-    fn flush_memtable(&mut self) -> Result<()> {
-        self.check_writable()?;
-        if self.current.mem.is_empty() {
-            return Ok(());
+    /// Callers hold the state lock with no group in flight (so no leader is
+    /// appending to the WAL being sealed) and no immutable memtable. The old
+    /// WAL stays live, and recovery replays it, until the flush commits.
+    /// Any failure poisons: the WALs on disk may no longer match memory.
+    fn switch_memtable(&mut self) -> Result<()> {
+        debug_assert!(!self.writing && self.current.imm.is_none());
+        let log_id = self.next_file;
+        self.next_file += 1;
+        let switched = self.failpoint("switch:new_log").and_then(|()| {
+            let new_wal = Wal::open(&log_path(&self.dir, log_id))?;
+            sync_dir(&self.dir)?;
+            // In `Periodic` mode the old log's tail may not be on disk yet,
+            // and nothing would sync it once it's swapped out. It holds the
+            // immutable memtable's writes until their table commits.
+            let mut wal = lock(&self.wal);
+            let before = wal.sync_count();
+            wal.sync()?;
+            let synced = wal.sync_count() - before;
+            *wal = new_wal;
+            Ok(synced)
+        });
+        match switched {
+            Ok(synced) => self.wal_syncs += synced,
+            Err(e) => return Err(self.poison(e)),
         }
-        let table_id = self.next_file;
-        let log_id = table_id + 1;
-        // Reserve both numbers up front so a failed flush never reuses one
-        // that an orphan file on disk might still hold.
-        self.next_file += 2;
-
-        let table_path = table_path(&self.dir, table_id);
-        let mut writer = SstWriter::with_options(&table_path, self.writer_options())?;
-        // Overwritten versions no reader can see stay behind. Tombstones all
-        // go in: older tables may hold what they delete.
-        let mut shadowed = Shadowed::new(self.oldest_snapshot());
-        for e in self.current.mem.iter() {
-            let (key, seq) = (&e.key().user_key, e.key().seq);
-            if !shadowed.check(key, seq) {
-                writer.add(key, seq, e.value())?;
-            }
-        }
-        writer.finish()?;
-        let reader = open_table(&self.dir, table_id, &self.read_ctx)?;
-        self.failpoint("flush:after_table")?;
-
-        let new_wal = Wal::open(&log_path(&self.dir, log_id))?;
-        sync_dir(&self.dir)?;
-        self.failpoint("flush:after_new_log")?;
-
-        let edits = [
-            Edit::AddTable {
-                id: table_id,
-                level: 0,
-            },
-            Edit::SetLogNumber(log_id),
-            // The old WAL, which held these writes' numbers, is going away.
-            Edit::SetLastSequence(self.last_seq),
-        ];
-        self.commit(&edits, "flush")?;
-
-        self.flush_bytes += reader.file_size();
-        let mut levels = self.current.levels.clone();
-        levels[0].insert(
-            0,
-            Arc::new(Table {
-                id: table_id,
-                reader,
-            }),
-        );
-        // The flushed versions leave the memtable and appear in the table in
-        // one step, so a reader sees them in exactly one of the two.
-        self.install(Arc::new(MemTable::new()), levels);
-        *lock(&self.wal) = new_wal;
         self.wal_number = log_id;
-        let _ = remove_obsolete_files(&self.dir, &self.version);
+        self.imm_last_seq = self.last_seq;
+        self.install(SuperVersion {
+            mem: Arc::new(MemTable::new()),
+            imm: Some(Arc::clone(&self.current.mem)),
+            levels: self.current.levels.clone(),
+        });
         Ok(())
     }
 
@@ -768,6 +885,7 @@ impl State {
         Stats {
             memtable_entries: self.current.mem.len(),
             memtable_bytes: self.current.mem.approx_size(),
+            immutable_entries: self.current.imm.as_ref().map_or(0, |m| m.len()),
             tables: self.current.levels.iter().map(Vec::len).sum(),
             level_files: self.current.levels.iter().map(Vec::len).collect(),
             level_bytes: self
@@ -781,6 +899,9 @@ impl State {
             writes: self.writes,
             write_groups: self.write_groups,
             wal_syncs: self.wal_syncs,
+            write_slowdowns: self.write_slowdowns,
+            write_stalls: self.write_stalls,
+            stall_micros: self.stall_micros,
             user_bytes: self.user_bytes,
             flush_bytes: self.flush_bytes,
             compaction_bytes: self.compaction_bytes,
@@ -792,11 +913,20 @@ impl State {
         }
     }
 
-    /// Makes `mem` and `levels` the live data, for this state and for
-    /// readers. The only way either changes after open.
-    fn install(&mut self, mem: Arc<MemTable>, levels: Levels) {
-        self.current = Arc::new(SuperVersion { mem, levels });
+    /// Makes `sv` the live data, for this state and for readers. The only
+    /// way the memtables or levels change after open.
+    fn install(&mut self, sv: SuperVersion) {
+        self.current = Arc::new(sv);
         lock(&self.view).current = Arc::clone(&self.current);
+    }
+
+    /// `install` with new levels and the same memtables.
+    fn install_levels(&mut self, levels: Levels) {
+        self.install(SuperVersion {
+            mem: Arc::clone(&self.current.mem),
+            imm: self.current.imm.clone(),
+            levels,
+        });
     }
 
     /// The oldest snapshot any reader may still read at: versions it can't
@@ -990,6 +1120,7 @@ fn remove_obsolete_files(dir: &Path, version: &Version) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sstable::SstWriter;
     use crate::test_util::Rng;
     use std::collections::BTreeMap;
 
@@ -1005,6 +1136,9 @@ mod tests {
         Options {
             memtable_size: 512,
             l0_compaction_trigger: 2,
+            // Close behind, so writes get slowed and stalled for real.
+            l0_slowdown_trigger: 4,
+            l0_stop_trigger: 6,
             level1_max_bytes: 4096,
             level_size_multiplier: 3,
             target_file_size: 1024,
@@ -1223,7 +1357,7 @@ mod tests {
         {
             let db = Db::open(dir.path()).unwrap();
             db.put(b"a", b"1").unwrap();
-            db.flush().unwrap(); // table 2, log 3; log 1 is obsolete
+            db.flush().unwrap(); // log 2, then table 3; log 1 is obsolete
         }
         for junk in ["000001.log", "000950.sst", "000951.sst.tmp"] {
             fs::write(dir.path().join(junk), b"junk").unwrap();
@@ -1232,7 +1366,7 @@ mod tests {
 
         let db = Db::open(dir.path()).unwrap();
         assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
-        assert_eq!(files(dir.path()), vec![DbFile::Log(3), DbFile::Table(2)]);
+        assert_eq!(files(dir.path()), vec![DbFile::Log(2), DbFile::Table(3)]);
         assert!(dir.path().join("notes.txt").exists());
     }
 
@@ -1244,9 +1378,9 @@ mod tests {
             db.put(b"a", b"1").unwrap();
             db.flush().unwrap();
         }
-        fs::remove_file(dir.path().join("000002.sst")).unwrap();
+        fs::remove_file(dir.path().join("000003.sst")).unwrap();
         match Db::open(dir.path()) {
-            Err(Error::Corruption(msg)) => assert!(msg.contains("000002.sst"), "{msg}"),
+            Err(Error::Corruption(msg)) => assert!(msg.contains("000003.sst"), "{msg}"),
             other => panic!("expected Corruption, got {:?}", other.err()),
         }
     }
@@ -1337,14 +1471,20 @@ mod tests {
         let n = 4000;
         {
             let db = Db::open_with(dir.path(), tiny()).unwrap();
+            let stop = tiny().l0_stop_trigger;
             for i in 0..n {
                 db.put(&key(i), &key(i)).unwrap();
-                assert!(
-                    db.stats().level_files[0] < 2,
-                    "L0 over trigger after put {i}"
-                );
+                // Compaction runs in the background, so level 0 may grow
+                // past its trigger, but the stop trigger bounds it.
+                let l0 = db.stats().level_files[0];
+                assert!(l0 <= stop, "L0 at {l0} after put {i}");
             }
+            db.flush().unwrap();
             let st = db.stats();
+            assert!(
+                st.level_files[0] < 2,
+                "L0 over trigger once settled: {st:?}"
+            );
             assert!(st.level_files[3] > 0, "never reached L3: {st:?}");
             assert!(st.write_amplification() > 1.0, "{st:?}");
             assert_keys(&db, 0..n, "before reopen");
@@ -1432,21 +1572,22 @@ mod tests {
         );
     }
 
+    /// Every step of a memtable switch and its background flush that can fail.
     const FLUSH_FAILPOINTS: [&str; 4] = [
+        "switch:new_log",
         "flush:after_table",
-        "flush:after_new_log",
         "flush:manifest",
         "flush:after_manifest",
     ];
 
-    /// Writes key(0), key(1), ... until a put fails (the flush hit the
-    /// failpoint). Returns how many keys were written; the failing key's own
-    /// WAL record is durable, so it counts too.
+    /// Writes key(0), key(1), ... until a put fails (the switch or the
+    /// background flush hit the failpoint and poisoned the database). Returns
+    /// how many puts succeeded: a refused put was never logged.
     fn write_until_failpoint(db: &mut Db, fp: &'static str) -> usize {
         db.state().fail_at = Some(fp);
         for i in 0..100_000 {
             if db.put(&key(i), &key(i)).is_err() {
-                return i + 1;
+                return i;
             }
         }
         panic!("{fp} never triggered");
@@ -1517,7 +1658,7 @@ mod tests {
             while db.put(&key(n), &key(n)).is_ok() {
                 n += 1;
             }
-            let n = n + 1; // the failing put's WAL record is durable
+            // n puts were acknowledged; the failing one was refused unlogged.
             drop(db);
 
             let db = Db::open_with(dir.path(), tiny()).unwrap();
@@ -1536,29 +1677,10 @@ mod tests {
     }
 
     #[test]
-    fn failure_before_commit_is_retryable_without_reopen() {
-        for fp in ["flush:after_table", "flush:after_new_log"] {
-            let dir = tempfile::tempdir().unwrap();
-            let mut db = Db::open_with(dir.path(), small()).unwrap();
-            let n = write_until_failpoint(&mut db, fp);
-
-            db.state().fail_at = None;
-            db.flush().unwrap();
-            for i in n..n + 300 {
-                db.put(&key(i), &key(i)).unwrap();
-            }
-            assert_keys(&db, 0..n + 300, fp);
-            drop(db);
-
-            let db = Db::open_with(dir.path(), small()).unwrap();
-            assert_keys(&db, 0..n + 300, &format!("{fp}, reopened"));
-            assert_no_orphans(dir.path(), &db, fp);
-        }
-    }
-
-    #[test]
-    fn failure_at_commit_poisons_writes_but_not_reads() {
-        for fp in ["flush:manifest", "flush:after_manifest"] {
+    fn background_failure_poisons_writes_but_not_reads() {
+        // Before the commit too: a background job has no caller to hand a
+        // retryable error to (DESIGN.md D15).
+        for fp in FLUSH_FAILPOINTS {
             let dir = tempfile::tempdir().unwrap();
             let mut db = Db::open_with(dir.path(), small()).unwrap();
             let n = write_until_failpoint(&mut db, fp);
@@ -1586,6 +1708,8 @@ mod tests {
     fn eight_overlapping_tables(dir: &Path, bloom_bits_per_key: usize, n: usize) -> Db {
         let opts = Options {
             l0_compaction_trigger: 100,
+            l0_slowdown_trigger: 100,
+            l0_stop_trigger: 100,
             bloom_bits_per_key,
             // Cache off, so every block a lookup needs is a disk read.
             block_cache_bytes: 0,
@@ -1663,6 +1787,8 @@ mod tests {
             bloom_bits_per_key: 0,
             block_cache_bytes: 0,
             l0_compaction_trigger: 100,
+            l0_slowdown_trigger: 100,
+            l0_stop_trigger: 100,
             ..small()
         };
         let db = Db::open_with(dir.path(), no_filters.clone()).unwrap();
@@ -2088,9 +2214,14 @@ mod tests {
             // Filter size changes on every reopen, so one database mixes
             // tables with no filter, weak filters and normal ones.
             let bloom_sizes = [0, 1, 4, 10];
+            // Close together, so slowdowns and stalls happen too.
+            let l0_compaction_trigger = 2 + rng.below(4) as usize;
+            let l0_slowdown_trigger = l0_compaction_trigger + rng.below(3) as usize;
             let mut opts = Options {
                 memtable_size: 64 + rng.below(4000) as usize,
-                l0_compaction_trigger: 2 + rng.below(4) as usize,
+                l0_compaction_trigger,
+                l0_slowdown_trigger,
+                l0_stop_trigger: l0_slowdown_trigger + rng.below(3) as usize,
                 level1_max_bytes: 512 + rng.below(8192),
                 level_size_multiplier: 2 + rng.below(9),
                 target_file_size: 256 + rng.below(4096) as usize,
@@ -2257,5 +2388,192 @@ mod tests {
         let st = db.stats();
         assert!(st.compaction_bytes > 0 && st.flush_bytes > 0, "{st:?}");
         assert!(reads > 1000, "only {reads} reads");
+    }
+
+    // ---- M8: background flush and compaction ----
+
+    /// The longest single call to `op`, over `n` calls.
+    fn slowest(n: usize, mut op: impl FnMut(usize)) -> Duration {
+        (0..n)
+            .map(|i| {
+                let start = std::time::Instant::now();
+                op(i);
+                start.elapsed()
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn writes_and_reads_continue_while_a_flush_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            memtable_size: 16 << 10,
+            ..Options::default()
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+        db.state().slow_background = Duration::from_millis(400);
+        // Fill the memtable until the switch: it's now immutable, and the
+        // background thread is (slowly) flushing it. Watched through the read
+        // view, which (unlike `stats`) doesn't take the state lock.
+        let flushing = |db: &Db| read_view(db).0.imm.is_some();
+        let mut n = 0;
+        while !flushing(&db) {
+            db.put(&key(n), &key(n)).unwrap();
+            n += 1;
+        }
+        // Writes into the fresh memtable and reads of the flushing one (and
+        // of the new one) don't wait for the flush.
+        let put_max = slowest(50, |i| db.put(&key(n + i), &key(n + i)).unwrap());
+        let get_max = slowest(n + 50, |i| {
+            assert_eq!(db.get(&key(i)).unwrap(), Some(key(i)))
+        });
+        assert!(
+            put_max < Duration::from_millis(100),
+            "a put took {put_max:?}"
+        );
+        assert!(
+            get_max < Duration::from_millis(100),
+            "a get took {get_max:?}"
+        );
+        assert!(flushing(&db), "flush finished too soon to tell");
+        assert_eq!(db.stats().write_stalls, 0);
+
+        // Filling the second memtable before the first is flushed must wait.
+        n += 50;
+        while db.stats().write_stalls == 0 {
+            db.put(&key(n), &key(n)).unwrap();
+            n += 1;
+        }
+        let st = db.stats();
+        assert!(st.stall_micros > 50_000, "{st:?}");
+        drop(db);
+        let db = Db::open(dir.path()).unwrap();
+        assert_keys(&db, 0..n, "reopened");
+    }
+
+    #[test]
+    fn writes_and_reads_continue_while_a_compaction_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open_with(dir.path(), small()).unwrap();
+        db.state().pause_compactions = true;
+        for round in 0..4 {
+            for i in 0..50 {
+                db.put(&key(i), format!("r{round}").as_bytes()).unwrap();
+            }
+            db.flush().unwrap();
+        }
+        assert_eq!(db.stats().level_files[0], 4);
+        {
+            let mut st = db.state();
+            st.pause_compactions = false;
+            st.slow_background = Duration::from_millis(400);
+        }
+        db.shared.bg_work.notify_one();
+        assert!(eventually(|| db.state().bg_busy));
+
+        // Fewer bytes than a memtable holds, so no switch is needed.
+        let put_max = slowest(20, |i| db.put(&key(100 + i), b"new").unwrap());
+        let get_max = slowest(50, |i| {
+            assert_eq!(db.get(&key(i)).unwrap(), Some(b"r3".to_vec()));
+        });
+        assert!(db.state().bg_busy, "compaction finished too soon to tell");
+        assert!(
+            put_max < Duration::from_millis(100),
+            "a put took {put_max:?}"
+        );
+        assert!(
+            get_max < Duration::from_millis(100),
+            "a get took {get_max:?}"
+        );
+
+        db.flush().unwrap(); // waits for the compaction too
+        let st = db.stats();
+        // The 4 old tables went down; the one new table is the 20 puts.
+        assert_eq!(st.level_files[0], 1, "{st:?}");
+        assert!(st.compaction_bytes > 0, "{st:?}");
+        assert_eq!(db.get(&key(7)).unwrap(), Some(b"r3".to_vec()));
+    }
+
+    #[test]
+    fn deep_level_0_slows_then_stops_writes_until_compaction_catches_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            memtable_size: 1024,
+            l0_compaction_trigger: 2,
+            l0_slowdown_trigger: 3,
+            l0_stop_trigger: 4,
+            ..Options::default()
+        };
+        let db = Arc::new(Db::open_with(dir.path(), opts).unwrap());
+        db.state().pause_compactions = true;
+        let written = Arc::new(AtomicU64::new(0));
+        let writer = {
+            let (db, written) = (Arc::clone(&db), Arc::clone(&written));
+            thread::spawn(move || {
+                for i in 0..2000 {
+                    db.put(&key(i), &[b'v'; 50]).unwrap();
+                    written.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+        // Level 0 fills to the stop trigger. Writes go on into the memtable
+        // until it's full; then the switch it needs waits, and they stop.
+        let stopped = eventually(|| {
+            let before = written.load(Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(100));
+            before == written.load(Ordering::Relaxed)
+        });
+        assert!(stopped && !writer.is_finished(), "writes never stopped");
+        assert_eq!(db.stats().level_files[0], 4);
+        assert!(db.stats().write_slowdowns > 0, "{:?}", db.stats());
+
+        // Compaction drains level 0, and the writer finishes.
+        db.state().pause_compactions = false;
+        db.shared.bg_work.notify_one();
+        writer.join().unwrap();
+        db.flush().unwrap();
+        let st = db.stats();
+        assert!(st.write_stalls > 0, "{st:?}");
+        assert!(st.level_files[0] < 2, "{st:?}");
+        assert_eq!(db.get(&key(1999)).unwrap(), Some(vec![b'v'; 50]));
+    }
+
+    #[test]
+    fn level_0_triggers_must_be_ordered() {
+        let dir = tempfile::tempdir().unwrap();
+        for (compaction, slowdown, stop) in [(4, 3, 12), (4, 8, 7)] {
+            let opts = Options {
+                l0_compaction_trigger: compaction,
+                l0_slowdown_trigger: slowdown,
+                l0_stop_trigger: stop,
+                ..Options::default()
+            };
+            assert!(matches!(
+                Db::open_with(dir.path(), opts),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn switch_syncs_the_old_log_even_in_periodic_mode() {
+        // An hour-long interval: no periodic fsync will happen in this test.
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options {
+            memtable_size: 1024,
+            ..periodic(Duration::from_secs(3600))
+        };
+        let db = Db::open_with(dir.path(), opts).unwrap();
+        let mut n = 0;
+        while db.stats().immutable_entries == 0 && db.stats().flush_bytes == 0 {
+            db.put(&key(n), &key(n)).unwrap();
+            n += 1;
+        }
+        // The one fsync is the switch sealing the old log, which still holds
+        // every acknowledged write until its table commits. Without it, a
+        // power cut before the flush finished could lose more than the
+        // interval allows.
+        assert_eq!(db.stats().wal_syncs, 1, "{:?}", db.stats());
     }
 }
