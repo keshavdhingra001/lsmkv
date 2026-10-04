@@ -8,6 +8,12 @@ pub enum Error {
 
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// An earlier WAL or manifest write failed, so the on-disk state is
+    /// uncertain. Writes are refused until the database is reopened, which
+    /// recovers from what actually reached the disk.
+    #[error("database is read-only after an earlier write failure: {0}")]
+    Poisoned(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

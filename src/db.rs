@@ -54,6 +54,8 @@ pub struct Db {
     tables: Vec<SstReader>,
     /// Next unused file number, for both logs and tables.
     next_file: u64,
+    /// Set after a WAL or manifest write fails; see `Error::Poisoned`.
+    poisoned: Option<String>,
     /// Test-only crash injection: the named failpoint returns an error.
     #[cfg(test)]
     fail_at: Option<&'static str>,
@@ -141,6 +143,7 @@ impl Db {
             version,
             tables,
             next_file,
+            poisoned: None,
             #[cfg(test)]
             fail_at: None,
         })
@@ -188,7 +191,12 @@ impl Db {
     ///    is live.
     /// 4. Switch in-memory state, then delete the now-obsolete WAL (best effort;
     ///    the next open retries).
+    ///
+    /// A failure before the commit point leaves the database usable; the
+    /// orphans are cleaned up on the next open. A failure at or after it
+    /// poisons the database (see `Error::Poisoned`).
     pub fn flush(&mut self) -> Result<()> {
+        self.check_writable()?;
         if self.memtable.is_empty() {
             return Ok(());
         }
@@ -211,12 +219,20 @@ impl Db {
         sync_dir(&self.dir)?;
         self.failpoint("flush:after_new_log")?;
 
+        // Commit point. If the manifest write fails, it may still have reached
+        // the disk, in which case the current WAL is now obsolete. Writing
+        // more to it would lose data on the next open, so poison instead.
         let edits = [Edit::AddTable(table_id), Edit::SetLogNumber(log_id)];
-        self.manifest.append(&edits)?;
+        let committed = self
+            .failpoint("flush:manifest")
+            .and_then(|()| self.manifest.append(&edits))
+            .and_then(|()| self.failpoint("flush:after_manifest"));
+        if let Err(e) = committed {
+            return Err(self.poison(e));
+        }
         for edit in edits {
             self.version.apply(edit).map_err(Error::Corruption)?;
         }
-        self.failpoint("flush:after_manifest")?;
 
         self.tables.insert(0, reader);
         self.memtable = MemTable::new();
@@ -240,13 +256,30 @@ impl Db {
     }
 
     fn write(&mut self, rec: Record) -> Result<()> {
-        self.wal.append(&rec)?;
-        self.wal.sync()?;
+        self.check_writable()?;
+        // A failed append or fsync may leave a partial record in the log, and
+        // later appends would land after it (mid-log corruption on reopen).
+        if let Err(e) = self.wal.append(&rec).and_then(|()| self.wal.sync()) {
+            return Err(self.poison(e));
+        }
         apply(&mut self.memtable, rec);
         if self.memtable.approx_size() >= self.opts.memtable_size {
             self.flush()?;
         }
         Ok(())
+    }
+
+    fn check_writable(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(why) => Err(Error::Poisoned(why.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// Marks the database read-only and passes the original error through.
+    fn poison(&mut self, e: Error) -> Error {
+        self.poisoned = Some(e.to_string());
+        e
     }
 
     #[cfg(test)]
@@ -538,6 +571,116 @@ mod tests {
         match Db::open(dir.path()) {
             Err(Error::Corruption(msg)) => assert!(msg.contains("000002.sst"), "{msg}"),
             other => panic!("expected Corruption, got {:?}", other.err()),
+        }
+    }
+
+    const FLUSH_FAILPOINTS: [&str; 4] = [
+        "flush:after_table",
+        "flush:after_new_log",
+        "flush:manifest",
+        "flush:after_manifest",
+    ];
+
+    /// Writes key(0), key(1), ... until a put fails (the flush hit the
+    /// failpoint). Returns how many keys were written; the failing key's own
+    /// WAL record is durable, so it counts too.
+    fn write_until_failpoint(db: &mut Db, fp: &'static str) -> usize {
+        db.fail_at = Some(fp);
+        for i in 0..100_000 {
+            if db.put(&key(i), &key(i)).is_err() {
+                return i + 1;
+            }
+        }
+        panic!("{fp} never triggered");
+    }
+
+    fn assert_keys(db: &Db, range: std::ops::Range<usize>, ctx: &str) {
+        for i in range {
+            assert_eq!(db.get(&key(i)).unwrap(), Some(key(i)), "{ctx}: key {i}");
+        }
+    }
+
+    /// No temp files, and every table on disk is live.
+    fn assert_no_orphans(dir: &Path, db: &Db, ctx: &str) {
+        let on_disk = files(dir);
+        assert!(!on_disk.contains(&DbFile::Temp), "{ctx}: {on_disk:?}");
+        let tables = on_disk
+            .iter()
+            .filter(|f| matches!(f, DbFile::Table(_)))
+            .count();
+        assert_eq!(tables, db.stats().tables, "{ctx}: {on_disk:?}");
+    }
+
+    #[test]
+    fn crash_at_every_flush_step_loses_nothing() {
+        for fp in FLUSH_FAILPOINTS {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open_with(dir.path(), small()).unwrap();
+            db.put(b"before", b"flush").unwrap();
+            db.flush().unwrap(); // so there's an older table and log in play
+            let n = write_until_failpoint(&mut db, fp);
+            drop(db); // the "crash": nothing after the failpoint runs
+
+            let mut db = Db::open_with(dir.path(), small()).unwrap();
+            assert_eq!(db.get(b"before").unwrap(), Some(b"flush".to_vec()), "{fp}");
+            assert_keys(&db, 0..n, fp);
+            assert_no_orphans(dir.path(), &db, fp);
+
+            // The recovered database must be fully writable, with no file
+            // number collisions, across more flushes and another reopen.
+            for i in n..n + 300 {
+                db.put(&key(i), &key(i)).unwrap();
+            }
+            db.flush().unwrap();
+            drop(db);
+            let db = Db::open_with(dir.path(), small()).unwrap();
+            assert_keys(&db, 0..n + 300, &format!("{fp}, after more writes"));
+            assert_no_orphans(dir.path(), &db, fp);
+        }
+    }
+
+    #[test]
+    fn failure_before_commit_is_retryable_without_reopen() {
+        for fp in ["flush:after_table", "flush:after_new_log"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open_with(dir.path(), small()).unwrap();
+            let n = write_until_failpoint(&mut db, fp);
+
+            db.fail_at = None;
+            db.flush().unwrap();
+            for i in n..n + 300 {
+                db.put(&key(i), &key(i)).unwrap();
+            }
+            assert_keys(&db, 0..n + 300, fp);
+            drop(db);
+
+            let db = Db::open_with(dir.path(), small()).unwrap();
+            assert_keys(&db, 0..n + 300, &format!("{fp}, reopened"));
+            assert_no_orphans(dir.path(), &db, fp);
+        }
+    }
+
+    #[test]
+    fn failure_at_commit_poisons_writes_but_not_reads() {
+        for fp in ["flush:manifest", "flush:after_manifest"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut db = Db::open_with(dir.path(), small()).unwrap();
+            let n = write_until_failpoint(&mut db, fp);
+            db.fail_at = None;
+
+            assert!(
+                matches!(db.put(b"x", b"y"), Err(Error::Poisoned(_))),
+                "{fp}"
+            );
+            assert!(matches!(db.delete(b"x"), Err(Error::Poisoned(_))), "{fp}");
+            assert!(matches!(db.flush(), Err(Error::Poisoned(_))), "{fp}");
+            assert_keys(&db, 0..n, &format!("{fp}, reads while poisoned"));
+            drop(db);
+
+            let mut db = Db::open_with(dir.path(), small()).unwrap();
+            assert_keys(&db, 0..n, &format!("{fp}, reopened"));
+            assert_eq!(db.get(b"x").unwrap(), None, "{fp}: refused write leaked");
+            db.put(b"x", b"y").unwrap();
         }
     }
 

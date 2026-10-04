@@ -6,7 +6,7 @@ use std::io::{self, BufRead, Write};
 fn main() -> lsmkv::Result<()> {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "./data".into());
     let mut db = lsmkv::Db::open(&dir)?;
-    println!("lsmkv @ {dir}  (put <k> <v> | get <k> | del <k> | quit)");
+    println!("lsmkv @ {dir}  (put <k> <v> | get <k> | del <k> | flush | stats | quit)");
 
     let stdin = io::stdin();
     loop {
@@ -29,6 +29,17 @@ fn main() -> lsmkv::Result<()> {
             ["del", k] => {
                 db.delete(k.as_bytes())?;
                 println!("OK");
+            }
+            ["flush"] => {
+                db.flush()?;
+                println!("OK");
+            }
+            ["stats"] => {
+                let s = db.stats();
+                println!(
+                    "memtable: {} entries, ~{} bytes | tables: {} | log: {:06}.log",
+                    s.memtable_entries, s.memtable_bytes, s.tables, s.log_number
+                );
             }
             ["quit"] | ["exit"] => break,
             [""] => {}

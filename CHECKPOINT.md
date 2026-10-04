@@ -9,8 +9,8 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M1** Memtable: `put` / `delete` / `get` with tombstones *(Claude; 7/7 tests pass; owner review pending)*
 - [x] **M2** WAL: `append` / `replay`, CRC32 per record, torn-tail handling *(Claude; 18/18 tests + manual kill -9 recovery check; owner review pending)*
 - [x] **M3** SSTable writer + reader: data blocks, index block, footer *(Claude; 43/43 tests incl. corruption + randomized; owner review pending)*
-- [ ] **M4** Flush memtable -> SSTable at size threshold; read path checks memtable then SSTables newest-first; manifest *(you)*
-- [ ] **Gate:** Tier 1 done -> make the GitHub repo public
+- [x] **M4** Flush memtable -> SSTable at size threshold; read path checks memtable then SSTables newest-first; manifest *(Claude; 59/59 tests incl. crash injection at every flush step; owner review pending)*
+- [ ] **Gate:** Tier 1 done -> make the GitHub repo public *(Tier 1 complete 2026-10-04; waiting for owner OK)*
 
 ### Tier 2: Strong (target)
 - [ ] **M5** Compaction (decide: leveled vs size-tiered), drop tombstones safely
@@ -32,12 +32,14 @@ MVCC, atomic batches, RESP server, compression, deterministic simulation testing
 **2026-10-04: Mode switched.** Claude now writes each milestone; owner studies and answers questions before the next one (see CLAUDE.md).
 M1 done: 7/7 memtable tests pass, clippy clean. Rust 1.99.0 installed (via TUNA mirror; Fastly route from the hotspot is slow).
 
-**2026-10-04: D2 + M3 done** (in 4 sections: D2 fail-loud, data blocks, writer/reader, hardening tests).
-43/43 tests pass, clippy clean. Mutation-checked: an off-by-one planted in the index search and a skipped footer CRC were both caught by the tests.
+**2026-10-04: M4 done. Tier 1 is complete.** Built in 3 sections: manifest, Db flush/recovery, crash tests + poisoning + REPL.
+59/59 tests, clippy clean. Mutation-checked: removing the poisoning and replaying only the newest log were both caught.
+Found and fixed while writing the crash tests: an fsync failure at the commit point could make later writes go to an obsolete WAL. The fix is poisoning (D7).
 
-**Next step:** M4 (flush memtable to SSTable, read path over multiple tables, manifest). It needs a design consult first:
-flush threshold, how the WAL is rotated after a flush, and how the manifest records live tables.
-Owner still has the M1 + M2 + M3 review questions pending (below).
+**Next step:**
+1. Owner decides on making the repo public (the Tier 1 gate).
+2. Owner works through the review questions (M1-M4, below).
+3. M5 compaction needs a design consult: leveled vs size-tiered, when to trigger, and when tombstones can be dropped.
 
 ## M1 review questions (owner answers)
 1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?
@@ -56,6 +58,13 @@ Owner still has the M1 + M2 + M3 review questions pending (below).
 3. Why does the footer need its own CRC when the index and blocks already have one?
 4. Why are tombstones written into SSTables at all? When can one finally be dropped? (Preview of M5 compaction.)
 5. `get` takes `&self` and uses `read_exact_at` instead of seek + read. Why does that matter for concurrency?
+
+## M4 review questions (owner answers)
+1. Walk through the 4 flush steps. For a crash right after each step, what's on disk, and what does recovery do?
+2. Why can there be TWO live WALs after a crash, and why must recovery replay both, oldest first?
+3. Why does `get` stop at the first tombstone instead of continuing to older tables?
+4. What is fsyncgate, and why does a failed manifest fsync *poison* the database instead of just returning an error?
+5. Why do logs and tables share one file-number counter?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed

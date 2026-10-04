@@ -23,6 +23,7 @@ get ─────────> MemTable ──miss──> SSTables newest-firs
   A crash can only tear the *last* record, so data after a bad record means disk corruption, not a crash. This mirrors RocksDB's default `kTolerateCorruptedTailRecords`.
 - **Zero-filled tails are tolerated:** some filesystems extend a file with zeros on a crash, which would otherwise look like corruption.
 - **Known limit:** a corrupted *length* field that points past EOF looks like a torn tail, so it's tolerated silently. Fixing that needs a header checksum or LevelDB-style fixed-size blocks (Tier 3).
+- **In-process write failures:** these are handled by poisoning (D7), so a partial record is never followed by more appends.
 - **Revisit at M7:** with group commit, several unsynced records can be torn at once. The tail rule still holds, because they're all at the end.
 
 ### D3: Memtable structure
@@ -46,4 +47,24 @@ get ─────────> MemTable ──miss──> SSTables newest-firs
 - **Deferred (Tier 3):** prefix compression and restart points within blocks, plus block compression.
 - **Platform:** reads use `FileExt::read_exact_at` (pread), so `get(&self)` needs no `&mut` or seek state, which matters for concurrent reads in M8. It's Unix-only.
 
-<!-- Add D6+ as milestones land: SSTable layout, flush threshold, compaction strategy, fsync policy... -->
+### D6: Flush, manifest and recovery (approved 2026-10-04)
+- **Flush threshold:** `Options::memtable_size`, default 4 MiB (same as LevelDB). Flushing is synchronous: the `put` that crosses the threshold does the flush. Background flushing waits for M8.
+- **File numbers:** logs and tables share one counter (`000001.log`, `000002.sst`, ...), so higher always means newer. Both numbers a flush needs are reserved up front, so a failed flush never reuses a number an orphan file still holds.
+- **Manifest:** an append-only log of 13-byte checksummed edits: `AddTable`, `RemoveTable` (for M5) and `SetLogNumber`. Replaying it rebuilds the live set. Impossible histories (adding the same table twice, removing an unknown table, the log number going backwards) are corruption. It's never rewritten yet; it grows by about 26 B per flush, and compacting it is Tier 3.
+- **Flush order:**
+  1. Write the table (tmp + fsync + rename).
+  2. Create the new WAL and fsync the directory.
+  3. **Commit point:** one manifest write of `AddTable` + `SetLogNumber`.
+  4. Switch in-memory state and delete obsolete logs (best effort).
+  - A crash before step 3 leaves orphans, and the old WAL still holds the data. A crash after it leaves the table live, and the old WAL is ignored.
+- **Recovery:** replay the manifest, then delete obsolete logs (number < log number), unlisted tables and `*.tmp` files, then replay *all* live logs oldest-first. Two live logs exist after a crash between steps 2 and 3. Only the newest log gets its torn tail cut, because it's the only one appended to. Unrecognized files are never touched.
+- **Read path:** memtable, then tables newest to oldest. The first hit wins, and a tombstone means "not found".
+- **Verified by:** failpoints after each step plus a simulated crash, then reopen. Every write is present, there are no orphans, and the database keeps working. Two planted bugs (no poisoning, and replaying only the newest log) were caught.
+
+### D7: Poison on write failure (fsyncgate)
+- **What:** if a WAL append/fsync or the manifest commit fails, the database becomes read-only (`Error::Poisoned`). Reads still work. Reopening recovers from whatever actually reached the disk.
+- **Why:** after a failed fsync, you can't know what's on disk (PostgreSQL's 2018 "fsyncgate"). If the manifest commit actually landed, the current WAL is obsolete, and writing more to it would lose those writes on reopen. A failed WAL append can also leave a partial record, and later appends after it would look like mid-log corruption.
+- **Not poisoned:** failures before the commit point (writing the table, creating the log). State is still consistent, and a retry works; the orphans are cleaned up on the next open.
+- **Known gaps:** there's no `LOCK` file yet, so two processes could open the same directory. Tier 2 adds an `flock`.
+
+<!-- Add D8+ as milestones land: SSTable layout, flush threshold, compaction strategy, fsync policy... -->
