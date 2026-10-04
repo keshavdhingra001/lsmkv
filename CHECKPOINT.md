@@ -14,7 +14,7 @@ Single source of truth for "where are we". Update at the end of every session.
 
 ### Tier 2: Strong (target)
 - [x] **M5** Compaction: leveled, tombstones dropped safely *(Claude; 71/71 tests incl. compaction crash injection; owner review pending)*
-- [ ] **M6** Bloom filters per SSTable + LRU block cache
+- [x] **M6** Bloom filters per SSTable + LRU block cache *(Claude; 97/97 tests incl. measured filter/cache wins; owner review pending)*
 - [ ] **M7** Durability modes: per-write fsync / group commit / periodic; measure each
 - [ ] **M8** Concurrency: snapshot reads that never block the writer
 - [ ] **M9** Range scans: merging iterator across memtable + levels
@@ -25,38 +25,30 @@ Single source of truth for "where are we". Update at the end of every session.
 ### Tier 3: Stretch (pick 2–3 later)
 MVCC, atomic batches, RESP server, compression, deterministic simulation testing, Raft.
 
-## ▶ RESUME HERE (handover 2026-10-04)
+## ▶ RESUME HERE (handover 2026-10-04, after M6)
 
-**State:** Tier 1 (M0–M4) and M5 are done. 71/71 tests pass, clippy clean, everything pushed to `main`
+**State:** M0–M6 are done. 97/97 tests pass, clippy clean, everything pushed to `main`
 at https://github.com/keshavdhingra001/lsmkv (private; owner said keep it private "not yet").
 
-**Next action:** M6 (bloom filters + block cache). The proposal below has been presented to the owner,
-who has **not approved it yet**. Confirm it (or apply their changes) before writing code, then build it
-in sections with one commit each, like M3–M5.
-
-**M6 proposal (pending owner approval):**
-| Decision | Proposal | Reason |
-|---|---|---|
-| Filter granularity | One bloom filter per SSTable, stored in the reserved filter block (`filter_offset`/`filter_len` in the footer) | A missing-key lookup skips the table without reading a block; the big win is L0, where every table is checked |
-| Bits per key | 10 bits/key, k = 7 | About 1% false positives (LevelDB default). Put the math in DESIGN.md |
-| Hash | Our own fixed 64-bit hash (FNV-1a or a murmur variant), NOT `std` `DefaultHasher` | Filters are persisted; `DefaultHasher` may change between Rust versions and silently break every saved filter |
-| k probes | Double hashing (Kirsch–Mitzenmacher) from one 64-bit hash | One hash per lookup, same false-positive rate |
-| Block cache | One LRU shared by all tables, 8 MiB default (`Options`), key = (table id, block offset), stores CRC-verified blocks; needs interior mutability (`Mutex`), since `get` takes `&self` | Hot reads skip the pread and the CRC; report hits/misses in `Stats` |
-| Proof | Count block reads for missing-key lookups with and without filters; measure the false-positive rate vs the ~1% theory | Turns "added bloom filters" into a measured resume claim |
-
-Format note: tables written before M6 have `filter_len = 0`. Readers must treat that as "no filter, always maybe" so M5-era data dirs keep working.
+**Next action:** M7 (durability modes). It needs a design consult before any code. Propose these as a table with a recommendation, then wait for "go":
+- **Modes:** per-write fsync (today's behaviour), group commit (concurrent writers share one fsync), periodic (fsync every N ms, so acked writes can be lost on a power cut).
+- **API:** a `sync: bool` per write (LevelDB `WriteOptions::sync`) vs a database-wide `Options::durability`.
+- **Group commit:** this needs concurrent writers, which only arrive in M8 (`Db` takes `&mut self` for writes today). Either do M8's writer queue first, or build the leader/follower queue in M7 behind a `Mutex`.
+- **Measurement:** ops/sec and p50/p99 per mode, plus a crash test that checks exactly which acked writes each mode can lose.
+- **D2 note:** with group commit, several unsynced records can be torn at once. They're all at the log's tail, so the torn-tail rule still holds.
 
 **Working agreement (see CLAUDE.md):** Claude writes each milestone in sections, tests it (including
 mutation checks that the tests can fail), commits `M<n>: ...` and pushes, explains it, and asks review questions.
-Consult the owner on design decisions before coding, and record them in DESIGN.md as D9+.
+Consult the owner on design decisions before coding, and record them in DESIGN.md as D11+.
 
 **Environment gotchas:**
 - Pushing over SSH from Claude's shell: `SSH_AUTH_SOCK=$(ls ~/.ssh/agent/s.* | head -1) git push`.
   If that fails, the owner must run `ssh-add ~/.ssh/id_ed25519` (the key has a passphrase).
 - Rust 1.99.0 is installed. If rustup is slow (the hotspot's route to the Fastly CDN), prefix the command with
   `RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup`. crates.io downloads work fine.
+- Mutation checks: a mutation can turn a test into an infinite loop. Run them under `timeout 60 cargo test`.
 
-**Code map:** `src/wal.rs` (log), `src/memtable.rs`, `src/sstable/{block,writer,reader,mod}.rs`,
+**Code map:** `src/wal.rs` (log), `src/memtable.rs`, `src/sstable/{block,writer,reader,filter,cache,mod}.rs`,
 `src/manifest.rs`, `src/db.rs` (open/recovery/flush/read path/poisoning + most tests),
 `src/db/compaction.rs`, `src/codec.rs`, `src/fsutil.rs`, `src/test_util.rs` (Rng), `src/main.rs` (REPL).
 
@@ -71,9 +63,13 @@ M1 done: 7/7 memtable tests pass, clippy clean. Rust 1.99.0 installed (via TUNA 
 71/71 tests, clippy clean. Mutation-checked: always dropping tombstones, compacting only the newest L0 table, the oldest version winning the merge, and deleting inputs before the commit were all caught.
 The owner chose to keep the repo private for now (2026-10-04).
 
+**2026-10-04: M6 done.** The owner approved the proposal as-is ("go"). Built in 3 sections: the filter (`filter.rs`), filters written into and checked by tables, and the shared LRU block cache (`cache.rs`).
+97/97 tests, clippy clean. Measured: filters cut block reads for missing keys from 31,936 to 279 (114x) at a 0.87% false-positive rate; a 256 KiB cache served 91% of skewed reads. Mutation-checked: 15 planted bugs, all caught (see D9, D10).
+The owner went ahead without answering the M1–M5 review questions (CLAUDE.md says to answer them before the next milestone).
+
 **Next step:**
-1. Owner works through the review questions (M1-M5, below).
-2. M6 (bloom filters + block cache) needs a design consult: bits per key, filter granularity (per table vs per block), cache size and eviction.
+1. Owner works through the review questions (M1–M6, below).
+2. M7 (durability modes) needs a design consult; see RESUME HERE.
 
 ## M1 review questions (owner answers)
 1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?
@@ -107,6 +103,15 @@ The owner chose to keep the repo private for now (2026-10-04).
 4. What is a trivial move, and why is it safe?
 5. Compaction deletes its input files only after the manifest commit. What happens on reopen if it deleted them first and then crashed?
 6. Write amplification: what does `stats` report after a big write workload, and where do the extra bytes come from?
+
+## M6 review questions (owner answers)
+1. Why is the filter checked *before* the index, and why can't it ever cause a wrong answer? What's the only cost of a false positive?
+2. Derive the 0.82% false-positive rate for 10 bits/key and k = 7. What happens to the rate with k = 1, and with k = 20?
+3. Why would using `std`'s `DefaultHasher` for the filter be a data-loss bug, not just a performance bug?
+4. Why must tombstones go into the filter? Walk through a `get` that returns a deleted value if they don't.
+5. Why is the cache key `(table id, offset)` and not just `offset`, and why does it matter that file numbers are never reused?
+6. Why does `get` on the cache need a `Mutex` even though it only "reads"? Why does the cache hand out `Arc<[u8]>` instead of `&[u8]`?
+7. Why do compaction reads skip the cache? What would happen to the hit rate if they didn't?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed
