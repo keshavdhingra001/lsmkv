@@ -25,7 +25,7 @@ Single source of truth for "where are we". Update at the end of every session.
 ### Tier 3: Stretch (owner approved M13–M15 on 2026-10-05)
 - [x] **M13** Atomic write batches + optimistic transactions (snapshot isolation, `get_for_update`) *(Claude; 15 mutants, all caught)*
 - [x] **M14** Redis-protocol (RESP) server: `redis-cli` talks to lsmkv *(Claude; `lsmkv-server`, 11 mutants all caught)*
-- [ ] **M15** Deterministic simulation + power-loss testing (simulated disk behind an `Fs` trait)
+- [x] **M15** Deterministic simulation + power-loss testing (simulated disk behind an `Fs` trait) *(Claude; found and fixed a real torn-manifest-commit bug; format 4)*
 Not planned: compression, column families, Raft.
 
 ## ▶ RESUME HERE (handover 2026-10-05, after M12: Tier 2 complete)
@@ -214,6 +214,16 @@ Mistakes on the way: a non-terminating `shuffled` helper hung a benchmark for 44
 6. Why is a recursive glob matcher a denial-of-service risk, and how does the iterative one avoid it?
 7. Why does the server bind to 127.0.0.1 by default? What's missing before it could face a network?
 8. `MGET` here reads all keys at one snapshot. Does Redis promise that? Why is it free in lsmkv?
+
+## M15 review questions (owner answers)
+1. What can a power cut lose that a `kill -9` can't? Name three things a power cut can do to files.
+2. What does `SimFs` keep after a power cut, file by file and name by name? Why is "a random prefix of the unsynced bytes" a good model of a torn write?
+3. Walk through the bug seed 44 found: what was written, what survived the power cut, what did replay do with it, and why did 300 kill -9 rounds never hit it?
+4. How does the `Group(n)` header make a manifest commit atomic? Why didn't per-record CRCs already do that?
+5. Why must every file creation be followed by a directory fsync? What happens to an fsynced file whose directory wasn't?
+6. What makes a simulation run deterministic, and how is that checked? What's still not deterministic about the real engine?
+7. Why did flushing right after each memtable switch hide two planted bugs? What does that teach about test schedules?
+8. What's the `Periodic`-mode guarantee the simulation checks ("a prefix, never a hole"), and why does a log-structured design give it naturally?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed

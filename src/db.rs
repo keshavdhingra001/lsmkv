@@ -632,6 +632,11 @@ impl Db {
             if !st.writing && st.current.imm.is_none() {
                 break;
             }
+            if st.opts.inline_background && !st.writing {
+                // No background thread will flush it: do it here.
+                st = self.run_inline(st);
+                continue;
+            }
             st = self.wait(st);
         }
         if !st.current.mem.is_empty() {
@@ -802,7 +807,27 @@ impl Db {
                 break Err(e);
             }
             let l0 = st.current.levels[0].len();
-            if !slowed && l0 >= st.opts.l0_slowdown_trigger {
+            // Inline mode does the background thread's work only where a
+            // writer would otherwise wait for it, so between switches the
+            // immutable memtable and its WAL stay unflushed for a while, as
+            // with a slow background thread. (Flushing right after every
+            // switch hid two planted durability bugs from the simulation.)
+            if st.opts.inline_background
+                && (l0 >= st.opts.l0_slowdown_trigger
+                    || (st.current.mem.approx_size() >= st.opts.memtable_size
+                        && st.current.imm.is_some()))
+            {
+                st = self.run_inline(st);
+                if st.current.levels[0].len() >= st.opts.l0_slowdown_trigger
+                    || st.current.imm.is_some()
+                {
+                    // Nothing more to do (poisoned, or no progress possible).
+                    if let Err(e) = st.check_writable() {
+                        break Err(e);
+                    }
+                }
+            }
+            if !slowed && l0 >= st.opts.l0_slowdown_trigger && !st.opts.inline_background {
                 // A 1 ms delay on many writes, instead of one long stall
                 // later: hands the background thread time to compact.
                 slowed = true;
@@ -815,22 +840,25 @@ impl Db {
             if st.current.mem.approx_size() < st.opts.memtable_size {
                 break Ok(());
             }
-            if st.opts.inline_background && (st.current.imm.is_some() || st.compaction_wanted()) {
-                // No background thread: do its work here, now.
-                st = self.run_inline(st);
-                continue;
-            }
             if st.current.imm.is_some() || l0 >= st.opts.l0_stop_trigger {
-                // The previous memtable is still being flushed, or level 0
-                // is too deep to add to: wait for the background thread.
-                stalled_since.get_or_insert_with(Instant::now);
-                st = self.wait(st);
-                continue;
+                if st.opts.inline_background {
+                    // Never wait for a thread that doesn't exist. The work
+                    // above flushed the immutable memtable unless the
+                    // database is poisoned (the loop's first check returns
+                    // that); if level 0 still can't shrink, go ahead.
+                    st = self.run_inline(st);
+                    if st.current.imm.is_some() {
+                        continue;
+                    }
+                } else {
+                    // The previous memtable is still being flushed, or level 0
+                    // is too deep to add to: wait for the background thread.
+                    stalled_since.get_or_insert_with(Instant::now);
+                    st = self.wait(st);
+                    continue;
+                }
             }
             let switched = st.switch_memtable();
-            if st.opts.inline_background && switched.is_ok() {
-                st = self.run_inline(st);
-            }
             self.shared.bg_work.notify_one();
             break switched;
         };
@@ -1330,10 +1358,10 @@ fn remove_obsolete_files(fs: &dyn Fs, dir: &Path, version: &Version) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, OpenOptions};
     use crate::sstable::SstWriter;
     use crate::test_util::Rng;
     use std::collections::{BTreeMap, HashSet};
+    use std::fs::{self, OpenOptions};
     use std::ops::Bound;
 
     fn small() -> Options {

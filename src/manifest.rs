@@ -7,9 +7,19 @@
 //! tag 2        = RemoveTable(id)
 //! tag 3        = SetLogNumber(n)
 //! tag 5        = SetLastSequence(n)
+//! tag 6        = Group(n): the next n records are one commit (format 4)
 //! ```
 //!
 //! Putting the level in the tag keeps records fixed-size.
+//!
+//! A commit of several edits (a flush: add the table, retire the WAL, record
+//! the last sequence; a compaction: remove the inputs, add the outputs) is
+//! written as a `Group(n)` header and then its n edits, in one write, and
+//! replay applies a group whole or not at all (DESIGN.md D28). Each record has
+//! its own CRC, so without the header a power cut that tears the write would
+//! leave a valid-looking prefix of the commit: a compaction with its inputs
+//! removed and its outputs never added. The simulation test found exactly
+//! that; a `kill -9` can't tear a write, so nothing else could.
 //!
 //! - `Format(v)`: the on-disk format of the whole database: manifest, WALs
 //!   and tables. Format 2 (M8) added sequence numbers to WAL records and table
@@ -45,11 +55,15 @@ const TAG_REMOVE_TABLE: u8 = 2;
 const TAG_SET_LOG_NUMBER: u8 = 3;
 const TAG_FORMAT: u8 = 4;
 const TAG_SET_LAST_SEQUENCE: u8 = 5;
+const TAG_GROUP: u8 = 6;
+/// More edits than any commit makes; a bigger group count is corruption.
+const MAX_GROUP: u64 = 1 << 16;
 const TAG_ADD_TABLE_BASE: u8 = 0x10;
 
 /// The on-disk format this build writes. It also reads (and upgrades)
-/// everything from `OLDEST_FORMAT` on.
-pub const FORMAT_VERSION: u64 = 3;
+/// everything from `OLDEST_FORMAT` on. 3 added WAL batches (M13); 4 added
+/// manifest groups (M15).
+pub const FORMAT_VERSION: u64 = 4;
 pub const OLDEST_FORMAT: u64 = 2;
 
 /// Levels 0..MAX_LEVELS. Level MAX_LEVELS - 1 is the bottom.
@@ -188,15 +202,14 @@ impl Manifest {
     /// file is cut back to its previous length, so a half-written edit can't
     /// end up in the middle of the log.
     pub fn append(&mut self, edits: &[Edit]) -> Result<()> {
-        let mut buf = Vec::with_capacity(edits.len() * RECORD_LEN);
+        let mut buf = Vec::with_capacity((edits.len() + 1) * RECORD_LEN);
+        if edits.len() > 1 {
+            encode_raw(TAG_GROUP, edits.len() as u64, &mut buf);
+        }
         for edit in edits {
             encode(*edit, &mut buf);
         }
-        match self
-            .file
-            .write_all(&buf)
-            .and_then(|()| self.file.sync())
-        {
+        match self.file.write_all(&buf).and_then(|()| self.file.sync()) {
             Ok(()) => {
                 self.len += buf.len() as u64;
                 Ok(())
@@ -217,6 +230,10 @@ fn encode(edit: Edit, out: &mut Vec<u8>) {
         Edit::SetLastSequence(n) => (TAG_SET_LAST_SEQUENCE, n),
         Edit::Format(v) => (TAG_FORMAT, v),
     };
+    encode_raw(tag, value, out);
+}
+
+fn encode_raw(tag: u8, value: u64, out: &mut Vec<u8>) {
     let mut body = [0u8; RECORD_LEN - 4];
     body[0] = tag;
     body[1..].copy_from_slice(&value.to_le_bytes());
@@ -225,6 +242,22 @@ fn encode(edit: Edit, out: &mut Vec<u8>) {
 }
 
 /// `None` = bad checksum or unknown tag.
+/// One record: an edit, or a group header.
+enum Rec {
+    Edit(Edit),
+    Group(u64),
+}
+
+fn decode_rec(rec: &[u8]) -> Option<Rec> {
+    if crc32fast::hash(&rec[4..RECORD_LEN]) != read_u32(rec, 0) {
+        return None;
+    }
+    if rec[4] == TAG_GROUP {
+        return Some(Rec::Group(read_u64(rec, 5)));
+    }
+    decode(rec).map(Rec::Edit)
+}
+
 fn decode(rec: &[u8]) -> Option<Edit> {
     if crc32fast::hash(&rec[4..RECORD_LEN]) != read_u32(rec, 0) {
         return None;
@@ -251,30 +284,64 @@ fn replay(buf: &[u8]) -> Result<(Version, u64)> {
     let mut pos = 0;
     while buf.len() - pos >= RECORD_LEN {
         let rest = &buf[pos..];
-        match decode(&rest[..RECORD_LEN]) {
-            Some(edit) => {
-                if pos == 0 && !matches!(edit, Edit::Format(_)) {
-                    return Err(Error::Corruption(
-                        "manifest has no format record: written by lsmkv before M8 \
-                         (format 1), which this build can't read"
-                            .into(),
-                    ));
+        // The edits of the next commit, and how many bytes it takes; or the
+        // offset (within `rest`) of a bad record.
+        let parsed: std::result::Result<(Vec<Edit>, usize), usize> =
+            match decode_rec(&rest[..RECORD_LEN]) {
+                Some(Rec::Edit(edit)) => Ok((vec![edit], RECORD_LEN)),
+                Some(Rec::Group(n)) if (2..=MAX_GROUP).contains(&n) => {
+                    let len = (n as usize + 1) * RECORD_LEN;
+                    if rest.len() < len {
+                        // The commit was cut off: a torn tail.
+                        break;
+                    }
+                    let mut edits = Vec::with_capacity(n as usize);
+                    let mut bad = None;
+                    for i in 1..=n as usize {
+                        match decode_rec(&rest[i * RECORD_LEN..(i + 1) * RECORD_LEN]) {
+                            Some(Rec::Edit(edit)) => edits.push(edit),
+                            _ => {
+                                bad = Some(i * RECORD_LEN);
+                                break;
+                            }
+                        }
+                    }
+                    match bad {
+                        None => Ok((edits, len)),
+                        Some(at) => Err(at),
+                    }
                 }
-                version
-                    .apply(edit)
-                    .map_err(|msg| Error::Corruption(format!("manifest offset {pos}: {msg}")))?;
-                pos += RECORD_LEN;
-            }
-            None => {
-                let after = rest.len() - RECORD_LEN;
-                if after == 0 || rest.iter().all(|&b| b == 0) {
+                _ => Err(0),
+            };
+        let (edits, len) = match parsed {
+            Ok(commit) => commit,
+            Err(at) => {
+                // A bad record is a torn tail if it's the last one, or if
+                // everything from it on is zeros. Anything else is corruption.
+                let from_bad = &rest[at..];
+                if from_bad.len() <= RECORD_LEN || from_bad.iter().all(|&b| b == 0) {
                     break;
                 }
                 return Err(Error::Corruption(format!(
-                    "manifest record at offset {pos} is invalid but {after} bytes follow it"
+                    "manifest record at offset {} is invalid but {} bytes follow it",
+                    pos + at,
+                    from_bad.len() - RECORD_LEN
                 )));
             }
+        };
+        if pos == 0 && !matches!(edits.as_slice(), [Edit::Format(_)]) {
+            return Err(Error::Corruption(
+                "manifest has no format record: written by lsmkv before M8 \
+                 (format 1), which this build can't read"
+                    .into(),
+            ));
         }
+        for edit in edits {
+            version
+                .apply(edit)
+                .map_err(|msg| Error::Corruption(format!("manifest offset {pos}: {msg}")))?;
+        }
+        pos += len;
     }
     Ok((version, pos as u64))
 }
@@ -358,9 +425,10 @@ mod tests {
         let path = dir.path().join(MANIFEST_FILE);
         {
             let (mut m, _) = Manifest::open(dir.path()).unwrap();
-            m.append(&[add(1), add(2)]).unwrap();
+            m.append(&[add(1)]).unwrap();
+            m.append(&[add(2)]).unwrap();
         }
-        // Crash halfway through the second record.
+        // Crash halfway through the second commit.
         let len = fs::metadata(&path).unwrap().len();
         OpenOptions::new()
             .write(true)
@@ -382,14 +450,28 @@ mod tests {
         let path = dir.path().join(MANIFEST_FILE);
         {
             let (mut m, _) = Manifest::open(dir.path()).unwrap();
-            m.append(&[add(1), add(2)]).unwrap();
+            m.append(&[add(1)]).unwrap();
+            m.append(&[add(2)]).unwrap();
         }
         let good = fs::read(&path).unwrap();
 
+        // Two separate commits: a bad last record loses only the second.
         let mut bad_last = good.clone();
         *bad_last.last_mut().unwrap() ^= 0xFF;
         fs::write(&path, &bad_last).unwrap();
         assert_eq!(ids(&reopen(dir.path())), vec![1]);
+
+        // One commit of both: a bad last record loses all of it.
+        fs::write(&path, &good[..RECORD_LEN]).unwrap(); // just the format record
+        {
+            let (mut m, _) = Manifest::open(dir.path()).unwrap();
+            m.append(&[add(1), add(2)]).unwrap();
+        }
+        let mut one_commit = fs::read(&path).unwrap();
+        *one_commit.last_mut().unwrap() ^= 0xFF;
+        fs::write(&path, &one_commit).unwrap();
+        assert_eq!(ids(&reopen(dir.path())), Vec::<u64>::new());
+        fs::write(&path, &good).unwrap();
 
         let mut zero_tail = good.clone();
         zero_tail.extend([0u8; 40]);
@@ -452,7 +534,10 @@ mod tests {
         assert_eq!((v.format, v.tables.len()), (FORMAT_VERSION, 1));
         let bytes = fs::read(&path).unwrap();
         assert_eq!(&bytes[..old.len()], &old[..], "history kept");
-        assert_eq!(decode(&bytes[old.len()..]), Some(Edit::Format(3)));
+        assert_eq!(
+            decode(&bytes[old.len()..]),
+            Some(Edit::Format(FORMAT_VERSION))
+        );
         // Reopening doesn't upgrade again.
         Manifest::open(dir.path()).unwrap();
         assert_eq!(fs::read(&path).unwrap().len(), bytes.len());
@@ -513,6 +598,55 @@ mod tests {
         match Manifest::open(dir.path()) {
             Err(Error::Corruption(msg)) => assert!(msg.contains("before M8"), "{msg}"),
             other => panic!("expected Corruption, got {:?}", other.map(|(_, v)| v)),
+        }
+    }
+
+    /// A power cut can tear a commit anywhere, and then the disk keeps a
+    /// prefix of it. Replay must apply a multi-edit commit whole or not at
+    /// all: a compaction commit cut after its RemoveTable edits but before
+    /// its AddTable edits would drop data. (Found by the simulation test,
+    /// D28: a kill -9 can't tear a write, so nothing else could.)
+    #[test]
+    fn a_commit_torn_anywhere_applies_whole_or_not_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MANIFEST_FILE);
+        let before = {
+            let (mut m, _) = Manifest::open(dir.path()).unwrap();
+            m.append(&[add(1), add(2), Edit::SetLogNumber(3)]).unwrap();
+            drop(m);
+            let (_, v) = Manifest::open(dir.path()).unwrap();
+            v
+        };
+        let start = fs::read(&path).unwrap().len();
+        // A compaction's commit: inputs out, outputs in.
+        let commit = [
+            Edit::RemoveTable(1),
+            Edit::RemoveTable(2),
+            add(4),
+            add(5),
+            Edit::SetLastSequence(9),
+        ];
+        let (mut m, _) = Manifest::open(dir.path()).unwrap();
+        m.append(&commit).unwrap();
+        drop(m);
+        let full = fs::read(&path).unwrap();
+        let after = {
+            let mut v = before.clone();
+            for e in commit {
+                v.apply(e).unwrap();
+            }
+            v
+        };
+        for cut in start..=full.len() {
+            fs::write(&path, &full[..cut]).unwrap();
+            let v = reopen(dir.path());
+            assert!(
+                v == before || v == after,
+                "cut at {cut} applied part of a commit: {v:?}"
+            );
+            if cut == full.len() {
+                assert_eq!(v, after);
+            }
         }
     }
 }

@@ -48,6 +48,7 @@ Later milestones changed some early decisions; those entries say so, and point a
 | D25 | Atomic write batches: one WAL record each; format 3 | M13 |
 | D26 | Optimistic transactions: snapshot isolation, first committer wins | M13 |
 | D27 | Redis-protocol server: RESP2, thread per connection | M14 |
+| D28 | Deterministic simulation: `Fs` trait, simulated disk, power cuts; atomic manifest commits (format 4) | M15 |
 
 ## Decisions
 
@@ -556,6 +557,47 @@ Tier 3, approved together with M14 and M15 in one "go".
 - **Durability:** the server opens the database in `Periodic(100ms)` by default (`--sync always` for fsync per write). A SIGKILL of the server loses nothing acknowledged, which was checked by hand: write, `kill -9`, restart, read.
 - **Verified by:** 7 socket-level integration tests (`tests/server.rs`), 4 protocol unit tests + 2 proptest fuzz properties, 2 glob tests. **Mutation checks: 11 planted bugs, all caught** (one only after the pipelining test was enlarged, see above).
 
+### D28: Deterministic simulation and power-loss testing (approved 2026-10-05)
+- **Why:** the `kill -9` harness (D22) can't test power loss. A killed process keeps everything it handed the kernel, so a missing fsync, a missing directory fsync or a torn write never shows. D22 argued power-loss safety from fsync ordering instead. This milestone tests it.
+- **All file I/O goes through an `Fs` trait** (`src/vfs.rs`), like RocksDB's `FileSystem` and LevelDB's `Env`: `RealFs` in production, and `SimFs`, an in-memory disk, in tests. `Options::fs` picks one. The WAL, manifest, table writer and reader, recovery and file cleanup all take it; `fsutil.rs` is gone.
+- **`SimFs`'s rules** (POSIX at its weakest):
+  - A file's contents are durable only up to its last successful `sync`.
+  - A create, rename or remove is durable only after a `sync_dir` of its directory.
+  - **A power cut** keeps each file's synced bytes plus a random prefix (half the time, none) of its unsynced tail, so writes tear anywhere, and different files independently, so writeback order varies. Names roll back to the last directory sync.
+  - **A failed `sync`** returns EIO and drops the unsynced data (Linux's behavior, "fsyncgate", D7).
+  - Faults are armed by count: "the machine dies at the Nth disk operation from now" (that and every later operation fails, reads included), or "the Nth sync fails".
+- **Determinism:** `Options::inline_background` starts no threads, and the WAL is synced by `Db::sync_wal` (new, public; RocksDB's `SyncWAL`). Flushes and compactions run on the writing thread, but **lazily**: only where a writer would otherwise wait for the background thread (the memtable is full and the previous one isn't flushed yet, or level 0 has reached the slowdown trigger), and in `flush`/`compact_all`. That models a slow background thread: acknowledged writes pile up in a new WAL while the old one still waits to be flushed.
+  - **The first version flushed right after every memtable switch, and that hid two planted bugs.** A missing directory fsync for a new WAL was masked because the immediate flush's own directory fsync always came first. A missing fsync of the old WAL at a switch (D14) was masked because its data went straight into a synced table. With the real thread, both are real windows. Making inline mode lazy exposed both. With one caller thread and a seeded disk, a seed replays exactly. `a_seed_replays_exactly` runs seeds twice and compares a hash of every disk operation and its arguments. One fix was needed first: compaction built its manifest edits from a `HashSet`, whose order changes per process, so it's a `BTreeSet` now.
+  - **Not deterministic:** the real threaded mode. The simulation tests the durability logic, not thread interleavings (those have the staged tests, D17–D21, and the concurrent tests).
+- **The test** (`tests/sim.rs`): per seed, 6 epochs on one disk. Each epoch opens the database, arms a fault (70% power cut at a random operation, 20% failed fsync, 10% none), runs random puts, deletes, batches, transactions, flushes, compactions, scans and WAL syncs until one fails, then cuts the power or exits. Each epoch is randomly `Always` or `Periodic`.
+- **The check, after every reopen:** the database holds the last state known to be durable **plus some prefix** of the operations after it, applied in order.
+  - In `Always` mode every acknowledged write is durable, so only the in-flight operation is uncertain.
+  - In `Periodic` mode, writes since the last `sync_wal` may be lost, **but only from the end**: never a hole in the middle, never half a batch.
+- **It found a real bug, which nothing else had: manifest commits weren't atomic.**
+  - A compaction commits by appending several manifest records (remove the inputs, add the outputs) in one write plus one fsync. Each record has its own CRC.
+  - Seed 44: the power died during that fsync, and the disk kept a torn prefix of the write. Replay saw valid-looking "remove input" records without their "add output" records, dropped the inputs, never added the outputs, deleted the outputs as orphans, and lost 37 keys (older values came back).
+  - A flush commit (add table + retire WAL + last sequence) had the same flaw.
+  - `kill -9` can't tear a write, so the 300-round crash soak, 5,000 fuzz cases and every unit test missed it.
+  - **Fix:** a commit of several edits is now a `Group(n)` header record followed by its n edits, in one write. Replay applies a group whole or not at all, and an incomplete group at the tail is a torn tail, cut off (`a_commit_torn_anywhere_applies_whole_or_not_at_all` cuts a commit at every byte; it failed before the fix). That's the same idea as WAL batches (D25).
+  - **Format 4.** A format-3 build refuses the directory (it accepts no later format record above 3) instead of misreading a group header as a torn tail.
+- **Verified by planting 10 durability bugs, each judged by the simulation and by the kill -9 harness:**
+
+  | planted bug | simulation | kill -9 harness |
+  |---|---|---|
+  | `Always` mode acks before the WAL fsync | caught | missed |
+  | a new WAL's name not made durable (no directory fsync) | caught | missed |
+  | memtable switch skips the old WAL's fsync (D14) | caught | missed |
+  | table not fsynced before its rename | caught | missed |
+  | table rename not made durable | caught | missed |
+  | manifest commit not fsynced | caught | missed |
+  | manifest commit without its group header | caught | missed |
+  | `sync_wal` doesn't sync | caught | missed |
+  | a fresh database's first WAL name not made durable | caught | missed |
+  | a torn WAL tail cut off without an fsync | equivalent | missed |
+
+  The equivalent one: the next WAL fsync makes the shorter length durable anyway (fdatasync covers the file size), and a power cut before then leaves the same torn tail, which recovery cuts again. **9 of 10 caught by the simulation, 0 of 10 by `kill -9`:** the two harnesses test different failures, and both are needed. The kill -9 harness covers the real binary, real threads and the real kernel.
+- **Rejected alternatives:** LazyFS (a FUSE filesystem that drops unsynced data) or dm-log-writes (records block writes to replay every crash point). Both test the real binary on a real kernel, which is more faithful, but they need root and setup, aren't deterministic or seedable, and can't run in `cargo test`. FoundationDB's full simulation also virtualizes the network, time and threads. This one virtualizes only the disk, since that's where this engine's correctness lives.
+- **Limits of the model:** a torn write keeps a prefix, never scattered sectors. Directory operations are durable only after a directory sync (real filesystems sometimes persist them earlier, which is the safer direction). No bit rot (the checksum tests cover that). One thread.
 ## Not done
 
 These were scoped as Tier 3 (stretch) and not built:
@@ -563,5 +605,5 @@ These were scoped as Tier 3 (stretch) and not built:
 - **Serializable transactions:** M13's transactions are snapshot isolation (D26); preventing write skew needs read-set validation.
 - **Compression and prefix-compressed blocks:** blocks store full keys and are searched linearly.
 - **Trivial moves out of level 0** (RocksDB's 1.00 write amplification on sequential keys, D24), and more than one background thread.
-- **Deterministic simulation testing** (a simulated disk and clock, to replay every interleaving and crash point from a seed), and power-loss testing with a fault-injecting filesystem (D22).
+- **Simulating threads and time,** not just the disk (D28 covers the disk only), and testing on a real fault-injecting filesystem (LazyFS).
 - **Replication (Raft).**
