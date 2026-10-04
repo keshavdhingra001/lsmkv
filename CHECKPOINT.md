@@ -33,7 +33,7 @@ at https://github.com/keshavdhingra001/lsmkv (private; owner said keep it privat
 **Progress:** 9 of 13 milestones (M0–M8). By effort, about 70%: M8 was the biggest; M9–M11 are medium, M12 is small.
 
 **Open with the owner (not blocking, but raise them):**
-- 52 review questions (M1–M8, below) are unanswered. CLAUDE.md says to answer them before the next milestone; the owner has said "go" each time anyway. Offer to quiz them, M8 and M7 first.
+- 52 review questions (M1–M8, below) are unanswered. CLAUDE.md says to answer them before the next milestone; the owner chose to build through to the end first. Offer the quiz at the end, after the demo (M8 and M7 first): they need to be able to defend this in interviews.
 - The repo stays private until the owner says otherwise.
 
 **Commands:**
@@ -44,13 +44,41 @@ at https://github.com/keshavdhingra001/lsmkv (private; owner said keep it privat
   - Before/after against an old commit: `git archive <commit> | tar -x -C target/old`, copy the example in, build with its own `CARGO_TARGET_DIR`. Both examples use only API that M7 had.
 - REPL: `cargo run -- ./data`. `stats` shows writes/groups/fsyncs, backpressure, snapshots, reads, cache and bloom counters; `snap` / `sget k` / `unsnap` try a snapshot.
 
-**Next action:** M9 (range scans). It needs a design consult before any code. Propose these as a table with a recommendation, then wait for "go":
+**Owner's plan for the next session (2026-10-04):** take the project from here to finished, M9 through M12, and end with a demo run. To keep it moving:
+1. **Open with ONE design consult covering M9–M12** (a table per milestone, each with a recommendation), and get a single "go". After that, build straight through, milestone by milestone. Stop again only if a measurement or bug contradicts an approved decision.
+2. Keep the usual rhythm per milestone: sections, tests, mutation checks (with the runner's cleanup and `touch` fixes), commit `M<n>: ...`, push, DESIGN.md entries (D19+), and review questions in this file.
+3. Finish with the demo (below), then ask the owner about making the repo public.
+
+**M9: range scans. Decisions to propose:**
 - **API:** `db.scan(range)` and `snapshot.scan(range)` returning an iterator of `(key, value)`. Forward only, or reverse too? Owned or borrowed results?
 - **Merging iterator:** a heap (k-way merge) over the memtable range, the immutable memtable, each L0 table, and one "level iterator" per deeper level (it walks that level's tables in order). Newest source wins per user key; hide versions above the snapshot, shadowed versions and tombstones.
-- **Streaming table iterator:** `SstReader::entries()` loads a whole table. Replace it with a block-at-a-time iterator (through the cache or not?), and decide whether compaction switches to the same streaming merge too: it currently builds a `BTreeMap` of all inputs, i.e. the whole bottom level in memory during `compact_all`.
-- **Lifetime:** the iterator holds an `Arc<SuperVersion>` (tables stay open, as for `get`) plus a snapshot number. Does an open iterator pin versions like a `Snapshot` (it must, or compaction could drop what it's about to read)?
+- **Streaming table iterator:** `SstReader::entries()` loads a whole table. Replace it with a block-at-a-time iterator (through the cache or not?). Decide whether compaction switches to the same streaming merge: it currently builds a `BTreeMap` of all inputs, i.e. the whole bottom level in memory during `compact_all`.
+- **Lifetime:** the iterator holds an `Arc<SuperVersion>` (tables stay open, as for `get`) plus a snapshot number. An open iterator must pin versions like a `Snapshot`, or compaction could drop what it's about to read.
 - **Skiplist range:** `crossbeam_skiplist::SkipMap::range` over internal keys.
-- **Proof:** a model-based randomized test (scans at random snapshots vs a `BTreeMap`), plus scan throughput.
+- **Proof:** a model-based randomized test (scans at random snapshots vs a `BTreeMap`), plus scan throughput. Add `scan` to the REPL.
+
+**M10: crash harness and fuzzing. Decisions to propose:**
+- **Crash loop:** extend `tests/kill9.rs` into many rounds. Random kill times, both sync modes, small memtables (flushes and compactions mid-flight), snapshots and deletes in the mix. After each crash, check that every acknowledged write is present with its latest acknowledged value (unacknowledged writes may or may not be there). Run time: a short version in `cargo test`, and a long one as `#[ignore]` (`cargo test -- --ignored`)?
+- **Model-based fuzz:** random op sequences (put/delete/get/scan/snapshot/flush/compact/reopen) against a model. Seeds with no new dependency, or `proptest` (shrinking)? `cargo-fuzz` needs nightly; skip or optional?
+- **Power loss** (LazyFS / dm-log-writes) stays out of scope unless cheap; say so in DESIGN.md.
+
+**M11: benchmarks vs RocksDB. Decisions to propose:**
+- **How:** the `rocksdb` crate (it builds librocksdb from C++: check for clang/libclang and cmake first, and expect a slow first build), or RocksDB's own `db_bench` if installable.
+- **Workloads,** in db_bench terms: `fillseq`, `fillrandom`, `readrandom`, `readwhilewriting`, and a range scan. Same settings on both sides: 4 MiB memtable, 10-bit bloom filters, no compression, matched WAL sync modes.
+- **Metrics:** ops/sec, p50/p99 latency, write amplification (ours from `Stats`, RocksDB's from its compaction statistics). Fold the existing `durability` and `concurrency` examples in, or keep them.
+- **Honesty:** report where RocksDB wins and why (compression off, its memtable/arena, its compaction tuning).
+
+**M12: documentation and the demo. Decisions to propose:**
+- **README:** what it is, architecture diagram, the design decisions in brief (pointing to DESIGN.md), results tables (M7 durability, M8 concurrency, M11 vs RocksDB), how to run the tests and benchmarks, and known limits.
+- **DESIGN.md:** a final pass (consistent structure, the Tier 3 list as "not done").
+- **Demo run:** a scripted, repeatable demo, e.g. `examples/demo.rs` or `demo.sh`:
+  1. Write a batch.
+  2. `kill -9` the writer mid-run, reopen, and show every acknowledged write recovered.
+  3. A snapshot read surviving overwrites and a compaction.
+  4. A range scan.
+  5. `stats` (levels, write amplification, bloom/cache hits).
+  6. A short benchmark.
+  Then run it live in the chat, and show the REPL by hand. Decide whether to record it (asciinema or a GIF) for the README.
 
 **Working agreement (see CLAUDE.md):** Claude writes each milestone in sections, tests it (including
 mutation checks that the tests can fail), commits `M<n>: ...` and pushes, explains it, and asks review questions.
