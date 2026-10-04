@@ -265,4 +265,4 @@ bench/                  lsmkv vs RocksDB (separate crate)
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).

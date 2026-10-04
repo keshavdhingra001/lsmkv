@@ -10,7 +10,7 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M2** WAL: `append` / `replay`, CRC32 per record, torn-tail handling *(Claude; 18/18 tests + manual kill -9 recovery check; owner review pending)*
 - [x] **M3** SSTable writer + reader: data blocks, index block, footer *(Claude; 43/43 tests incl. corruption + randomized; owner review pending)*
 - [x] **M4** Flush memtable -> SSTable at size threshold; read path checks memtable then SSTables newest-first; manifest *(Claude; 59/59 tests incl. crash injection at every flush step; owner review pending)*
-- [ ] **Gate:** Tier 1 done -> make the GitHub repo public *(Tier 1 complete 2026-10-04; owner said not yet)*
+- [x] **Gate:** make the GitHub repo public *(owner approved 2026-10-05, after Tier 2)*
 
 ### Tier 2: Strong (target)
 - [x] **M5** Compaction: leveled, tombstones dropped safely *(Claude; 71/71 tests incl. compaction crash injection; owner review pending)*
@@ -30,7 +30,7 @@ MVCC, atomic batches, RESP server, compression, deterministic simulation testing
 **State:** M0–M12 are done. All of Tier 2 is built, measured and documented. 145 unit tests + the kill -9 harness + the proptest model test + 2 doc tests pass, clippy clean, everything pushed to `main` at https://github.com/keshavdhingra001/lsmkv (still **private**).
 
 **Open with the owner:**
-1. **Make the repo public?** The Tier 1 gate said "not yet"; ask again now that Tier 2 is done. Don't do it without an explicit yes.
+1. **The repo is public** (owner approved 2026-10-05).
 2. **The review questions (M1–M11, 71 in all) are unanswered.** They need to be able to defend this in interviews. Suggested order: M8, M7, M9, M10, then the rest. Run them as a quiz, one at a time, and record the answers here.
 3. Tier 3 is optional. If wanted, the cheapest high-signal items: atomic write batches (sequence numbers already exist), level-0 trivial moves (fixes `fillseq` write amp 2.28 vs 1.00), a RESP server.
 
