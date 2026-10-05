@@ -28,20 +28,24 @@ Single source of truth for "where are we". Update at the end of every session.
 - [x] **M15** Deterministic simulation + power-loss testing (simulated disk behind an `Fs` trait) *(found and fixed a real torn-manifest-commit bug; format 4)*
 Not planned: compression, column families, Raft.
 
-## ▶ RESUME HERE (2026-10-05, after M15: Tier 3 done)
+### Tier 4: Hardening (owner asked for it on 2026-10-05, approved D29 and D30 the same day)
+- [x] **M16** Testing infrastructure: GitHub Actions CI, libFuzzer targets for every parser, the planted-bug runner in the repo, LazyFS power cuts, the real `redis-cli` *(D31; 27 planted bugs, all caught; 300 LazyFS power cuts, 138k acked writes, none lost)*
+- [x] **M17** Trivial moves out of level 0 *(D29; `fillseq` write amplification 2.28 → 1.17)*
+- [x] **M18** Restart points in data blocks, format 5 *(D30; in-block lookups 1.2x–9.3x faster; format-4 databases still open)*
 
-**State:** M0–M15 are done and pushed to `main`: https://github.com/keshavdhingra001/lsmkv (**public** since 2026-10-05).
-All three planned Tier 3 milestones are built: M13 batches + transactions, M14 Redis-protocol server, M15 deterministic simulation.
-184 tests pass (`cargo test`, about 25 s), clippy clean.
+## ▶ RESUME HERE (2026-10-05, after M18: Tier 4 done)
 
-**What the owner does next (the plan they stated): study the project in a new chat.**
-1. **The review-question quiz** is the priority: 95 questions, M1–M15, below. Ask them one at a time, have the owner answer in their own words, correct and explain, and record each answer and a short verdict under its question. Suggested order (what interviewers probe most): M2 (WAL), M4 (flush/recovery), M7 (group commit), M8 (concurrency/snapshots), M15 (power loss + the bug it found), M13 (transactions), then the rest.
-2. For each milestone, it helps to open the code alongside: the "Code map" below says where each piece lives, and DESIGN.md has a decision index (D1–D28).
+**State:** M0–M18 are done. M0–M15 are on `main`; M16–M18 are on branch `ccr-26eafa08-mvbvvg`, waiting for the owner to review and merge (a PR).
+196 tests pass (`cargo test`, about 70 s), clippy clean, CI green.
+
+**What the owner does next: study, then merge.**
+1. **The review-question quiz** is the priority: 117 questions, M1–M18, below. Ask them one at a time, have the owner answer in their own words, correct and explain, and record each answer and a short verdict under its question. Suggested order (what interviewers probe most): M2 (WAL), M4 (flush/recovery), M7 (group commit), M8 (concurrency/snapshots), M15 (power loss + the bugs it found), M13 (transactions), M16 (how it's tested), then the rest.
+2. For each milestone, it helps to open the code alongside: the "Code map" below says where each piece lives, and DESIGN.md has a decision index (D1–D31).
 3. The headline stories to be able to tell, start to finish:
-   - **The two bugs the simulation found** (D28): the torn manifest commit (seed 44, the `Group(n)` fix), and recovery serving un-fsynced WAL data (seed 14676, fsync on replay). Why `kill -9` can't find either.
-   - **Sim vs kill -9:** 9 of 10 planted durability bugs caught by the simulation, 0 of 10 by kill -9 (D28's table).
-   - **Compaction memory** 265 → 24 MiB (D20). **RocksDB comparison** and why the first run wasn't trusted (D24).
-4. Optional: install `valkey` (`sudo pacman -S valkey`) and try `valkey-cli -p 6380` against `cargo run --release --bin lsmkv-server`. The server was tested with a socket-level RESP client, not yet with the real `redis-cli`/`valkey-cli`, so do that once.
+   - **The three bugs the simulation found** (D28): the torn manifest commit (seed 44, the `Group(n)` fix), recovery serving un-fsynced WAL data (seed 14676, fsync on replay), and recovery acting on an un-fsynced manifest commit (seed 2793, fsync the manifest on open). Why `kill -9` can't find any of them.
+   - **Three ways to test crashes** (D22, D28, D31): `kill -9` (real binary, kernel keeps the data), `SimFs` (deterministic, models the disk), LazyFS (real kernel, drops unsynced data). What each can and can't catch.
+   - **The single-bit magic** (D30): "LSMKVSS3" vs "LSMKVSS2", and why the footer CRC now covers the magic.
+   - **Compaction memory** 265 → 24 MiB (D20). **RocksDB comparison**, why the first run wasn't trusted (D24), and `fillseq` 2.28 → 1.17 (D29).
 
 **Commands:**
 - Everything: `cargo fmt && cargo clippy --all-targets && cargo test`.
@@ -49,14 +53,18 @@ All three planned Tier 3 milestones are built: M13 batches + transactions, M14 R
 - Crash soak: `cargo test --release --test kill9 -- --ignored` (300 rounds; `LSMKV_CRASH_ROUNDS=10000` for more).
 - Simulation: `LSMKV_SIM_SEEDS=20000 cargo test --release --test sim`; replay one seed: `LSMKV_SIM_SEED=44 cargo test --test sim -- --nocapture`.
 - Fuzz: `PROPTEST_CASES=5000 cargo test --release --test model`.
-- Benchmarks: `examples/{durability,concurrency,scan,server_bench}.rs`; vs RocksDB: `cd bench && cargo run --release` (never `cargo clippy` in `bench/`: it recompiles RocksDB's C++, ~7 min).
+- Benchmarks: `examples/{durability,concurrency,scan,server_bench,block_search}.rs`; vs RocksDB: `cd bench && cargo run --release` (never `cargo clippy` in `bench/`: it recompiles RocksDB's C++, ~7 min).
+- Planted bugs: `python3 scripts/mutate.py` (all, ~30 min), `python3 scripts/mutate.py D30` (by name), `--control` (the same tests unmutated; must all pass). Logs in `target/mutants/`.
+- Power cuts on LazyFS: `scripts/lazyfs.sh 300` (needs `fuse3 libfuse3-dev cmake g++`).
+- Fuzzing: `cargo install cargo-fuzz`, then `cd fuzz && cargo +nightly fuzz run <target>` (`cargo fuzz list`).
 
 **Code map:** `src/wal.rs` (log, batch records), `src/key.rs` (sequence numbers, internal key order), `src/memtable.rs` (skiplist + `MemIter`),
-`src/sstable/{block,writer,reader,filter,cache,mod}.rs`, `src/manifest.rs` (edit log, `Group(n)` commits, format 4), `src/vfs.rs` (`Fs`, `RealFs`, `SimFs`),
+`src/sstable/{block,writer,reader,filter,cache,mod}.rs` (blocks with restart points), `src/manifest.rs` (edit log, `Group(n)` commits, format 5), `src/vfs.rs` (`Fs`, `RealFs`, `SimFs`),
 `src/db.rs` (`Db`, writer queue, `SuperVersion`, recovery, inline mode), `src/db/background.rs` (flush, `run_one`), `src/db/compaction.rs`,
 `src/db/iter.rs` (`MergeIter`, `DbIter`), `src/db/batch.rs` (`WriteBatch`, `Transaction`, conflict check), `src/db/snapshot.rs`,
 `src/resp.rs` + `src/server.rs` + `src/bin/lsmkv-server.rs` (Redis protocol), `src/main.rs` (REPL),
-`tests/{kill9,sim,model,server}.rs`, `examples/{demo,durability,concurrency,scan,server_bench}.rs`, `bench/` (vs RocksDB).
+`tests/{kill9,sim,model,server,compat}.rs` (+ `tests/fixtures/format4-db`), `examples/{demo,durability,concurrency,scan,server_bench,block_search}.rs`, `bench/` (vs RocksDB),
+`fuzz/` (libFuzzer), `scripts/{mutate.py,mutants.toml,lazyfs.sh}`, `.github/workflows/ci.yml`.
 
 ## Current status
 
@@ -106,10 +114,15 @@ A 20,000-seed release run found a second real bug (seed 14676): recovery replaye
 **Left running (detached):** a 20,000-seed simulation rerun on the final code (`target/sim20k-final.log`), and the 10,000-round kill -9 soak started in M13 (`target/soak10k.log`, built from M13-era code). Check both first thing. If they passed, update the README's long-run numbers (it currently cites the 300-round soak and "20,000-seed release runs"), and rerun the demo to refresh the README's demo output (it gained a transactions step). If either failed, replay it (`LSMKV_SIM_SEED=<n>`) before anything else.
 
 **2026-10-05: Cleanup pass (no behavior or format change).** Removed duplication: one WAL record writer (`Wal::write_record`) for plain and batch records, `Record::size`; one manifest record decoder (the CRC was checked twice per record); `SuperVersion::newest` behind both `get` and `newest_seq`; `Shared::read_view`, `Pending::writes`, `State::new_file_number`, `Table::open`, `bytes(level)`; `ENTRY_HEADER_LEN` instead of a literal 17; a shared `test_util::val`. `db.rs` tests moved to `src/db/tests.rs` (like `sstable/tests.rs`). 184 tests pass; simulation seeds 0–2792 pass (see below).
-Simulation sweep (`LSMKV_SIM_SEEDS=20000`, release) on this machine: **seed 2186** failed because a failed-fsync fault armed for an epoch that ended in a clean close stayed armed into the next reopen. That's a harness bug, fixed with `SimFs::disarm` on clean close. **Seed 2793 fails on the original code too, and looks like a real durability bug:** after a power cut during an inline flush/compaction in `Always` mode, durable keys come back missing or at an older version (`k077` lost, `k092` s196 -> s110). Not fixed: needs the owner (durability). Replay: `LSMKV_SIM_SEED=2793 cargo test --release --test sim -- --nocapture`. The README's "20,000 seeds pass" claim doesn't hold until this is resolved.
+Simulation sweep (`LSMKV_SIM_SEEDS=20000`, release) on this machine: **seed 2186** failed because a failed-fsync fault armed for an epoch that ended in a clean close stayed armed into the next reopen. That's a harness bug, fixed with `SimFs::disarm` on clean close. **Seed 2793 was a real durability bug:** a flush's manifest commit was only in the page cache when the process died; the next open replayed it, deleted the WAL it retired, and never fsynced the manifest, so a later power cut lost the commit *and* the WAL. Fixed: `Manifest::open` fsyncs what it replayed (D28, `a_replayed_commit_survives_a_later_power_cut`). All 20,000 seeds pass now.
 Commit history rewritten (owner approved 2026-10-05) to drop AI co-author trailers; new commits carry none.
 
-**Next step:** see RESUME HERE (the quiz in a new chat).
+**2026-10-05: M16–M18 (Tier 4) built while the owner studies.** The owner asked for the project to be finished and approved D29 and D30 up front.
+M16: CI on every push (short soaks) and nightly (long); five libFuzzer targets, ~10M runs each, no crashes; `scripts/mutate.py` with a 27-bug catalog, all caught, plus a control mode; LazyFS power cuts (300 rounds, 138k acked writes, none lost; ack-before-fsync caught in round 1); the real `redis-cli` in tests.
+M17: level-0 trivial moves (`fillseq` write amp 2.28 → 1.17). M18: restart points, format 5 (in-block lookups 1.2x on 4 KiB blocks of 100-byte values, 9.3x on 64 KiB blocks); format-4 databases still open (`tests/compat.rs`).
+Found along the way: CI's second run caught a flaky orphan check (a compaction finishing between listing files and counting tables); "LSMKVSS3" and "LSMKVSS2" differ in one bit, so the footer CRC now covers the magic; the first D29 tests used `compact_all`, which repaired bad moves before anything looked (all planted bugs survived them); the mutation runner's control mode showed `writes_and_reads_continue_while_a_flush_runs` was timing-sensitive under load (400 ms → 2 s margin); LazyFS's completion FIFO must stay open; GitHub archive downloads are blocked here, so LazyFS's `spdlog` is fetched with git.
+
+**Next step:** see RESUME HERE (the quiz in a new chat), then merge M16–M18.
 
 ## M1 review questions (owner answers)
 1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?
@@ -233,10 +246,38 @@ Commit history rewritten (owner approved 2026-10-05) to drop AI co-author traile
 6. What makes a simulation run deterministic, and how is that checked? What's still not deterministic about the real engine?
 7. Why did flushing right after each memtable switch hide two planted bugs? What does that teach about test schedules?
 8. What's the `Periodic`-mode guarantee the simulation checks ("a prefix, never a hole"), and why does a log-structured design give it naturally?
+9. Seed 2793: walk through how a manifest commit that was never fsynced ends up losing a WAL. Why must `Manifest::open` fsync even when it found no torn tail, and why couldn't a `kill -9` alone (no power cut) ever show this?
+
+## M16 review questions (owner answers)
+1. CI runs short soaks on every push and long ones nightly. Why not run the 20,000-seed simulation on every push? What does a nightly failure tell you that a push failure doesn't?
+2. A fuzz target that only feeds random bytes to `SstReader::open` rarely gets past the footer CRC. Why, and what does `sstable_roundtrip` check that `sstable_read` can't?
+3. The RESP fuzz target feeds the input one byte at a time and requires the same answer as the whole input. What bug does that property catch, and why does it matter for pipelining?
+4. What is mutation testing? Why does the runner build before it starts the timer, and why must a mutant that doesn't compile count as a failure of the catalog, not as "caught"?
+5. LazyFS caught "ack before fsync" in the first round; `kill -9` never can. Explain exactly what LazyFS drops on `clear-cache`, and why that's a power cut but `kill -9` isn't.
+6. Why does the LazyFS harness run only `Always` rounds? What property could you check for `Periodic` mode instead?
+7. The harness hung the first time because it read LazyFS's completion FIFO to end-of-file. Why does that never end, and why must the FIFO stay open between rounds?
+
+## M17 review questions (owner answers)
+1. Why does a level-0 compaction normally take every level-0 table? Under what three conditions can they all move down without being rewritten instead?
+2. Two level-0 tables are [a..m] and [m..z]. Why can't they both move to level 1, even though they only touch at "m"? What would a later `get("m")` do?
+3. Why must an empty table never move to level 1? Can a flush even produce one?
+4. A level-1 table [e..f] sits between level-0 tables [c] and [m]. It overlaps neither, so why is this still a merge?
+5. `fillseq` write amplification went from 2.28 to 1.17, not 1.00. Where do the remaining rewrites come from?
+6. The first version of the tests ran `compact_all` and every planted bug survived. Why? What's the general lesson about where a test looks?
+
+## M18 review questions (owner answers)
+1. Walk through `get("k0057")` in a block with restart points: what does the binary search compare, where does the scan start, and at most how many entries does it read?
+2. Why does `seek` start from restart `lo - 1` and not `lo`?
+3. The CRC already covers the restart trailer. Why also check that every restart is exactly the offset of entry 16k? What would a restart pointing mid-entry do?
+4. Why is that check done when a block is read from disk but not on a cache hit?
+5. "LSMKVSS3" and "LSMKVSS2" differ by one bit. Walk through what a single flipped bit did before the footer CRC covered the magic.
+6. How does a format-5 build read a format-4 table, and why does the database format go to 5 even though old tables stay readable?
+7. Restart points give 1.2x on 4 KiB blocks of 100-byte values but 9.3x on 64 KiB blocks. Why does the gain grow with block size?
+8. Why no prefix compression? What would it change about `RawEntry` and the iterators?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed
 - [x] GitHub repo https://github.com/keshavdhingra001/lsmkv
 - [x] Git email links to GitHub account keshavdhingra001
 - [x] D2: mid-log WAL corruption fails loud (owner approved 2026-10-04)
-- [ ] Simulation seed 2793: durable writes lost after a power cut mid-compaction (see 2026-10-05 cleanup entry)
+- [x] Simulation seed 2793: manifest not fsynced on recovery (fixed 2026-10-05)

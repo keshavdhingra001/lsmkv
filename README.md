@@ -5,13 +5,15 @@ with group commit, a lock-free skiplist memtable, checksummed SSTables with bloo
 leveled compaction on a background thread, snapshots, range scans, atomic batches, optimistic transactions,
 and a Redis-protocol server, so `redis-cli` talks to it.
 
-Its crash safety is tested two ways: real `kill -9`s of a running process (300 rounds, over a million acknowledged writes, none lost), and a
-**deterministic simulation** that runs the engine on a simulated disk and cuts the power at random points. The
-simulation found two real bugs the crash tests never could (a manifest commit torn by a power cut, and recovery serving unsynced data), and catches 9 of
-10 planted durability bugs that `kill -9` misses entirely. See [how it's tested](#how-its-tested).
+Its crash safety is tested three ways: real `kill -9`s of a running process (300 rounds, over a million acknowledged writes, none lost);
+**real power cuts** on [LazyFS](https://github.com/dsrhaslab/lazyfs), a filesystem that drops every unsynced byte on command (300 rounds,
+138k acknowledged writes, none lost); and a **deterministic simulation** that runs the engine on a simulated disk and cuts the power at
+random points. The simulation found three real bugs the crash tests never could (a manifest commit torn by a power cut, and recovery acting
+on unsynced WAL and manifest data). CI runs all of it, plus libFuzzer on every parser and the real `redis-cli`.
+See [how it's tested](#how-its-tested).
 
-About 9,800 lines of Rust (8,100 in `src/`, unit tests included). Three runtime dependencies: `crc32fast`, `crossbeam-skiplist` and `thiserror`.
-Every design decision, with the alternatives and the reasoning, is in [DESIGN.md](DESIGN.md) (D1–D28).
+About 11,000 lines of Rust, not counting blank lines and comments (9,000 in `src/`, unit tests included). Three runtime dependencies: `crc32fast`, `crossbeam-skiplist` and `thiserror`.
+Every design decision, with the alternatives and the reasoning, is in [DESIGN.md](DESIGN.md) (D1–D31).
 
 ```rust,no_run
 fn main() -> lsmkv::Result<()> {
@@ -66,7 +68,7 @@ flowchart LR
 - **A full memtable** becomes immutable, a fresh memtable and WAL take over, and a background thread flushes it to a
   level-0 SSTable. Writes slow down at 8 level-0 tables and stop at 12 (D14–D16).
 - **Leveled compaction** merges level n into n+1 on the background thread, streaming one block per input
-  (D8, D15, D20). Old versions and tombstones are dropped only when no reader or snapshot can see them (D18).
+  (D8, D15, D20). Tables that overlap nothing below them move down by a manifest edit instead (D29). Old versions and tombstones are dropped only when no reader or snapshot can see them (D18).
 - **Reads** take no lock beyond copying an `Arc<SuperVersion>`: an immutable bundle of memtables and tables.
   So reads never wait for writes, flushes or compactions (D12).
 - **Every version carries a sequence number,** so snapshots and scans read a consistent point in time (D18, D21).
@@ -78,7 +80,8 @@ flowchart LR
   corruption anywhere else refuses to open (D2, D6). A failed fsync poisons the database instead of
   pretending (fsyncgate, D7).
 
-**SSTable format** (D5): 4 KiB data blocks with a CRC32 each, then a bloom filter block (10 bits per key, D9), then an index
+**SSTable format** (D5): 4 KiB data blocks, each ending in restart points (the offset of every 16th entry, for a
+binary search inside the block, D30) and a CRC32; then a bloom filter block (10 bits per key, D9), then an index
 block (each block's last key), then a fixed-size footer. Files are written to a temp name, fsynced, renamed,
 and the directory fsynced.
 
@@ -108,7 +111,7 @@ filters, 8 MiB block cache, 4 KiB blocks, no compression, the same level-0 trigg
 
 - **Writes: roughly even, and RocksDB's compaction is better.** RocksDB does random fills 8–19% faster with
   lower write amplification. On sequential keys it moves level-0 tables down without rewriting them (write amp 1.0);
-  lsmkv merges all of level 0 into level 1 every time (2.28).
+  lsmkv merged all of level 0 into level 1 every time (2.28), until M17 (1.17, below).
 - **Single-threaded point reads and seeks: lsmkv is 1.4–2.0x faster here. I haven't profiled why** (no `perf`
   on this machine). It isn't value copying (both copy each value once) or CPU-specific CRC code (a native build
   changed nothing). The likely cost is RocksDB's more general read path (merge operators, range tombstones,
@@ -118,6 +121,39 @@ filters, 8 MiB block cache, 4 KiB blocks, no compression, the same level-0 trigg
 - **With fsync per write,** both are bound by the disk (~0.7 ms per fsync).
 - Where RocksDB has features this comparison doesn't use: compression, prefix-compressed blocks, many
   background threads, and dynamic level sizing (its default; turned off here to match).
+
+### Level-0 trivial moves and restart points (M17, M18)
+
+Rerun on a 4-core cloud VM, where RocksDB itself runs about 45% slower than on the laptop above, so compare the ratios,
+not the absolute numbers. Same settings, one run (`cd bench && cargo run --release`):
+
+| workload | lsmkv ops/s | RocksDB ops/s | p99 µs, lsmkv vs RocksDB | write amp, lsmkv vs RocksDB |
+|---|---:|---:|---:|---:|
+| fillseq | 308k | 411k | 25.2 vs 6.6 | **1.17** vs 1.00 (was 2.28) |
+| fillrandom | 173k | 336k | 32.0 vs 7.9 | 5.44 vs 4.27 |
+| overwrite | 140k | 244k | 31.8 vs 10.9 | 6.74 vs 5.13 |
+| readrandom | 204k | 132k | 13.4 vs 32.5 |  |
+| readmissing | 1.01M | 476k | 4.6 vs 10.5 |  |
+| seekrandom (+100 next) | 31k | 15k | 79.8 vs 163.6 |  |
+| readwhilewriting: reads (4 threads) | 183k | 193k | 148.6 vs 79.6 |  |
+| readwhilewriting: writes (1 thread) | 116k | 171k | 34.4 vs 10.9 |  |
+| fillrandom (fsync each) | 4,338 | 4,024 | 579 vs 587 |  |
+
+- **Sequential loads stop paying a level-0 rewrite** (D29): disjoint level-0 tables move to level 1 by one manifest
+  commit. What's left above 1.00 is level 1 overflowing into level 2 while keys still arrive in level 0.
+- **Writes are slower than RocksDB on this machine** (4 cores shared by both the writer and the one background thread;
+  write p99 is 3–4x RocksDB's). The laptop run above had them even; this VM is the less flattering one.
+- **Restart points on their own** (`cargo run --release --example block_search`, same entries, with and without):
+
+  | block | value | entries | linear scan (formats 2–4) | restart points (format 5) | speedup |
+  |---:|---:|---:|---:|---:|---:|
+  | 4 KiB | 100 B | 31 | 149 ns | 123 ns | 1.2x |
+  | 4 KiB | 16 B | 83 | 309 ns | 158 ns | 2.0x |
+  | 16 KiB | 100 B | 123 | 500 ns | 153 ns | 3.3x |
+  | 64 KiB | 100 B | 492 | 1787 ns | 192 ns | 9.3x |
+
+  Small for the default 4 KiB blocks of 100-byte values (31 entries to scan), and it grows with entries per block:
+  O(log n) against O(n).
 
 ### Durability modes and group commit (M7)
 
@@ -159,43 +195,62 @@ shown; up to 0.5 s) is level-0 backpressure: when the writer outruns compaction,
 
 ## How it's tested
 
-- **184 tests** (`cargo test`, about 25 s): unit tests per component, plus:
+- **196 tests** (`cargo test`, about 70 s): unit tests per component, plus:
   - **Crash injection** at every step of a flush and a compaction (failpoints), and every-byte corruption
-    and truncation tests on WAL records, batches, blocks, the index, the footer and the manifest.
+    and truncation tests on WAL records, batches, blocks (restart trailers included), the index, the footer
+    and the manifest.
   - **A `kill -9` harness** (`tests/kill9.rs`): a child process writes (puts, deletes and atomic batches)
     from 4 threads and is killed at random moments, round after round, against one directory. After each
     kill, every key must hold exactly its last acknowledged value, and an in-flight batch must be there
     whole or not at all. Long run: 300 rounds, 1,022,073 acknowledged operations, none lost (`cargo test --release --test kill9 -- --ignored`).
+  - **Real power cuts on LazyFS** (`scripts/lazyfs.sh`): the same harness on a
+    [LazyFS](https://github.com/dsrhaslab/lazyfs) mount, which after each kill drops every byte that was
+    written but not fsynced: what the machine losing power does, on the real kernel, against the real
+    multi-threaded binary. 300 rounds, 137,999 acknowledged writes, none lost. Planting "acknowledge before
+    the fsync" fails in the first round; `kill -9` alone can never see it, since the kernel still has the data.
   - **Deterministic simulation** (`tests/sim.rs`): the engine runs single-threaded on `SimFs`, a
     simulated disk that tracks what was fsynced. The test cuts the power at a random I/O (keeping a random
     torn prefix of unsynced data) or fails an fsync, reopens, and requires the durable state plus a
     prefix of later operations: nothing acknowledged lost in `Always` mode, no holes in `Periodic` mode.
-    A seed replays exactly. Long run: 100 seeds in every `cargo test`; 20,000-seed release runs (`LSMKV_SIM_SEEDS=20000 cargo test --release --test sim`).
+    A seed replays exactly. 100 seeds in every `cargo test`, 2,000 on every push, 20,000 nightly.
     - **It found a real bug:** a compaction's manifest commit, torn by a power cut, could apply its
       "remove inputs" records without its "add outputs" records, losing data. `kill -9` can't tear a
       write, so the crash harness, the fuzzer and every unit test had missed it. Commits now carry a
       group header and apply whole or not at all (D28).
-    - **And a second:** recovery replayed write-ahead logs without fsyncing them, so after a restart the
-      database could serve a write that a later power cut or failed fsync took back. Recovery now fsyncs
-      what it replays (D28).
-    - **Planted durability bugs** (a missing fsync, a missing directory fsync, an ack before the fsync, ...):
-      the simulation caught 9 of 10, the `kill -9` harness 0 of 10 (the 10th is a harmless equivalent).
+    - **A second:** recovery replayed write-ahead logs without fsyncing them, so after a restart the
+      database could serve a write that a later power cut or failed fsync took back (seed 14676).
+    - **And a third, the same mistake in the manifest** (seed 2793): a flush's commit that was only in the
+      page cache when the process died was replayed, the WAL it retired was deleted, and a power cut then
+      took the commit back. Recovery now fsyncs everything it replays before acting on it (D28).
   - **A model-based fuzz test** (`tests/model.rs`, proptest): random options and random sequences of
     every operation (batches, transactions racing direct writes, close and reopen), checked against a
-    `BTreeMap`, with failures shrunk to minimal cases. 5,000 cases pass.
+    `BTreeMap`, with failures shrunk to minimal cases. 5,000 cases nightly.
+  - **libFuzzer** (`fuzz/`, `cargo +nightly fuzz run <target>`) on every parser that reads untrusted bytes:
+    WAL replay, manifest open, SSTables (raw bytes, and arbitrary entries written and read back), and the
+    RESP parser (including fed one byte at a time). In CI, 30 s per target on every push, 10 min nightly.
+  - **Backward compatibility** (`tests/compat.rs`): a database written by the format-4 build is checked in;
+    the current build opens it, reads every key, mixes old and new tables, and rewrites it.
   - **Concurrency:** staged tests (test-only hooks hold a flush or a write group in place), readers
     that must never see half a batch, and bank transfers between accounts that must never create or
     lose money.
-  - **The Redis server** over real sockets: pipelining across reads, `MULTI`/`EXEC`, `WATCH`, 8 clients
-    incrementing one counter, and a fuzzed protocol parser.
-- **Mutation-checked:** about 140 bugs planted across M5–M15, each checked to make the tests fail. Every
-  survivor led to a new or fixed test, or is explained as equivalent; DESIGN.md lists them.
+  - **The Redis server** over real sockets and with the real `redis-cli`: pipelining across reads,
+    `MULTI`/`EXEC`, `WATCH` (including an aborted `EXEC`), and 8 clients incrementing one counter.
+- **Mutation-checked** (`python3 scripts/mutate.py`): a catalog of planted bugs (missing fsyncs, a missing
+  directory fsync, ack before fsync, tombstones dropped too early, conflict checks off, a bad trivial move,
+  a bad restart point, ...), each applied, built and tested in turn: **27 of 27 caught**, each by the tests meant for it
+  (`target/mutants/*.log` shows which). A control mode runs the same tests unmutated, so a "caught" can't be a test
+  failing for some other reason; it found one timing-sensitive test, now fixed.
+  Earlier milestones planted about 140 more by hand (DESIGN.md lists them).
+- **CI** (`.github/workflows/ci.yml`): fmt, clippy, all tests and short soaks on every push; long soaks nightly.
 
 ## Running it
 
 ```bash
-cargo test                                                   # everything, about 25 s
+cargo test                                                   # everything, about 70 s
 cargo test --release --test kill9 -- --ignored               # 300 crash rounds, ~90 s
+scripts/lazyfs.sh 300                                        # 300 real power cuts (needs FUSE 3)
+python3 scripts/mutate.py                                    # every planted bug must be caught
+cargo +nightly fuzz run resp_parse                           # one fuzz target (cargo install cargo-fuzz)
 LSMKV_SIM_SEEDS=20000 cargo test --release --test sim        # long simulation run
 PROPTEST_CASES=5000 cargo test --release --test model        # long fuzz run, ~40 s
 cargo run --release --example demo                           # the demo below, a few seconds
@@ -212,7 +267,7 @@ LSMKV_SIM_SEED=44 cargo test --test sim -- --nocapture
 ### The Redis-protocol server
 
 `lsmkv-server` speaks RESP2, Redis's protocol, on 127.0.0.1:6380 by default. Clients like `redis-cli` or
-`valkey-cli` (`sudo pacman -S valkey` on Arch) connect with `-p 6380`. Commands map onto engine features:
+`valkey-cli` connect with `-p 6380` (tested with redis-cli 7.0; `redis-benchmark -P 16` ran 94k `SET`/s and 524k `GET`/s). Commands map onto engine features:
 
 | command | in lsmkv |
 |---|---|
@@ -295,19 +350,19 @@ done
 
 ## Known limits
 
-- **The power-loss simulation models the disk, not the kernel.** `SimFs` tears writes as prefixes (never
-  scattered sectors) and treats directory changes as durable only after a directory fsync. It runs the
-  engine single-threaded. Threads are covered by the `kill -9` harness and the concurrency tests; a real
-  fault-injecting filesystem (LazyFS) would be the next step.
-- **No compression, no prefix compression in blocks.** Blocks store full keys, and a lookup scans its block
-  linearly (RocksDB uses restart points for a binary search inside each block).
-- **One background thread** does all flushes and compactions, and level-0 compaction always rewrites into
-  level 1 (no trivial move for sequential keys, so `fillseq` write amplification is 2.3 vs RocksDB's 1.0).
+- **Power loss is tested two ways, each with a gap.** `SimFs` is deterministic but models the disk: torn writes
+  keep a prefix (never scattered sectors), and it runs the engine single-threaded. LazyFS runs the real binary
+  on the real kernel, but isn't deterministic, and drops all unsynced data at once rather than tearing it.
+- **No compression, no prefix compression in blocks.** Blocks store full keys; restart points (D30) make a
+  lookup inside a block a binary search, but don't shrink it.
+- **One background thread** does all flushes and compactions, and level-0 tables move down without a rewrite
+  only when all of them are disjoint (D29); RocksDB can move a subset.
 - **Forward scans only,** no reverse iteration. Transactions are snapshot isolation, not serializable
   (`get_for_update` covers write skew for the keys you name), and have no transactional `scan`.
 - **The memtable switch** (a new WAL, a directory fsync and the old WAL's fsync) runs under the state lock,
   which shows up as write tail latency.
-- **The server** has no AUTH or TLS (it binds to localhost), and `SCAN` cursors re-scan from the start.
+- **The server** has no AUTH or TLS (it binds to localhost), implements a subset of commands, and `SCAN`
+  cursors re-scan from the start.
 - **Linux/POSIX only:** compaction deletes table files that readers may still have open.
 
 Not built: compression, column families, Raft replication, serializable transactions.
@@ -333,9 +388,14 @@ src/bin/lsmkv-server.rs the server binary
 tests/kill9.rs          kill -9 crash harness
 tests/sim.rs            deterministic simulation with power cuts
 tests/model.rs          proptest model test
-tests/server.rs         the server over real sockets
+tests/server.rs         the server over real sockets, and the real redis-cli
+tests/compat.rs         a format-4 database (tests/fixtures/) opened by this build
 examples/               demo and benchmarks
 bench/                  lsmkv vs RocksDB (separate crate)
+fuzz/                   libFuzzer targets (separate crate, nightly)
+scripts/mutate.py       planted-bug runner; the catalog is scripts/mutants.toml
+scripts/lazyfs.sh       builds LazyFS and runs the power-cut rounds on it
+.github/workflows/      CI
 ```
 
 ## License

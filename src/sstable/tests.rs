@@ -195,9 +195,10 @@ fn footer_roundtrip_and_magic_at_end() {
         filter_offset: 3,
         filter_len: 4,
         entry_count: 5,
+        restarts: true,
     };
     let bytes = f.encode();
-    assert_eq!(&bytes[44..], b"LSMKVSS2");
+    assert_eq!(&bytes[44..], b"LSMKVSS3");
     assert_eq!(Footer::decode(&bytes).unwrap(), f);
 }
 

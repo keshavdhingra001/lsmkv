@@ -15,7 +15,8 @@
 //!   (DESIGN.md D18), so a binary search over the index finds the only block
 //!   that can hold the version a lookup wants.
 //! - Footer: `[index_offset u64][index_len u64][filter_offset u64][filter_len u64]
-//!   [entry_count u64][crc32 u32][magic u64]`. The CRC covers the five u64s.
+//!   [entry_count u64][crc32 u32][magic u64]`. The CRC covers the five u64s,
+//!   and since format 5 the magic too (it says which block layout to use).
 //!   The footer is fixed size at a fixed place (end of file), so it's where a
 //!   reader starts.
 //!
@@ -40,9 +41,12 @@ use crate::error::{Error, Result};
 /// can exceed it by at most one entry.
 pub const DEFAULT_BLOCK_SIZE: usize = 4096;
 pub const FOOTER_LEN: usize = 5 * 8 + 4 + 8;
-/// "LSMKVSS2" read as a little-endian u64. The 2 is the format: sequence
-/// numbers in every entry (M8). M3–M7 tables ended in "LSMKVSST".
-pub const MAGIC: u64 = u64::from_le_bytes(*b"LSMKVSS2");
+/// "LSMKVSS3" read as a little-endian u64: what this build writes. The 3
+/// means data blocks end in restart points (format 5, DESIGN.md D30).
+pub const MAGIC: u64 = u64::from_le_bytes(*b"LSMKVSS3");
+/// Tables from M8 to format 4: sequence numbers in every entry, blocks
+/// without restart points. Still read. M3–M7 tables ended in "LSMKVSST".
+pub const MAGIC_V2: u64 = u64::from_le_bytes(*b"LSMKVSS2");
 
 /// What every table a database has open shares: one block cache and one set
 /// of counters. The default has the cache turned off.
@@ -100,6 +104,22 @@ struct Footer {
     filter_offset: u64,
     filter_len: u64,
     entry_count: u64,
+    /// Data blocks end in restart points (`MAGIC`), or not (`MAGIC_V2`).
+    restarts: bool,
+}
+
+/// The footer's CRC: over the five u64s, and in format 5 over the magic
+/// too. "LSMKVSS3" and "LSMKVSS2" differ in one bit, so without that a
+/// single flipped bit would make a table read with the wrong block layout.
+fn footer_crc(buf: &[u8; FOOTER_LEN]) -> u32 {
+    if read_u64(buf, 44) == MAGIC {
+        let mut h = crc32fast::Hasher::new();
+        h.update(&buf[..40]);
+        h.update(&buf[44..52]);
+        h.finalize()
+    } else {
+        crc32fast::hash(&buf[..40])
+    }
 }
 
 impl Footer {
@@ -115,21 +135,26 @@ impl Footer {
         for (i, f) in fields.iter().enumerate() {
             out[i * 8..i * 8 + 8].copy_from_slice(&f.to_le_bytes());
         }
-        let crc = crc32fast::hash(&out[..40]);
+        let magic = if self.restarts { MAGIC } else { MAGIC_V2 };
+        out[44..52].copy_from_slice(&magic.to_le_bytes());
+        let crc = footer_crc(&out);
         out[40..44].copy_from_slice(&crc.to_le_bytes());
-        out[44..52].copy_from_slice(&MAGIC.to_le_bytes());
         out
     }
 
     fn decode(buf: &[u8; FOOTER_LEN]) -> Result<Self> {
         // Magic first: a wrong magic means "not an SSTable", a clearer error
         // than a checksum failure.
-        if read_u64(buf, 44) != MAGIC {
-            return Err(Error::Corruption(
-                "bad magic number (not an sstable, or truncated)".into(),
-            ));
-        }
-        if crc32fast::hash(&buf[..40]) != read_u32(buf, 40) {
+        let restarts = match read_u64(buf, 44) {
+            MAGIC => true,
+            MAGIC_V2 => false,
+            _ => {
+                return Err(Error::Corruption(
+                    "bad magic number (not an sstable, or truncated)".into(),
+                ))
+            }
+        };
+        if footer_crc(buf) != read_u32(buf, 40) {
             return Err(Error::Corruption("footer checksum mismatch".into()));
         }
         Ok(Self {
@@ -138,6 +163,7 @@ impl Footer {
             filter_offset: read_u64(buf, 16),
             filter_len: read_u64(buf, 24),
             entry_count: read_u64(buf, 32),
+            restarts,
         })
     }
 }

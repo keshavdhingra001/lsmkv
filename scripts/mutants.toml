@@ -1,0 +1,233 @@
+# Planted bugs for scripts/mutate.py. Each `find` must appear exactly once
+# in `file`; `tests` are the `cargo test` arguments that must catch it.
+
+# ---- Durability (D28): only the power-loss simulation can see these ----
+
+[[mutant]]
+name = "durability: Always mode acks before the WAL fsync"
+file = "src/db.rs"
+find = '''            if sync {
+                wal.sync()?;
+            } else {
+                wal.flush()?;
+            }'''
+replace = '''            let _ = sync;
+            wal.flush()?;'''
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: a new WAL's name not made durable"
+file = "src/db.rs"
+find = '''            let new_wal = Wal::open_in(&*self.opts.fs, &log_path(&self.dir, log_id))?;
+            self.opts.fs.sync_dir(&self.dir)?;'''
+replace = '''            let new_wal = Wal::open_in(&*self.opts.fs, &log_path(&self.dir, log_id))?;'''
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: memtable switch skips the old WAL's fsync"
+file = "src/db.rs"
+find = '''            let before = wal.sync_count();
+            wal.sync()?;'''
+replace = '''            let before = wal.sync_count();
+            wal.flush()?;'''
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: table not fsynced before its rename"
+file = "src/sstable/writer.rs"
+find = '''        self.file.get_mut().sync()?;
+        self.fs.rename'''
+replace = '''        self.fs.rename'''
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: table rename not made durable"
+file = "src/sstable/writer.rs"
+find = '''        self.fs
+            .sync_dir(self.final_path.parent().unwrap_or(Path::new("")))?;'''
+replace = ''
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: manifest commit not fsynced"
+file = "src/manifest.rs"
+find = "match self.file.write_all(&buf).and_then(|()| self.file.sync()) {"
+replace = "match self.file.write_all(&buf) {"
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: manifest commit without its group header"
+file = "src/manifest.rs"
+find = "        if edits.len() > 1 {"
+replace = "        if false {"
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: sync_wal doesn't sync"
+file = "src/db.rs"
+find = "let synced = lock(&wal).sync();"
+replace = "let synced = lock(&wal).flush();"
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: a fresh database's first WAL name not durable"
+file = "src/db.rs"
+find = '''        let wal = Wal::open_in(&*fs, &log_path(&dir, wal_number))?;
+        fs.sync_dir(&dir)?;'''
+replace = '''        let wal = Wal::open_in(&*fs, &log_path(&dir, wal_number))?;'''
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "2000" }
+
+[[mutant]]
+name = "durability: recovery doesn't fsync replayed WALs (seed 14676)"
+file = "src/db.rs"
+find = '''            // simulation found it).
+            f.sync()?;'''
+replace = '''            // simulation found it).
+            let _ = &mut f;'''
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "20000" }
+
+[[mutant]]
+name = "durability: recovery doesn't fsync the manifest (seed 2793)"
+file = "src/manifest.rs"
+find = '''            // after the files it retired are gone (D28; seed 2793).
+            file.sync()?;'''
+replace = '''            // after the files it retired are gone (D28; seed 2793).'''
+tests = "--release --test sim"
+env = { LSMKV_SIM_SEEDS = "20000" }
+
+# ---- Correctness of reads, compaction and transactions ----
+
+[[mutant]]
+name = "compaction: tombstones always dropped"
+file = "src/db/compaction.rs"
+find = "if entry == Entry::Tombstone && seq <= env.oldest_snapshot && shadows_nothing {"
+replace = "if entry == Entry::Tombstone {"
+tests = "--lib db::"
+
+[[mutant]]
+name = "snapshots: versions a snapshot needs are garbage collected"
+file = "src/key.rs"
+find = "let hidden = self.newer_seq <= self.oldest_snapshot;"
+replace = "let hidden = self.newer_seq != MAX_SEQ;"
+tests = "--lib db::"
+
+[[mutant]]
+name = "filters: tombstones left out of the bloom filter"
+file = "src/sstable/writer.rs"
+find = "if self.opts.bloom_bits_per_key > 0 && new_key {"
+replace = "if self.opts.bloom_bits_per_key > 0 && new_key && matches!(entry, Entry::Value(_)) {"
+tests = "--lib"
+
+[[mutant]]
+name = "transactions: conflicts within one write group missed"
+file = "src/db/batch.rs"
+find = "let newer = written.contains(key)"
+replace = "let newer = false"
+tests = "--lib db::batch"
+
+[[mutant]]
+name = "transactions: conflict check compares the wrong way"
+file = "src/db/batch.rs"
+find = "is_some_and(|seq| seq > read_seq)"
+replace = "is_some_and(|seq| seq < read_seq)"
+tests = "--lib db::batch"
+
+[[mutant]]
+name = "wal: mid-log corruption treated as a torn tail"
+file = "src/wal.rs"
+find = "let is_tail = rest.is_empty() || buf[pos..].iter().all(|&b| b == 0);"
+replace = "let is_tail = true;"
+tests = "--lib wal::"
+
+# ---- D29: trivial moves out of level 0 ----
+
+[[mutant]]
+name = "D29: tables sharing an edge key move"
+file = "src/db/compaction.rs"
+find = "w[0].largest() < w[1].smallest()"
+replace = "w[0].largest() <= w[1].smallest()"
+tests = "--lib db::"
+
+[[mutant]]
+name = "D29: level-0 tables move without a disjointness check"
+file = "src/db/compaction.rs"
+find = ".all(|w| w[0].largest() < w[1].smallest())"
+replace = ".all(|_| true)"
+tests = "--lib db::"
+
+[[mutant]]
+name = "D29: next-level overlap ignored"
+file = "src/db/compaction.rs"
+find = "c.next.is_empty() && can_move"
+replace = "can_move"
+tests = "--lib db::"
+
+[[mutant]]
+name = "D29: empty tables move"
+file = "src/db/compaction.rs"
+find = "if tables.iter().any(|t| t.reader.entry_count() == 0) {"
+replace = "if false {"
+tests = "--lib db::"
+
+[[mutant]]
+name = "D29: moved tables left unsorted in their level"
+file = "src/db/compaction.rs"
+find = "        next.sort_by(|a, b| a.smallest().cmp(b.smallest()));"
+replace = ""
+tests = "--lib db::"
+
+# ---- D30: restart points in blocks ----
+
+[[mutant]]
+name = "D30: seek starts at the restart after the target"
+file = "src/sstable/block.rs"
+find = "self.iter_at(if lo == 0 { 0 } else { self.restart(lo - 1) })"
+replace = "self.iter_at(if lo == 0 { 0 } else { self.restart(lo.min(self.restarts.len() / 4 - 1)) })"
+tests = "--lib sstable"
+
+[[mutant]]
+name = "D30: restart offsets not checked against entries"
+file = "src/sstable/block.rs"
+find = '''        if has_restarts {
+            block.check_restarts()?;
+        }'''
+replace = ""
+tests = "--lib sstable"
+
+[[mutant]]
+name = "D30: footer CRC doesn't cover the magic"
+file = "src/sstable/mod.rs"
+find = "    if read_u64(buf, 44) == MAGIC {"
+replace = "    if false {"
+tests = "--lib sstable"
+
+[[mutant]]
+name = "D30: old tables read as if they had restart points"
+file = "src/sstable/reader.rs"
+find = "Block::from_verified(&raw, self.footer.restarts)"
+replace = "Block::from_verified(&raw, true)"
+tests = "--test compat"
+
+[[mutant]]
+name = "D30: a restart point recorded after its entry"
+file = "src/sstable/block.rs"
+find = '''        if self.count.is_multiple_of(RESTART_INTERVAL) {
+            self.restarts.push(len_u32(&self.buf, "block")?);
+        }
+
+        self.buf.push(kind);'''
+replace = '''        self.buf.push(kind);
+        if self.count.is_multiple_of(RESTART_INTERVAL) {
+            self.restarts.push(len_u32(&self.buf, "block")?);
+        }'''
+tests = "--lib sstable"

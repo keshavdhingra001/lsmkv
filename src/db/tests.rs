@@ -422,6 +422,8 @@ fn tombstone_survives_while_older_data_is_deeper() {
     let db = Db::open_with(dir.path(), tiny()).unwrap();
     db.delete(b"a").unwrap();
     db.flush().unwrap();
+    // Spans "a", so the two level-0 tables overlap and merge (not move, D29).
+    db.put(b"0", b"1").unwrap();
     db.put(b"b", b"1").unwrap();
     db.flush().unwrap(); // L0 hits the trigger (2): L0 -> L1
     assert_eq!(db.stats().level_files[..2], [0, 1], "{:?}", db.stats());
@@ -485,8 +487,11 @@ fn assert_keys(db: &Db, range: std::ops::Range<usize>, ctx: &str) {
     }
 }
 
-/// No temp files, and every table on disk is live.
+/// No temp files, and every table on disk is live. Waits for the
+/// background thread to go idle first: a job that finishes between listing
+/// the files and counting the live tables would make them disagree.
 fn assert_no_orphans(dir: &Path, db: &Db, ctx: &str) {
+    db.wait_for_background(db.lock()).unwrap();
     let on_disk = files(dir);
     assert!(!on_disk.contains(&DbFile::Temp), "{ctx}: {on_disk:?}");
     let tables = on_disk
@@ -534,8 +539,12 @@ fn crash_at_every_compaction_step_loses_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open_with(dir.path(), tiny()).unwrap();
         // Let a few compactions succeed first, so deeper levels exist.
+        // Rewriting one of the first 50 keys after each new one makes every
+        // level-0 table overlap the others, so compactions merge (sequential
+        // keys alone would only move tables, D29, and never reach `fp`).
         for i in 0..500 {
             db.put(&key(i), &key(i)).unwrap();
+            db.put(&key(i % 50), &key(i % 50)).unwrap();
         }
         assert!(db.stats().level_files[2] > 0, "{fp}: {:?}", db.stats());
         let start = 500;
@@ -543,13 +552,16 @@ fn crash_at_every_compaction_step_loses_nothing() {
         let mut n = start;
         while db.put(&key(n), &key(n)).is_ok() {
             n += 1;
+            if db.put(&key(n % 50), &key(n % 50)).is_err() {
+                break;
+            }
         }
         // n puts were acknowledged; the failing one was refused unlogged.
         drop(db);
 
         let db = Db::open_with(dir.path(), tiny()).unwrap();
         assert_keys(&db, 0..n, fp);
-        assert_no_orphans(dir.path(), &db, fp);
+        assert_no_orphans(dir.path(), &db, &format!("{fp}, reopened"));
 
         for i in n..n + 1000 {
             db.put(&key(i), &key(i)).unwrap();
@@ -1293,7 +1305,9 @@ fn writes_and_reads_continue_while_a_flush_runs() {
         ..Options::default()
     };
     let db = Db::open_with(dir.path(), opts).unwrap();
-    db.state().slow_background = Duration::from_millis(400);
+    // Long enough that the second memtable fills while the first is still
+    // flushing, even on a loaded machine (400 ms wasn't, under parallel tests).
+    db.state().slow_background = Duration::from_secs(2);
     // Fill the memtable until the switch: it's now immutable, and the
     // background thread is (slowly) flushing it. Watched through the read
     // view, which (unlike `stats`) doesn't take the state lock.
@@ -1943,7 +1957,8 @@ fn concurrent_scans_see_a_prefix_of_ordered_writes() {
     done.store(true, Ordering::Release);
     let scans: u64 = scanners.into_iter().map(|s| s.join().unwrap()).sum();
     assert!(scans > 10, "only {scans} scans");
-    assert!(db.stats().compaction_bytes > 0);
+    // Sequential keys: tables moved down (D29) while the scans ran.
+    assert!(db.stats().level_files[1..].iter().sum::<usize>() > 0);
 }
 
 /// Random writes, snapshots, flushes and compactions; scans with random
@@ -2008,4 +2023,131 @@ fn randomized_scans_match_a_model() {
             }
         }
     }
+}
+
+// ---- M17: level-0 trivial moves (D29) ----
+
+/// Sequential keys: every flush makes a level-0 table past all the others,
+/// so level 0 moves down whole, by manifest edits, and nothing is rewritten.
+#[test]
+fn sequential_level0_tables_move_down_without_rewriting() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = 3000;
+    {
+        let db = Db::open_with(dir.path(), tiny()).unwrap();
+        for i in 0..n {
+            db.put(&key(i), &key(i)).unwrap();
+        }
+        db.flush().unwrap();
+        let st = db.stats();
+        assert_eq!(
+            st.compaction_bytes, 0,
+            "a sequential load was rewritten: {st:?}"
+        );
+        assert!(st.level_files[1..].iter().sum::<usize>() > 2, "{st:?}");
+        assert_keys(&db, 0..n, "before reopen");
+    }
+    // Reopen re-checks that the moved tables don't overlap in their levels.
+    let db = Db::open_with(dir.path(), tiny()).unwrap();
+    assert_keys(&db, 0..n, "after reopen");
+}
+
+/// Flushes each batch of puts into its own level-0 table (compactions held
+/// back), then lets the one level-0 compaction run and waits for it. Returns
+/// the database and whether that compaction rewrote data (merged) rather
+/// than moving tables. Stops there: `compact_all` would rewrite the bottom
+/// level and hide a bad move.
+fn compact_level0(dir: &Path, batches: &[&[(&str, &str)]]) -> (Db, bool) {
+    let opts = Options {
+        l0_compaction_trigger: batches.len(),
+        ..Options::default()
+    };
+    let db = Db::open_with(dir, opts).unwrap();
+    db.state().pause_compactions = true;
+    for batch in batches {
+        for (k, v) in *batch {
+            db.put(k.as_bytes(), v.as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+    }
+    assert_eq!(db.stats().level_files[0], batches.len());
+    db.state().pause_compactions = false;
+    db.shared.bg_work.notify_one();
+    db.flush().unwrap(); // waits until the background thread is idle
+    let st = db.stats();
+    assert_eq!(st.level_files[0], 0, "{st:?}");
+    (db, st.compaction_bytes > 0)
+}
+
+/// Reopening re-checks that no level 1+ holds overlapping or empty tables.
+fn reopen_and_get(dir: &Path, key: &str) -> Option<Vec<u8>> {
+    Db::open(dir).unwrap().get(key.as_bytes()).unwrap()
+}
+
+/// Level-0 tables that share even one user key must merge, never move:
+/// moving both would put two tables holding that key into one level.
+#[test]
+fn level0_tables_sharing_a_key_are_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    // The second table touches the first only at its edge, "m".
+    let (db, merged) = compact_level0(
+        dir.path(),
+        &[&[("a", "old"), ("m", "x")], &[("m", "new"), ("z", "y")]],
+    );
+    assert!(merged, "edge-sharing tables were moved");
+    assert_eq!(db.stats().level_files[1], 1);
+    drop(db);
+    assert_eq!(reopen_and_get(dir.path(), "m"), Some(b"new".to_vec()));
+}
+
+/// Disjoint level-0 tables still merge when level 1 overlaps them.
+#[test]
+fn level0_tables_overlapping_level1_are_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    place_table(dir.path(), 10, 1, &[("a", Some("1")), ("z", Some("1"))]);
+    let (db, merged) = compact_level0(dir.path(), &[&[("c", "2")], &[("m", "2")]]);
+    assert!(merged, "moved into an overlapping level 1");
+    assert_eq!(db.stats().level_files[1], 1);
+    drop(db);
+    assert_eq!(reopen_and_get(dir.path(), "m"), Some(b"2".to_vec()));
+
+    // A level-1 table in the gap between them, touching neither, still
+    // makes this a merge: it lies in the range the compaction covers.
+    let dir = tempfile::tempdir().unwrap();
+    place_table(dir.path(), 10, 1, &[("e", Some("1")), ("f", Some("1"))]);
+    let (db, merged) = compact_level0(dir.path(), &[&[("c", "2")], &[("m", "2")]]);
+    assert!(merged);
+    assert_eq!(db.stats().level_files[1], 1);
+    drop(db);
+    assert_eq!(reopen_and_get(dir.path(), "e"), Some(b"1".to_vec()));
+}
+
+/// Disjoint level-0 tables with nothing below them move without a rewrite,
+/// and keep their contents.
+#[test]
+fn disjoint_level0_tables_move() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, merged) = compact_level0(dir.path(), &[&[("m", "2"), ("n", "2")], &[("a", "1")]]);
+    assert!(!merged, "disjoint tables were rewritten");
+    assert_eq!(db.stats().level_files[1], 2);
+    drop(db);
+    assert_eq!(reopen_and_get(dir.path(), "a"), Some(b"1".to_vec()));
+}
+
+/// An empty level-0 table is merged away, never moved: levels 1+ refuse
+/// empty tables on open.
+#[test]
+fn an_empty_level0_table_is_not_moved() {
+    let dir = tempfile::tempdir().unwrap();
+    place_table(dir.path(), 10, 0, &[]);
+    place_table(dir.path(), 11, 0, &[("a", Some("1"))]);
+    let opts = Options {
+        l0_compaction_trigger: 2,
+        ..Options::default()
+    };
+    let db = Db::open_with(dir.path(), opts).unwrap();
+    db.flush().unwrap();
+    assert_eq!(db.stats().level_files[0], 0);
+    drop(db);
+    assert_eq!(reopen_and_get(dir.path(), "a"), Some(b"1".to_vec()));
 }
