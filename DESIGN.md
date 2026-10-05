@@ -50,6 +50,7 @@ Later milestones changed some early decisions; those entries say so, and point a
 | D27 | Redis-protocol server: RESP2, thread per connection | M14 |
 | D28 | Deterministic simulation: `Fs` trait, simulated disk, power cuts; atomic manifest commits (format 4) | M15 |
 | D29 | Trivial moves out of level 0: disjoint level-0 tables move down by manifest edit | M17 |
+| D30 | Restart points in data blocks: binary search inside a block (format 5) | M18 |
 
 ## Decisions
 
@@ -609,12 +610,22 @@ Tier 3, approved together with M14 and M15 in one "go".
 - **Why all-or-nothing:** RocksDB can move a subset of level 0 and merge the rest. All-or-nothing is simpler and covers the case that matters (sequential keys, where every table is disjoint); a mixed workload just merges, as before.
 - **Tests:** sequential keys rewrite nothing (`compaction_bytes == 0`); edge-sharing tables, tables overlapping level 1 (including a level-1 table in the gap between two level-0 tables, which overlaps the compaction's range but neither table), and an empty table all merge; every case reopens, which re-validates levels 1+. Mutation-checked: 5 planted bugs (edges allowed to touch, no disjointness check, next-level overlap ignored, empty tables moved, moved tables left unsorted), all caught. The first version of the tests ran `compact_all`, whose bottom-level rewrite repaired a bad move before anything looked: every planted bug survived it.
 
+### D30: Restart points in data blocks (approved 2026-10-05)
+- **Problem:** a point read binary-searches the index for its block, then scanned the block entry by entry from the start: ~30 entries for 4 KiB blocks of 100-byte values, hundreds for small values or big blocks. LevelDB and RocksDB binary-search inside the block too.
+- **Layout (format 5):** after a block's entries come the byte offsets of entries 0, 16, 32, ... (u32 each), then their count, then the CRC, which now covers the trailer too. Keys stay whole (no prefix compression), so every entry can still be read where it starts, and iterators keep borrowing keys straight out of the block. `Block::seek(key, seq)` binary-searches the restart points for the last one before the target, then scans at most 16 entries; `get` and the table iterator's seek both use it.
+- **Restart interval 16:** LevelDB's default. Each restart point costs 4 bytes (about 3% of a block of 130-byte entries); a smaller interval means more bytes and a shorter scan. With whole keys, an interval of 1 would be possible, but 16 keeps the trailer small for small entries.
+- **Trailer checking:** the CRC proves the bytes are what the writer wrote, not that the writer was right. When a block is read from disk (not on cache hits), it walks the entries once and requires restart k to be exactly the offset of entry 16k, and the count to match. A restart pointing into the middle of an entry would otherwise be parsed as an entry: garbage served as data. The walk costs about what the CRC does.
+- **Compatibility:** a table says which layout its blocks use with its footer's magic: "LSMKVSS3" (restart points) or "LSMKVSS2" (formats 2 to 4, no trailer). Old tables stay readable and get rewritten by compaction. The database format goes to 5 (an old directory is upgraded on open by appending `Format(5)`), so a format-4 build refuses the directory instead of failing on the first new table. `tests/compat.rs` opens a database written by the format-4 build (checked in under `tests/fixtures/`), reads every key, mixes old and new tables, and rewrites it.
+- **Found while building it:** "LSMKVSS3" and "LSMKVSS2" differ in one bit, and the footer CRC covered only the five u64s, not the magic. One flipped bit would have made a new table read as an old one, its restart trailer parsed as entries. The existing every-byte-flip test caught it. Format-5 footers now include the magic in their CRC.
+- **Rejected for now:** prefix compression (LevelDB stores each key as shared-prefix length + suffix, with full keys only at restart points). It saves space on keys with long common prefixes, but entries could no longer be read in place: iterators would have to rebuild each key into a buffer, and `RawEntry` couldn't borrow from the block. It's the natural next step on top of this layout.
+- **Tests:** `seek` matches a linear scan for every version of 100 keys plus keys between them; old-layout blocks read the same; wrong trailers behind a good CRC (a restart off by a byte, a first restart not at 0, a count one short, a count past the block) are corruption; the fuzzers (`sstable_roundtrip`, `sstable_read`) ran against the new layout. Planted bugs: see `scripts/mutants.toml`.
+
 ## Not done
 
 These were scoped as Tier 3 (stretch) and not built:
-- **Reverse iteration:** every source would need `prev`, and blocks would need restart points to walk backwards cheaply.
+- **Reverse iteration:** every source would need `prev`; blocks now have restart points (D30), which is what walking backwards inside a block needs.
 - **Serializable transactions:** M13's transactions are snapshot isolation (D26); preventing write skew needs read-set validation.
-- **Compression and prefix-compressed blocks:** blocks store full keys and are searched linearly.
+- **Compression and prefix-compressed blocks:** blocks store full keys (binary-searchable since D30, but not compressed).
 - **More than one background thread** for flushes and compactions.
 - **Simulating threads and time,** not just the disk (D28 covers the disk only), and testing on a real fault-injecting filesystem (LazyFS).
 - **Replication (Raft).**

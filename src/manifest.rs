@@ -62,8 +62,10 @@ const TAG_ADD_TABLE_BASE: u8 = 0x10;
 
 /// The on-disk format this build writes. It also reads (and upgrades)
 /// everything from `OLDEST_FORMAT` on. 3 added WAL batches (M13); 4 added
-/// manifest groups (M15).
-pub const FORMAT_VERSION: u64 = 4;
+/// manifest groups (M15); 5 added restart points to table blocks (M18).
+/// Tables written before 5 stay readable (their footer's magic says which
+/// block layout they use) until compaction rewrites them.
+pub const FORMAT_VERSION: u64 = 5;
 pub const OLDEST_FORMAT: u64 = 2;
 
 /// Levels 0..MAX_LEVELS. Level MAX_LEVELS - 1 is the bottom.

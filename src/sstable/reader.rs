@@ -105,7 +105,8 @@ impl SstReader {
         // key costs one block read. Compaction needs it for overlap checks.
         if let Some(first) = reader.index.first() {
             let raw = reader.read_block(first)?;
-            let block = Block::new(&raw).map_err(|e| reader.block_error(e, first))?;
+            let block = Block::new(&raw, reader.footer.restarts)
+                .map_err(|e| reader.block_error(e, first))?;
             let (key, _, _) = block
                 .iter()
                 .next()
@@ -151,7 +152,7 @@ impl SstReader {
             return Ok(None);
         };
         let raw = self.cached_block(entry)?;
-        Block::from_verified(&raw)
+        Block::from_verified(&raw, self.footer.restarts)
             .get_versioned(key, snapshot)
             .map_err(|e| self.block_error(e, entry))
     }
@@ -168,7 +169,7 @@ impl SstReader {
         }
         let raw = self.read_block(entry)?;
         ReadStats::bump(&stats.block_reads);
-        Block::new(&raw).map_err(|e| self.block_error(e, entry))?;
+        Block::new(&raw, self.footer.restarts).map_err(|e| self.block_error(e, entry))?;
         let raw: Arc<[u8]> = raw.into();
         self.ctx.cache.insert(key, Arc::clone(&raw));
         Ok(raw)
@@ -213,7 +214,7 @@ impl SstReader {
             return Ok(raw);
         }
         let raw = self.read_block(entry)?;
-        Block::new(&raw).map_err(|e| self.block_error(e, entry))?;
+        Block::new(&raw, self.footer.restarts).map_err(|e| self.block_error(e, entry))?;
         Ok(raw.into())
     }
 
@@ -318,20 +319,12 @@ impl Cursor {
             pos: 0,
         };
         cursor.load(r)?;
-        // Skip the block's entries before `start`.
-        if let (Some(start), Some(raw)) = (start, cursor.block.clone()) {
-            let mut it = Block::from_verified(&raw).iter();
-            loop {
-                let at = it.position();
-                match it.next() {
-                    Some(Ok((k, _, _))) if k < start => {}
-                    Some(Err(e)) => return Err(r.block_error(e, &r.index[block_idx])),
-                    _ => {
-                        cursor.pos = at;
-                        break;
-                    }
-                }
-            }
+        // Skip the block's entries before `start`: a binary search over its
+        // restart points, then a short scan.
+        if let (Some(start), Some(raw)) = (start, &cursor.block) {
+            cursor.pos = Block::from_verified(raw, r.footer.restarts)
+                .seek(start, key::MAX_SEQ)
+                .map_err(|e| r.block_error(e, &r.index[block_idx]))?;
         }
         Ok(cursor)
     }
@@ -351,7 +344,7 @@ impl Cursor {
             let Some(raw) = &self.block else {
                 return Ok(None);
             };
-            let mut it = Block::from_verified(raw).iter_at(self.pos);
+            let mut it = Block::from_verified(raw, r.footer.restarts).iter_at(self.pos);
             match it.next() {
                 Some(Ok((k, seq, v))) => {
                     self.pos = it.position();

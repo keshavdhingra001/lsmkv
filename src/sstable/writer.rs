@@ -179,6 +179,7 @@ impl SstWriter {
             filter_offset,
             filter_len,
             entry_count: self.entry_count,
+            restarts: true,
         };
         self.file.write_all(&footer.encode())?;
 
