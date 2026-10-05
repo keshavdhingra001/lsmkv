@@ -417,7 +417,7 @@ The owner approved the combined M9–M12 proposal in one "go".
   - Measured (`examples/scan.rs`, 1M keys, `compact_all` rewriting 129 MiB of tables): **peak RSS 24 MiB, down from 265 MiB**, and 1.52 s instead of 2.00 s. The old number was measured by running the same example against the section 2 commit.
 
 ### D21: What an open scan holds (approved 2026-10-04)
-- **No snapshot registration.** The handover notes said an open iterator must pin its sequence number like a `Snapshot`, or compaction could drop versions it's about to read. It doesn't need to:
+- **No snapshot registration.** The original M9 plan said an open iterator must pin its sequence number like a `Snapshot`, or compaction could drop versions it's about to read. It doesn't need to:
   - the scan holds `Arc`s of the memtables and of every table it might read (the SuperVersion as of its start);
   - none of those ever change (D12: flush and compaction build new ones);
   - a table file that compaction deletes stays readable through the descriptor the scan's reader holds open (POSIX).

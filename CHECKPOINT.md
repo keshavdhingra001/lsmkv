@@ -116,6 +116,10 @@ Mistakes on the way: a `/tmp` cleanup deleted a live soak's database (not an eng
 A 20,000-seed release run found a second real bug (seed 14676): recovery replayed WALs without fsyncing them, so a later failed fsync or power cut could take back writes the reopened database had already served. Fixed (recovery fsyncs replayed WALs), with a unit test and a process-kill fault in the simulation.
 **Left running at handover (detached):** a 20,000-seed simulation rerun on the final code (`target/sim20k-final.log`), and the 10,000-round kill -9 soak started in M13 (`target/soak10k.log`, built from M13-era code). Check both first thing. If they passed, update the README's long-run numbers (it currently cites the 300-round soak and "20,000-seed release runs"), and rerun the demo to refresh the README's demo output (it gained a transactions step). If either failed, replay it (`LSMKV_SIM_SEED=<n>`) before anything else.
 
+**2026-10-05: Cleanup pass (no behavior or format change).** Removed duplication: one WAL record writer (`Wal::write_record`) for plain and batch records, `Record::size`; one manifest record decoder (the CRC was checked twice per record); `SuperVersion::newest` behind both `get` and `newest_seq`; `Shared::read_view`, `Pending::writes`, `State::new_file_number`, `Table::open`, `bytes(level)`; `ENTRY_HEADER_LEN` instead of a literal 17; a shared `test_util::val`. `db.rs` tests moved to `src/db/tests.rs` (like `sstable/tests.rs`). 184 tests pass, 3,000 simulation seeds pass.
+Simulation sweep (`LSMKV_SIM_SEEDS=20000`, release) on this machine: **seed 2186** failed because a failed-fsync fault armed for an epoch that ended in a clean close stayed armed into the next reopen. That's a harness bug, fixed with `SimFs::disarm` on clean close. **Seed 2793 fails on the original code too, and looks like a real durability bug:** after a power cut during an inline flush/compaction in `Always` mode, durable keys come back missing or at an older version (`k077` lost, `k092` s196 -> s110). Not fixed: needs the owner (durability). Replay: `LSMKV_SIM_SEED=2793 cargo test --release --test sim -- --nocapture`. The README's "20,000 seeds pass" claim doesn't hold until this is resolved.
+Owner rule added to CLAUDE.md: no Co-Authored-By / AI trailers unless asked. All 49 earlier commits carry one; rewriting history (a force-push to the public `main`) is waiting on the owner.
+
 **Next step:** see RESUME HERE (the quiz in a new chat).
 
 ## M1 review questions (owner answers)
@@ -246,3 +250,4 @@ A 20,000-seed release run found a second real bug (seed 14676): recovery replaye
 - [x] GitHub: private repo https://github.com/keshavdhingra001/lsmkv (SSH remote, key ~/.ssh/id_ed25519)
 - [x] Git email links to GitHub account keshavdhingra001
 - [x] D2: mid-log WAL corruption fails loud (owner approved 2026-10-04)
+- [ ] Simulation seed 2793: durable writes lost after a power cut mid-compaction (see 2026-10-05 cleanup entry)
