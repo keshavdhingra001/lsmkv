@@ -55,3 +55,22 @@ jobs:
         run: LSMKV_CRASH_ROUNDS=$CRASH_ROUNDS cargo test --release --test kill9 -- --ignored
       - name: Model-based fuzzing
         run: PROPTEST_CASES=$FUZZ_CASES cargo test --release --test model
+
+  # libFuzzer over every parser of untrusted bytes (fuzz/). Needs nightly.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      - name: Run each target
+        run: |
+          secs=30
+          if [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then secs=600; fi
+          cd fuzz
+          for t in $(cargo fuzz list); do
+            cargo fuzz run "$t" -- -max_total_time=$secs -rss_limit_mb=2048
+          done
