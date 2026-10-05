@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * *" # nightly long runs
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  # Longer randomized runs, in release mode. Short on every push, long nightly.
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick the run length
+        run: |
+          if [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "SIM_SEEDS=20000" >> "$GITHUB_ENV"
+            echo "CRASH_ROUNDS=300" >> "$GITHUB_ENV"
+            echo "FUZZ_CASES=5000" >> "$GITHUB_ENV"
+          else
+            echo "SIM_SEEDS=2000" >> "$GITHUB_ENV"
+            echo "CRASH_ROUNDS=30" >> "$GITHUB_ENV"
+            echo "FUZZ_CASES=1000" >> "$GITHUB_ENV"
+          fi
+      - name: Power-loss simulation
+        run: LSMKV_SIM_SEEDS=$SIM_SEEDS cargo test --release --test sim
+      - name: kill -9 crash harness
+        run: LSMKV_CRASH_ROUNDS=$CRASH_ROUNDS cargo test --release --test kill9 -- --ignored
+      - name: Model-based fuzzing
+        run: PROPTEST_CASES=$FUZZ_CASES cargo test --release --test model
