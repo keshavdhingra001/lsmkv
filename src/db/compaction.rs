@@ -161,10 +161,6 @@ impl State {
     /// manifest edit); anything else becomes a job to run without the lock.
     pub(super) fn start_compaction(&mut self, c: Compaction) -> Result<Option<CompactionJob>> {
         self.check_writable()?;
-        if c.inputs.len() == 1 && c.next.is_empty() && c.out_level > c.level {
-            self.trivial_move(c.level, c.inputs[0])?;
-            return Ok(None);
-        }
         let mut tables = Vec::new();
         for (level, ids) in [(c.level, &c.inputs), (c.out_level, &c.next)] {
             for id in ids {
@@ -174,6 +170,10 @@ impl State {
                     .expect("compaction input is live");
                 tables.push(Arc::clone(table));
             }
+        }
+        if c.out_level > c.level && c.next.is_empty() && can_move(&tables) {
+            self.trivial_move(c.level, tables)?;
+            return Ok(None);
         }
         Ok(Some(CompactionJob {
             c,
@@ -224,33 +224,44 @@ impl State {
         Ok(())
     }
 
-    /// A single table with nothing overlapping it in the next level moves
-    /// down by a manifest edit alone: no data is rewritten.
-    fn trivial_move(&mut self, level: usize, id: u64) -> Result<()> {
-        let edits = [
-            Edit::RemoveTable(id),
-            Edit::AddTable {
-                id,
-                level: (level + 1) as u8,
-            },
-        ];
+    /// Tables with nothing overlapping them in the next level, and not each
+    /// other, move down by a manifest edit alone: no data is rewritten. For
+    /// level 0 that's all of its tables at once (D29): with sequential keys,
+    /// every flush makes a table past the ones before it, so they never merge.
+    fn trivial_move(&mut self, level: usize, tables: Vec<Arc<Table>>) -> Result<()> {
+        let mut edits: Vec<Edit> = tables.iter().map(|t| Edit::RemoveTable(t.id)).collect();
+        edits.extend(tables.iter().map(|t| Edit::AddTable {
+            id: t.id,
+            level: (level + 1) as u8,
+        }));
         self.commit(&edits, "compact")?;
 
         let mut levels = self.current.levels.clone();
-        let i = levels[level]
-            .iter()
-            .position(|t| t.id == id)
-            .expect("moved table is live");
-        let table = levels[level].remove(i);
+        levels[level].retain(|t| !tables.iter().any(|m| m.id == t.id));
         if level > 0 {
-            self.compact_pointer[level] = Some(table.largest().to_vec());
+            let largest = tables.iter().map(|t| t.largest()).max();
+            self.compact_pointer[level] = largest.map(<[u8]>::to_vec);
         }
         let next = &mut levels[level + 1];
-        let at = next.partition_point(|t| t.smallest() < table.smallest());
-        next.insert(at, table);
+        next.extend(tables);
+        next.sort_by(|a, b| a.smallest().cmp(b.smallest()));
         self.install_levels(levels);
         Ok(())
     }
+}
+
+/// Whether `tables` can move down a level as they are: none is empty (levels
+/// 1+ never hold an empty table) and no two share a user key, not even at
+/// their edges, since a key's versions may be split across level-0 tables.
+fn can_move(tables: &[Arc<Table>]) -> bool {
+    if tables.iter().any(|t| t.reader.entry_count() == 0) {
+        return false;
+    }
+    let mut by_start: Vec<&Arc<Table>> = tables.iter().collect();
+    by_start.sort_by(|a, b| a.smallest().cmp(b.smallest()));
+    by_start
+        .windows(2)
+        .all(|w| w[0].largest() < w[1].smallest())
 }
 
 impl CompactionJob {

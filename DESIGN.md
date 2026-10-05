@@ -49,6 +49,7 @@ Later milestones changed some early decisions; those entries say so, and point a
 | D26 | Optimistic transactions: snapshot isolation, first committer wins | M13 |
 | D27 | Redis-protocol server: RESP2, thread per connection | M14 |
 | D28 | Deterministic simulation: `Fs` trait, simulated disk, power cuts; atomic manifest commits (format 4) | M15 |
+| D29 | Trivial moves out of level 0: disjoint level-0 tables move down by manifest edit | M17 |
 
 ## Decisions
 
@@ -600,12 +601,20 @@ Tier 3, approved together with M14 and M15 in one "go".
   The equivalent one: the next WAL fsync makes the shorter length durable anyway (fdatasync covers the file size), and a power cut before then leaves the same torn tail, which recovery cuts again. **9 of 10 caught by the simulation, 0 of 10 by `kill -9`:** the two harnesses test different failures, and both are needed. The kill -9 harness covers the real binary, real threads and the real kernel.
 - **Rejected alternatives:** LazyFS (a FUSE filesystem that drops unsynced data) or dm-log-writes (records block writes to replay every crash point). Both test the real binary on a real kernel, which is more faithful, but they need root and setup, aren't deterministic or seedable, and can't run in `cargo test`. FoundationDB's full simulation also virtualizes the network, time and threads. This one virtualizes only the disk, since that's where this engine's correctness lives.
 - **Limits of the model:** a torn write keeps a prefix, never scattered sectors. Directory operations are durable only after a directory sync (real filesystems sometimes persist them earlier, which is the safer direction). No bit rot (the checksum tests cover that). One thread.
+### D29: Trivial moves out of level 0 (approved 2026-10-05)
+- **Problem:** a level-0 compaction always rewrote every level-0 table into level 1, even when the tables were disjoint and level 1 held nothing in their range. With sequential keys (a bulk load, time-ordered ids) that's every compaction: write amplification 2.28 on `fillseq`, against RocksDB's 1.00 (D24).
+- **Rule:** a compaction's tables move down by a manifest edit alone (no data read or written) when (1) it moves down a level, (2) nothing in the next level overlaps its range, and (3) no two of its tables share a user key, **not even at their edges** (`largest < next smallest`, strictly). An edge can be shared in level 0: a key overwritten in a later memtable has versions in two tables, and moving both would put that key in two tables of one level, which levels 1+ forbid (reads binary-search for the one table that can hold a key). Levels 1+ already moved a lone table this way (M5); this generalizes it to all of level 0 at once.
+- **Empty tables never move:** open refuses an empty table in levels 1+ (it has no key range to place). A flush never writes one, but a moved empty table would make the database unopenable, so the check costs nothing to keep.
+- **One commit:** the removals and additions go in one `Group(n)` manifest commit (D28), so a crash leaves the tables in level 0 or in level 1, never in both or neither. The compaction failpoints cover it like any compaction.
+- **Why all-or-nothing:** RocksDB can move a subset of level 0 and merge the rest. All-or-nothing is simpler and covers the case that matters (sequential keys, where every table is disjoint); a mixed workload just merges, as before.
+- **Tests:** sequential keys rewrite nothing (`compaction_bytes == 0`); edge-sharing tables, tables overlapping level 1 (including a level-1 table in the gap between two level-0 tables, which overlaps the compaction's range but neither table), and an empty table all merge; every case reopens, which re-validates levels 1+. Mutation-checked: 5 planted bugs (edges allowed to touch, no disjointness check, next-level overlap ignored, empty tables moved, moved tables left unsorted), all caught. The first version of the tests ran `compact_all`, whose bottom-level rewrite repaired a bad move before anything looked: every planted bug survived it.
+
 ## Not done
 
 These were scoped as Tier 3 (stretch) and not built:
 - **Reverse iteration:** every source would need `prev`, and blocks would need restart points to walk backwards cheaply.
 - **Serializable transactions:** M13's transactions are snapshot isolation (D26); preventing write skew needs read-set validation.
 - **Compression and prefix-compressed blocks:** blocks store full keys and are searched linearly.
-- **Trivial moves out of level 0** (RocksDB's 1.00 write amplification on sequential keys, D24), and more than one background thread.
+- **More than one background thread** for flushes and compactions.
 - **Simulating threads and time,** not just the disk (D28 covers the disk only), and testing on a real fault-injecting filesystem (LazyFS).
 - **Replication (Raft).**
