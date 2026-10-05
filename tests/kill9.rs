@@ -28,8 +28,13 @@
 //! The child also checks itself while it runs: every thread rescans its own
 //! keys (sometimes through a snapshot) and compares them with what it wrote.
 //!
-//! A power cut (losing the kernel's page cache too) is out of scope: it needs
-//! a VM or a fault-injecting filesystem (DESIGN.md D22).
+//! Power cuts (losing the kernel's page cache too) need a fault-injecting
+//! filesystem: `lazyfs_power_cuts` runs the same rounds on a LazyFS mount
+//! and, after each kill, has LazyFS drop every byte that wasn't fsynced
+//! (DESIGN.md D31). It's skipped unless `LSMKV_LAZYFS_DIR` (a directory on
+//! the mount) and `LSMKV_LAZYFS_FIFO` (its fault FIFO) are set; see
+//! `scripts/lazyfs.sh`. Only `Always` rounds run there: `Periodic` mode may
+//! lose unsynced writes to a power cut by design.
 //!
 //! `cargo test --test kill9` runs 6 rounds; the soak test runs 300
 //! (`cargo test --release --test kill9 -- --ignored`, or set
@@ -355,15 +360,48 @@ fn check(dir: &Path, round: u64, ops: &[Vec<Op>], model: &mut HashMap<String, Op
 
 /// Runs `rounds` crash rounds against one directory. Returns the totals.
 fn crash_rounds(rounds: u64) {
-    let dir = tempfile::tempdir().unwrap();
+    crash_rounds_in(tempfile::tempdir().unwrap(), rounds, None);
+}
+
+/// LazyFS's fault FIFO, and the FIFO it reports finished commands on.
+struct PowerCut {
+    fifo: String,
+    /// Opened once and kept open: LazyFS holds the writing end for its whole
+    /// life, so a reader that closed it between rounds would leave LazyFS
+    /// writing into a pipe with no reader.
+    done: std::io::BufReader<std::fs::File>,
+}
+
+impl PowerCut {
+    fn open(fifo: String, done: &str) -> Self {
+        let done = std::io::BufReader::new(std::fs::File::open(done).unwrap());
+        Self { fifo, done }
+    }
+
+    /// Drops every byte the kernel would have lost in a power cut: LazyFS
+    /// throws away all data that was written but never fsynced.
+    fn now(&mut self) {
+        std::fs::write(&self.fifo, "lazyfs::clear-cache\n").unwrap();
+        let mut reply = String::new();
+        self.done.read_line(&mut reply).unwrap();
+        assert_eq!(reply.trim(), "finished::clear-cache");
+    }
+}
+
+fn crash_rounds_in(dir: tempfile::TempDir, rounds: u64, mut power_cut: Option<PowerCut>) {
     let mut model: HashMap<String, Option<Vec<u8>>> = (0..THREADS)
         .flat_map(|t| (0..KEYS_PER_THREAD).map(move |j| (key(t, j), None)))
         .collect();
     let mut rng = Rng::new(42);
     let (mut acked, mut unacked) = (0, 0);
-    for round in 0..rounds {
+    for i in 0..rounds {
+        // Power cuts run `Always` rounds only (the even ones).
+        let round = if power_cut.is_some() { 2 * i } else { i };
         let kill_after = Duration::from_millis(20 + rng.below(280));
         let ops = run_child(dir.path(), round, kill_after);
+        if let Some(cut) = &mut power_cut {
+            cut.now();
+        }
         check(dir.path(), round, &ops, &mut model);
         acked += ops.iter().flatten().filter(|op| op.acked).count();
         unacked += ops.iter().flatten().filter(|op| !op.acked).count();
@@ -398,4 +436,23 @@ fn kill_9_loses_no_acknowledged_write() {
 fn kill_9_soak() {
     let rounds = std::env::var("LSMKV_CRASH_ROUNDS").map_or(300, |s| s.parse().unwrap());
     crash_rounds(rounds);
+}
+
+#[test]
+#[ignore = "needs a LazyFS mount: scripts/lazyfs.sh"]
+fn lazyfs_power_cuts() {
+    let (Ok(dir), Ok(fifo)) = (
+        std::env::var("LSMKV_LAZYFS_DIR"),
+        std::env::var("LSMKV_LAZYFS_FIFO"),
+    ) else {
+        eprintln!("LSMKV_LAZYFS_DIR / LSMKV_LAZYFS_FIFO not set: skipped");
+        return;
+    };
+    let done = std::env::var("LSMKV_LAZYFS_DONE").unwrap_or_else(|_| format!("{fifo}.completed"));
+    let rounds = std::env::var("LSMKV_CRASH_ROUNDS").map_or(50, |s| s.parse().unwrap());
+    crash_rounds_in(
+        tempfile::tempdir_in(dir).unwrap(),
+        rounds,
+        Some(PowerCut::open(fifo, &done)),
+    );
 }

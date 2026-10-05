@@ -1305,7 +1305,9 @@ fn writes_and_reads_continue_while_a_flush_runs() {
         ..Options::default()
     };
     let db = Db::open_with(dir.path(), opts).unwrap();
-    db.state().slow_background = Duration::from_millis(400);
+    // Long enough that the second memtable fills while the first is still
+    // flushing, even on a loaded machine (400 ms wasn't, under parallel tests).
+    db.state().slow_background = Duration::from_secs(2);
     // Fill the memtable until the switch: it's now immutable, and the
     // background thread is (slowly) flushing it. Watched through the read
     // view, which (unlike `stats`) doesn't take the state lock.
