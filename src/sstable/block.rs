@@ -23,7 +23,7 @@ use crate::memtable::Entry;
 
 pub const KIND_VALUE: u8 = 1;
 pub const KIND_TOMBSTONE: u8 = 2;
-const ENTRY_HEADER_LEN: usize = 1 + 8 + 4 + 4;
+pub(crate) const ENTRY_HEADER_LEN: usize = 1 + 8 + 4 + 4;
 const CRC_LEN: usize = 4;
 
 /// Accumulates entries for one block. Reusable: `finish` resets it.
@@ -224,10 +224,7 @@ fn parse_entry(buf: &[u8]) -> Result<(RawEntry<'_>, usize)> {
 mod tests {
     use super::*;
     use crate::key::MAX_SEQ;
-
-    fn val(s: &str) -> Entry {
-        Entry::Value(s.as_bytes().to_vec())
-    }
+    use crate::test_util::val;
 
     fn build(entries: &[(&str, SeqNo, Entry)]) -> Vec<u8> {
         let mut b = BlockBuilder::new();

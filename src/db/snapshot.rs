@@ -11,7 +11,6 @@
 //! compactions.
 
 use std::ops::RangeBounds;
-use std::sync::Arc;
 
 use super::{lock, Db, DbIter};
 use crate::error::Result;
@@ -44,14 +43,14 @@ impl Snapshot<'_> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         // The current tables, not the ones at snapshot time: they still hold
         // every version this snapshot can see, since compaction keeps those.
-        let current = Arc::clone(&lock(&self.db.shared.view).current);
+        let (current, _) = self.db.shared.read_view();
         current.get(key, self.seq)
     }
 
     /// The live keys in `range` as of this snapshot (see `Db::scan`). The
     /// scan doesn't borrow the snapshot: it keeps what it reads alive itself.
     pub fn scan<K: AsRef<[u8]> + ?Sized>(&self, range: impl RangeBounds<K>) -> Result<DbIter> {
-        let current = Arc::clone(&lock(&self.db.shared.view).current);
+        let (current, _) = self.db.shared.read_view();
         DbIter::new(&current, self.seq, range)
     }
 

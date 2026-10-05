@@ -401,6 +401,15 @@ impl SimFs {
         s.record("process_restart", Path::new(""), 0);
     }
 
+    /// Cancels any armed crash or fsync failure that hasn't fired yet, as
+    /// `power_cut` and `process_restart` do. For a clean close, so a fault
+    /// armed for one run can't fire in the next one's recovery.
+    pub fn disarm(&self) {
+        let mut s = self.lock();
+        s.crash_at = None;
+        s.fail_sync_at = None;
+    }
+
     /// Paths and sizes of every file, as the program sees them.
     pub fn files(&self) -> Vec<(PathBuf, usize)> {
         let s = self.lock();

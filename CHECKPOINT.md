@@ -5,30 +5,30 @@ Single source of truth for "where are we". Update at the end of every session.
 ## Roadmap
 
 ### Tier 1: Baseline
-- [x] **M0** Scaffold: crate layout, error type, Db glue, REPL, tests for M1/M2 *(Claude)*
-- [x] **M1** Memtable: `put` / `delete` / `get` with tombstones *(Claude; 7/7 tests pass; owner review pending)*
-- [x] **M2** WAL: `append` / `replay`, CRC32 per record, torn-tail handling *(Claude; 18/18 tests + manual kill -9 recovery check; owner review pending)*
-- [x] **M3** SSTable writer + reader: data blocks, index block, footer *(Claude; 43/43 tests incl. corruption + randomized; owner review pending)*
-- [x] **M4** Flush memtable -> SSTable at size threshold; read path checks memtable then SSTables newest-first; manifest *(Claude; 59/59 tests incl. crash injection at every flush step; owner review pending)*
+- [x] **M0** Scaffold: crate layout, error type, Db glue, REPL, tests for M1/M2
+- [x] **M1** Memtable: `put` / `delete` / `get` with tombstones *(7/7 tests pass; owner review pending)*
+- [x] **M2** WAL: `append` / `replay`, CRC32 per record, torn-tail handling *(18/18 tests + manual kill -9 recovery check; owner review pending)*
+- [x] **M3** SSTable writer + reader: data blocks, index block, footer *(43/43 tests incl. corruption + randomized; owner review pending)*
+- [x] **M4** Flush memtable -> SSTable at size threshold; read path checks memtable then SSTables newest-first; manifest *(59/59 tests incl. crash injection at every flush step; owner review pending)*
 - [x] **Gate:** make the GitHub repo public *(owner approved 2026-10-05, after Tier 2)*
 
 ### Tier 2: Strong (target)
-- [x] **M5** Compaction: leveled, tombstones dropped safely *(Claude; 71/71 tests incl. compaction crash injection; owner review pending)*
-- [x] **M6** Bloom filters per SSTable + LRU block cache *(Claude; 97/97 tests incl. measured filter/cache wins; owner review pending)*
-- [x] **M7** Durability modes: per-write fsync / group commit / periodic; measure each *(Claude; 109 unit tests + kill -9 test + benchmark; owner review pending)*
-- [x] **M8** Concurrency: snapshot reads that never block the writer *(Claude; 129 unit tests + kill -9 test + before/after benchmark vs M7; owner review pending)*
-- [x] **M9** Range scans: merging iterator across memtable + levels *(Claude; 145 unit tests; 20 mutants, 19 caught + 1 equivalent; owner review pending)*
-- [x] **M10** Crash-injection harness (random kill -9, verify no acked write lost) + model-based fuzz test *(Claude; 300-round soak: 1.02M acked ops, none lost; 5,000 fuzz cases; harness and fuzzer each mutation-checked; owner review pending)*
-- [x] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB *(Claude; `bench/` crate, RocksDB 11.8; writes even, lsmkv faster on single-threaded reads (unprofiled), RocksDB better compaction and tails)*
-- [x] **M12** DESIGN.md complete, README with results *(Claude; README rewrite with mermaid diagram + all results, DESIGN index + final pass, `examples/demo.rs`)*
+- [x] **M5** Compaction: leveled, tombstones dropped safely *(71/71 tests incl. compaction crash injection; owner review pending)*
+- [x] **M6** Bloom filters per SSTable + LRU block cache *(97/97 tests incl. measured filter/cache wins; owner review pending)*
+- [x] **M7** Durability modes: per-write fsync / group commit / periodic; measure each *(109 unit tests + kill -9 test + benchmark; owner review pending)*
+- [x] **M8** Concurrency: snapshot reads that never block the writer *(129 unit tests + kill -9 test + before/after benchmark vs M7; owner review pending)*
+- [x] **M9** Range scans: merging iterator across memtable + levels *(145 unit tests; 20 mutants, 19 caught + 1 equivalent; owner review pending)*
+- [x] **M10** Crash-injection harness (random kill -9, verify no acked write lost) + model-based fuzz test *(300-round soak: 1.02M acked ops, none lost; 5,000 fuzz cases; harness and fuzzer each mutation-checked; owner review pending)*
+- [x] **M11** Benchmarks (ops/sec, p50/p99, write amplification) vs RocksDB *(`bench/` crate, RocksDB 11.8; writes even, lsmkv faster on single-threaded reads (unprofiled), RocksDB better compaction and tails)*
+- [x] **M12** DESIGN.md complete, README with results *(README rewrite with mermaid diagram + all results, DESIGN index + final pass, `examples/demo.rs`)*
 
 ### Tier 3: Stretch (owner approved M13–M15 on 2026-10-05)
-- [x] **M13** Atomic write batches + optimistic transactions (snapshot isolation, `get_for_update`) *(Claude; 15 mutants, all caught)*
-- [x] **M14** Redis-protocol (RESP) server: `redis-cli` talks to lsmkv *(Claude; `lsmkv-server`, 11 mutants all caught)*
-- [x] **M15** Deterministic simulation + power-loss testing (simulated disk behind an `Fs` trait) *(Claude; found and fixed a real torn-manifest-commit bug; format 4)*
+- [x] **M13** Atomic write batches + optimistic transactions (snapshot isolation, `get_for_update`) *(15 mutants, all caught)*
+- [x] **M14** Redis-protocol (RESP) server: `redis-cli` talks to lsmkv *(`lsmkv-server`, 11 mutants all caught)*
+- [x] **M15** Deterministic simulation + power-loss testing (simulated disk behind an `Fs` trait) *(found and fixed a real torn-manifest-commit bug; format 4)*
 Not planned: compression, column families, Raft.
 
-## ▶ RESUME HERE (handover 2026-10-05, after M15: Tier 3 done)
+## ▶ RESUME HERE (2026-10-05, after M15: Tier 3 done)
 
 **State:** M0–M15 are done and pushed to `main`: https://github.com/keshavdhingra001/lsmkv (**public** since 2026-10-05).
 All three planned Tier 3 milestones are built: M13 batches + transactions, M14 Redis-protocol server, M15 deterministic simulation.
@@ -51,15 +51,6 @@ All three planned Tier 3 milestones are built: M13 batches + transactions, M14 R
 - Fuzz: `PROPTEST_CASES=5000 cargo test --release --test model`.
 - Benchmarks: `examples/{durability,concurrency,scan,server_bench}.rs`; vs RocksDB: `cd bench && cargo run --release` (never `cargo clippy` in `bench/`: it recompiles RocksDB's C++, ~7 min).
 
-**Environment gotchas:**
-- Pushing: `SSH_AUTH_SOCK=$(ls ~/.ssh/agent/s.* | head -1) git push`. If that fails, the owner runs `ssh-add ~/.ssh/id_ed25519`.
-- **Long runs must be detached** (`setsid nohup bash -c '...' &`): a session restart kills background tasks (it killed the 10k soak twice).
-- **Never clean `/tmp/.tmp*` while a long test runs:** that cleanup deleted the live soak's database once (looked like a recovery bug; it wasn't). Long soaks now use `TMPDIR=$PWD/target/soak-tmp`.
-- **`pkill -f` / `pgrep -f` patterns match the shell running them** (happened 3 times). Use `pgrep -x name`, or the bracket trick: `pgrep -f "kill9-[0-9a-f]"`.
-- Other sessions (lob, ember) run cargo here: the shared package-cache lock can stall builds, and their CPU skews benchmarks. The mutation runner builds with `--no-run` first, so lock waits aren't scored as "caught".
-- Mutation checks: the scratchpad runner (`mutate.py <json> [test args]`) restores and `touch`es files. If a session dies mid-run, look for `*.bak` in `src/` and restore.
-- `/tmp` is tmpfs: benchmark on the real disk (`target/`). No `perf`, `ptrace` restricted.
-
 **Code map:** `src/wal.rs` (log, batch records), `src/key.rs` (sequence numbers, internal key order), `src/memtable.rs` (skiplist + `MemIter`),
 `src/sstable/{block,writer,reader,filter,cache,mod}.rs`, `src/manifest.rs` (edit log, `Group(n)` commits, format 4), `src/vfs.rs` (`Fs`, `RealFs`, `SimFs`),
 `src/db.rs` (`Db`, writer queue, `SuperVersion`, recovery, inline mode), `src/db/background.rs` (flush, `run_one`), `src/db/compaction.rs`,
@@ -71,8 +62,7 @@ All three planned Tier 3 milestones are built: M13 batches + transactions, M14 R
 
 **2026-10-04: M0 done.** Scaffold committed. Nothing compiled yet (Rust not installed at scaffold time).
 
-**2026-10-04: Mode switched.** Claude now writes each milestone; owner studies and answers questions before the next one (see CLAUDE.md).
-M1 done: 7/7 memtable tests pass, clippy clean. Rust 1.99.0 installed (via TUNA mirror; Fastly route from the hotspot is slow).
+M1 done: 7/7 memtable tests pass, clippy clean. Rust 1.99.0 installed.
 
 **2026-10-04: M5 done.** Built in 4 sections: manifest levels + table key ranges, level read path, compaction, crash tests + REPL.
 71/71 tests, clippy clean. Mutation-checked: always dropping tombstones, compacting only the newest L0 table, the oldest version winning the merge, and deleting inputs before the commit were all caught.
@@ -80,7 +70,7 @@ The owner chose to keep the repo private for now (2026-10-04).
 
 **2026-10-04: M6 done.** The owner approved the proposal as-is ("go"). Built in 3 sections: the filter (`filter.rs`), filters written into and checked by tables, and the shared LRU block cache (`cache.rs`).
 97/97 tests, clippy clean. Measured: filters cut block reads for missing keys from 31,936 to 279 (114x) at a 0.87% false-positive rate; a 256 KiB cache served 91% of skewed reads. Mutation-checked: 15 planted bugs, all caught (see D9, D10).
-The owner went ahead without answering the M1–M5 review questions (CLAUDE.md says to answer them before the next milestone).
+The owner went ahead without answering the M1–M5 review questions.
 
 **2026-10-04: M7 done.** The owner approved the proposal ("go"). Built as: (1+2) writer queue + group commit + `SyncMode::{Always, Periodic}`, merged because the code is intertwined; (3) the kill -9 test, the benchmark, and moving the periodic fsync off both locks.
 Found and fixed along the way: a lost-wakeup hang in the periodic thread's shutdown, the periodic interval stretching to 177 ms during compactions, and the sync thread blocking at startup on the state lock.
@@ -98,9 +88,8 @@ Semantics changed: any background failure poisons (M4's "retryable before commit
 
 **2026-10-04: M9 done.** The owner approved the combined M9–M12 proposal in one "go". Built in 3 sections: (1) streaming table iterator + memtable range iterator; (2) `MergeIter` (heap k-way merge), `DbIter`, `Db::scan`/`iter`, `Snapshot::scan`/`iter`, REPL `scan`/`sscan`; (3) compaction switched to the streaming merge.
 Measured: compaction peak RSS 265 MiB → 24 MiB over a 129 MiB rewrite; full scan 5.8M keys/s, seek + 100 keys 76k/s.
-Corrected the handover note: an open scan does NOT need to register a snapshot (it holds an immutable SuperVersion; see D21).
+Corrected the M9 plan: an open scan does NOT need to register a snapshot (it holds an immutable SuperVersion; see D21).
 Found along the way: `impl RangeBounds<[u8]>` doesn't accept `&[u8]` ranges (std's impl needs sized T), so the API takes `RangeBounds<K: AsRef<[u8]>>`; a mutation survivor showed the narrow-scan test damaged bytes the scan never reads.
-Environment: another session's `cargo add` held the shared package-cache lock for minutes, so the mutation runner now builds with `cargo test --no-run` before the timed run (a lock wait can't be scored as "caught").
 
 **2026-10-04: M10 done.** `tests/kill9.rs` rewritten as a multi-round crash harness (one directory, random kill times, both sync modes, an exact checker, the child self-checking with scans). `tests/model.rs`: a proptest model test over every public operation, including reopen. proptest is the only new dependency (dev only).
 Measured: a 300-round soak checked 1,022,073 acknowledged operations with none lost; 5,000 fuzz cases passed.
@@ -114,7 +103,11 @@ Mistakes on the way: a non-terminating `shuffled` helper hung a benchmark for 44
 Mistakes on the way: a `/tmp` cleanup deleted a live soak's database (not an engine bug); the first inline mode flushed eagerly and masked two planted bugs; a recursive glob was exponential (replaced); the first pipelining test was too small to split commands across reads.
 
 A 20,000-seed release run found a second real bug (seed 14676): recovery replayed WALs without fsyncing them, so a later failed fsync or power cut could take back writes the reopened database had already served. Fixed (recovery fsyncs replayed WALs), with a unit test and a process-kill fault in the simulation.
-**Left running at handover (detached):** a 20,000-seed simulation rerun on the final code (`target/sim20k-final.log`), and the 10,000-round kill -9 soak started in M13 (`target/soak10k.log`, built from M13-era code). Check both first thing. If they passed, update the README's long-run numbers (it currently cites the 300-round soak and "20,000-seed release runs"), and rerun the demo to refresh the README's demo output (it gained a transactions step). If either failed, replay it (`LSMKV_SIM_SEED=<n>`) before anything else.
+**Left running (detached):** a 20,000-seed simulation rerun on the final code (`target/sim20k-final.log`), and the 10,000-round kill -9 soak started in M13 (`target/soak10k.log`, built from M13-era code). Check both first thing. If they passed, update the README's long-run numbers (it currently cites the 300-round soak and "20,000-seed release runs"), and rerun the demo to refresh the README's demo output (it gained a transactions step). If either failed, replay it (`LSMKV_SIM_SEED=<n>`) before anything else.
+
+**2026-10-05: Cleanup pass (no behavior or format change).** Removed duplication: one WAL record writer (`Wal::write_record`) for plain and batch records, `Record::size`; one manifest record decoder (the CRC was checked twice per record); `SuperVersion::newest` behind both `get` and `newest_seq`; `Shared::read_view`, `Pending::writes`, `State::new_file_number`, `Table::open`, `bytes(level)`; `ENTRY_HEADER_LEN` instead of a literal 17; a shared `test_util::val`. `db.rs` tests moved to `src/db/tests.rs` (like `sstable/tests.rs`). 184 tests pass; simulation seeds 0–2792 pass (see below).
+Simulation sweep (`LSMKV_SIM_SEEDS=20000`, release) on this machine: **seed 2186** failed because a failed-fsync fault armed for an epoch that ended in a clean close stayed armed into the next reopen. That's a harness bug, fixed with `SimFs::disarm` on clean close. **Seed 2793 fails on the original code too, and looks like a real durability bug:** after a power cut during an inline flush/compaction in `Always` mode, durable keys come back missing or at an older version (`k077` lost, `k092` s196 -> s110). Not fixed: needs the owner (durability). Replay: `LSMKV_SIM_SEED=2793 cargo test --release --test sim -- --nocapture`. The README's "20,000 seeds pass" claim doesn't hold until this is resolved.
+Commit history rewritten (owner approved 2026-10-05) to drop AI co-author trailers; new commits carry none.
 
 **Next step:** see RESUME HERE (the quiz in a new chat).
 
@@ -243,6 +236,7 @@ A 20,000-seed release run found a second real bug (seed 14676): recovery replaye
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed
-- [x] GitHub: private repo https://github.com/keshavdhingra001/lsmkv (SSH remote, key ~/.ssh/id_ed25519)
+- [x] GitHub repo https://github.com/keshavdhingra001/lsmkv
 - [x] Git email links to GitHub account keshavdhingra001
 - [x] D2: mid-log WAL corruption fails loud (owner approved 2026-10-04)
+- [ ] Simulation seed 2793: durable writes lost after a power cut mid-compaction (see 2026-10-05 cleanup entry)

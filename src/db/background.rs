@@ -15,12 +15,12 @@ use std::sync::{Arc, MutexGuard};
 #[cfg(test)]
 use std::time::Duration;
 
-use super::{lock, open_table, remove_obsolete_files, table_path, Shared, State, Table};
+use super::{lock, remove_obsolete_files, table_path, Shared, State, Table};
 use crate::error::Result;
 use crate::key::{SeqNo, Shadowed};
 use crate::manifest::Edit;
 use crate::memtable::MemTable;
-use crate::sstable::{ReadContext, SstReader, SstWriter, WriterOptions};
+use crate::sstable::{ReadContext, SstWriter, WriterOptions};
 use crate::vfs::Fs;
 
 /// What a job needs from `State`, copied out so it can run with no lock held.
@@ -103,20 +103,19 @@ fn flush<'a>(
     mut st: MutexGuard<'a, State>,
 ) -> (MutexGuard<'a, State>, Result<bool>) {
     let imm = Arc::clone(st.current.imm.as_ref().expect("checked by caller"));
-    let table_id = st.next_file;
-    st.next_file += 1;
+    let table_id = st.new_file_number();
     let env = st.job_env();
     drop(st);
 
     let written = write_table(&env, &imm, table_id);
 
     let mut st = lock(&shared.state);
-    let done = written.and_then(|reader| st.finish_flush(table_id, reader));
+    let done = written.and_then(|table| st.finish_flush(table));
     (st, done.map(|()| true))
 }
 
 /// Step 1 of a flush, no lock held.
-fn write_table(env: &JobEnv, imm: &MemTable, table_id: u64) -> Result<SstReader> {
+fn write_table(env: &JobEnv, imm: &MemTable, table_id: u64) -> Result<Arc<Table>> {
     #[cfg(test)]
     std::thread::sleep(env.slow);
     let path = table_path(&env.dir, table_id);
@@ -131,7 +130,7 @@ fn write_table(env: &JobEnv, imm: &MemTable, table_id: u64) -> Result<SstReader>
         }
     }
     writer.finish()?;
-    open_table(&*env.fs, &env.dir, table_id, &env.read_ctx)
+    Table::open(&*env.fs, &env.dir, table_id, &env.read_ctx)
 }
 
 /// One compaction: start (lock held), merge (no lock), finish (lock held).
@@ -148,11 +147,7 @@ fn compact<'a>(
     };
     drop(st);
 
-    let outputs = job.run(|| {
-        let mut st = lock(&shared.state);
-        st.next_file += 1;
-        st.next_file - 1
-    });
+    let outputs = job.run(|| lock(&shared.state).new_file_number());
 
     let mut st = lock(&shared.state);
     let done = outputs.and_then(|outputs| st.finish_compaction(job, outputs));
@@ -174,11 +169,11 @@ impl State {
     }
 
     /// Steps 2 and 3 of a flush, lock held.
-    fn finish_flush(&mut self, table_id: u64, reader: SstReader) -> Result<()> {
+    fn finish_flush(&mut self, table: Arc<Table>) -> Result<()> {
         self.failpoint("flush:after_table")?;
         let edits = [
             Edit::AddTable {
-                id: table_id,
+                id: table.id,
                 level: 0,
             },
             // Logs before the active one hold only the flushed writes.
@@ -188,15 +183,9 @@ impl State {
         ];
         self.commit(&edits, "flush")?;
 
-        self.flush_bytes += reader.file_size();
+        self.flush_bytes += table.reader.file_size();
         let mut levels = self.current.levels.clone();
-        levels[0].insert(
-            0,
-            Arc::new(Table {
-                id: table_id,
-                reader: Arc::new(reader),
-            }),
-        );
+        levels[0].insert(0, table);
         self.install(super::SuperVersion {
             mem: Arc::clone(&self.current.mem),
             imm: None,

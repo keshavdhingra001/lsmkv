@@ -330,6 +330,8 @@ fn run(seed: u64, verbose: bool) -> Result<Summary, String> {
             // A process exit: whatever reached the OS stays. A clean close
             // syncs the WAL in Periodic mode, unless the database was poisoned.
             drop(db);
+            // The epoch's fault, if it never fired, ends with it.
+            sim.disarm();
             say("  closed".into());
         }
     }

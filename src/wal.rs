@@ -53,10 +53,17 @@ impl Record {
         }
     }
 
-    pub fn value_len(&self) -> usize {
+    /// Key plus value bytes: what a write costs the user, before encoding.
+    pub fn size(&self) -> usize {
+        let (_, key, value) = self.parts();
+        key.len() + value.len()
+    }
+
+    /// Kind byte, key and value (empty for a delete), as they're encoded.
+    fn parts(&self) -> (u8, &[u8], &[u8]) {
         match self {
-            Record::Put { value, .. } => value.len(),
-            Record::Delete { .. } => 0,
+            Record::Put { key, value } => (KIND_PUT, key, value),
+            Record::Delete { key } => (KIND_DELETE, key, &[]),
         }
     }
 }
@@ -101,26 +108,9 @@ impl Wal {
     /// Does NOT fsync; that's `sync`'s job, which lets a caller batch several
     /// appends under one fsync later (group commit).
     pub fn append(&mut self, seq: SeqNo, rec: &Record) -> Result<()> {
-        let (kind, key, value): (u8, &[u8], &[u8]) = match rec {
-            Record::Put { key, value } => (KIND_PUT, key, value),
-            Record::Delete { key } => (KIND_DELETE, key, &[]),
-        };
-        let key_len = len_u32(key, "key")?;
-        let val_len = len_u32(value, "value")?;
-
-        // Everything after the CRC field, built first so the CRC can cover it.
-        let mut body = Vec::with_capacity(HEADER_LEN - 4 + key.len() + value.len());
-        body.push(kind);
-        body.extend_from_slice(&seq.to_le_bytes());
-        body.extend_from_slice(&key_len.to_le_bytes());
-        body.extend_from_slice(&val_len.to_le_bytes());
-        body.extend_from_slice(key);
-        body.extend_from_slice(value);
-
-        let crc = crc32fast::hash(&body);
-        self.file.write_all(&crc.to_le_bytes())?;
-        self.file.write_all(&body)?;
-        Ok(())
+        let (kind, key, value) = rec.parts();
+        let (key_len, val_len) = (len_u32(key, "key")?, len_u32(value, "value")?);
+        self.write_record(kind, seq, key_len, val_len, &[key, value])
     }
 
     /// Logs `ops`, numbered `first_seq`, `first_seq + 1`, ..., as one unit:
@@ -133,10 +123,7 @@ impl Wal {
             _ => {
                 let mut payload = Vec::new();
                 for op in ops {
-                    let (kind, key, value): (u8, &[u8], &[u8]) = match op {
-                        Record::Put { key, value } => (KIND_PUT, key, value),
-                        Record::Delete { key } => (KIND_DELETE, key, &[]),
-                    };
+                    let (kind, key, value) = op.parts();
                     payload.push(kind);
                     payload.extend_from_slice(&len_u32(key, "key")?.to_le_bytes());
                     payload.extend_from_slice(&len_u32(value, "value")?.to_le_bytes());
@@ -146,19 +133,35 @@ impl Wal {
                 let count = u32::try_from(ops.len())
                     .map_err(|_| Error::InvalidArgument("batch has over 4G operations".into()))?;
                 let payload_len = len_u32(&payload, "batch")?;
-
-                let mut body = Vec::with_capacity(HEADER_LEN - 4 + payload.len());
-                body.push(KIND_BATCH);
-                body.extend_from_slice(&first_seq.to_le_bytes());
-                body.extend_from_slice(&count.to_le_bytes());
-                body.extend_from_slice(&payload_len.to_le_bytes());
-                body.extend_from_slice(&payload);
-                let crc = crc32fast::hash(&body);
-                self.file.write_all(&crc.to_le_bytes())?;
-                self.file.write_all(&body)?;
-                Ok(())
+                self.write_record(KIND_BATCH, first_seq, count, payload_len, &[&payload])
             }
         }
+    }
+
+    /// Writes one record: the header fields, then `body` back to back, with
+    /// the CRC in front covering everything after it.
+    fn write_record(
+        &mut self,
+        kind: u8,
+        seq: SeqNo,
+        len_a: u32,
+        len_b: u32,
+        body: &[&[u8]],
+    ) -> Result<()> {
+        let body_len: usize = body.iter().map(|b| b.len()).sum();
+        let mut rec = Vec::with_capacity(HEADER_LEN + body_len);
+        rec.extend_from_slice(&[0; 4]); // the CRC, filled in below
+        rec.push(kind);
+        rec.extend_from_slice(&seq.to_le_bytes());
+        rec.extend_from_slice(&len_a.to_le_bytes());
+        rec.extend_from_slice(&len_b.to_le_bytes());
+        for part in body {
+            rec.extend_from_slice(part);
+        }
+        let crc = crc32fast::hash(&rec[4..]);
+        rec[..4].copy_from_slice(&crc.to_le_bytes());
+        self.file.write_all(&rec)?;
+        Ok(())
     }
 
     /// Pushes buffered bytes to the OS without waiting for the disk. They
