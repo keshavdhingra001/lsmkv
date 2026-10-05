@@ -29,6 +29,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The server test drives the real redis-cli when it's installed.
+      - run: sudo apt-get install -y redis-tools
       - run: cargo test
 
   # Longer randomized runs, in release mode. Short on every push, long nightly.

@@ -333,3 +333,57 @@ fn a_protocol_error_closes_the_connection() {
         R::Simple("PONG".into())
     );
 }
+
+/// The real `redis-cli`, if it's installed (CI installs it): runs `script`
+/// over one connection and returns its output lines.
+fn redis_cli(port: u16, script: &str) -> Option<Vec<String>> {
+    let mut child = std::process::Command::new("redis-cli")
+        .args(["-p", &port.to_string()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    Some(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+#[test]
+fn the_real_redis_cli_works() {
+    let (port, _dir) = start();
+    let script = "PING\nSET k hello\nGET k\nMGET k nope\nINCRBY n 41\nINCR n\n\
+                  WATCH n\nMULTI\nINCRBY n -2\nGET n\nEXEC\nDEL k\nGET k\n";
+    let Some(lines) = redis_cli(port, script) else {
+        eprintln!("redis-cli not installed: skipped");
+        return;
+    };
+    let expected = [
+        "PONG", "OK", "hello", "hello", "", "41", "42", "OK", "OK", "QUEUED", "QUEUED", "40", "40",
+        "1", "",
+    ];
+    assert_eq!(lines, expected);
+
+    // A write to a watched key between WATCH and EXEC aborts the transaction:
+    // EXEC replies with a null array (an empty line in redis-cli).
+    let mut other = Client::connect(port);
+    let mut tx = Client::connect(port);
+    assert_eq!(tx.cmd(&["WATCH", "n"]), ok());
+    assert_eq!(other.cmd(&["SET", "n", "7"]), ok());
+    let lines = redis_cli(port, "GET n\n").unwrap();
+    assert_eq!(lines, ["7"]);
+    assert_eq!(tx.cmd(&["MULTI"]), ok());
+    assert_eq!(tx.cmd(&["INCR", "n"]), R::Simple("QUEUED".into()));
+    assert_eq!(tx.cmd(&["EXEC"]), R::NilArray);
+}
