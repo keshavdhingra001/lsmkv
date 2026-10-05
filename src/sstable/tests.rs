@@ -3,12 +3,8 @@
 use super::*;
 use crate::key::{SeqNo, MAX_SEQ};
 use crate::memtable::Entry;
-use crate::test_util::Rng;
+use crate::test_util::{val, Rng};
 use std::path::{Path, PathBuf};
-
-fn val(s: &str) -> Entry {
-    Entry::Value(s.as_bytes().to_vec())
-}
 
 /// Writes one version per key, all at seq 1.
 fn write_table(path: &Path, block_size: usize, entries: &[(Vec<u8>, Entry)]) {

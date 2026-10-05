@@ -1,5 +1,12 @@
 //! Helpers shared by tests across modules.
 
+use crate::memtable::Entry;
+
+/// A value entry holding `s`.
+pub(crate) fn val(s: &str) -> Entry {
+    Entry::Value(s.as_bytes().to_vec())
+}
+
 /// xorshift64: tiny deterministic PRNG, so failures are reproducible by seed.
 pub(crate) struct Rng(u64);
 

@@ -241,41 +241,33 @@ fn encode_raw(tag: u8, value: u64, out: &mut Vec<u8>) {
     out.extend_from_slice(&body);
 }
 
-/// `None` = bad checksum or unknown tag.
 /// One record: an edit, or a group header.
 enum Rec {
     Edit(Edit),
     Group(u64),
 }
 
+/// `None` = bad checksum or unknown tag.
 fn decode_rec(rec: &[u8]) -> Option<Rec> {
     if crc32fast::hash(&rec[4..RECORD_LEN]) != read_u32(rec, 0) {
         return None;
     }
-    if rec[4] == TAG_GROUP {
-        return Some(Rec::Group(read_u64(rec, 5)));
-    }
-    decode(rec).map(Rec::Edit)
-}
-
-fn decode(rec: &[u8]) -> Option<Edit> {
-    if crc32fast::hash(&rec[4..RECORD_LEN]) != read_u32(rec, 0) {
-        return None;
-    }
     let value = read_u64(rec, 5);
-    match rec[4] {
+    let edit = match rec[4] {
+        TAG_GROUP => return Some(Rec::Group(value)),
         tag if (TAG_ADD_TABLE_BASE..TAG_ADD_TABLE_BASE + MAX_LEVELS as u8).contains(&tag) => {
-            Some(Edit::AddTable {
+            Edit::AddTable {
                 id: value,
                 level: tag - TAG_ADD_TABLE_BASE,
-            })
+            }
         }
-        TAG_REMOVE_TABLE => Some(Edit::RemoveTable(value)),
-        TAG_SET_LOG_NUMBER => Some(Edit::SetLogNumber(value)),
-        TAG_SET_LAST_SEQUENCE => Some(Edit::SetLastSequence(value)),
-        TAG_FORMAT => Some(Edit::Format(value)),
-        _ => None,
-    }
+        TAG_REMOVE_TABLE => Edit::RemoveTable(value),
+        TAG_SET_LOG_NUMBER => Edit::SetLogNumber(value),
+        TAG_SET_LAST_SEQUENCE => Edit::SetLastSequence(value),
+        TAG_FORMAT => Edit::Format(value),
+        _ => return None,
+    };
+    Some(Rec::Edit(edit))
 }
 
 /// Rebuilds the `Version` and returns it with the length of the valid prefix.
@@ -349,6 +341,14 @@ fn replay(buf: &[u8]) -> Result<(Version, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The edit in one encoded record, if it is a valid edit.
+    fn decode(rec: &[u8]) -> Option<Edit> {
+        match decode_rec(rec)? {
+            Rec::Edit(edit) => Some(edit),
+            Rec::Group(_) => None,
+        }
+    }
     use std::fs::{self, OpenOptions};
 
     fn reopen(dir: &Path) -> Version {

@@ -175,13 +175,10 @@ fn entry_len(entry: &Entry) -> usize {
 mod tests {
     use super::*;
     use crate::key::MAX_SEQ;
+    use crate::test_util::val;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
     use std::thread;
-
-    fn val(s: &str) -> Entry {
-        Entry::Value(s.as_bytes().to_vec())
-    }
 
     #[test]
     fn get_missing_is_none() {

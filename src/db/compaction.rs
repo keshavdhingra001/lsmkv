@@ -33,13 +33,12 @@ use std::sync::Arc;
 
 use super::background::JobEnv;
 use super::iter::{MergeIter, Source};
-use super::{
-    open_table, remove_obsolete_files, table_for_key, table_path, State, SuperVersion, Table,
-};
+use super::{bytes, remove_obsolete_files, table_for_key, table_path, State, SuperVersion, Table};
 use crate::error::Result;
 use crate::key::Shadowed;
 use crate::manifest::{Edit, MAX_LEVELS};
 use crate::memtable::Entry;
+use crate::sstable::block::ENTRY_HEADER_LEN;
 use crate::sstable::SstWriter;
 
 /// Table ids to merge from `level` and from `out_level`, into `out_level`.
@@ -100,10 +99,7 @@ impl State {
     fn pick_level(&self) -> Option<usize> {
         let l0 = self.current.levels[0].len() as f64 / self.opts.l0_compaction_trigger as f64;
         let deeper = (1..MAX_LEVELS - 1).map(|n| {
-            let bytes: u64 = self.current.levels[n]
-                .iter()
-                .map(|t| t.reader.file_size())
-                .sum();
+            let bytes = bytes(&self.current.levels[n]);
             (bytes as f64 / self.max_bytes_for(n) as f64, n)
         });
         std::iter::once((l0, 0))
@@ -213,7 +209,7 @@ impl State {
                 .find(|t| t.id == c.inputs[0])
                 .map(|t| t.largest().to_vec());
         }
-        self.compaction_bytes += outputs.iter().map(|t| t.reader.file_size()).sum::<u64>();
+        self.compaction_bytes += bytes(&outputs);
         let mut levels = self.current.levels.clone();
         for level in [c.level, out_level] {
             levels[level].retain(|t| !removed.contains(&t.id));
@@ -278,6 +274,11 @@ impl CompactionJob {
         let mut shadowed = Shadowed::new(env.oldest_snapshot);
         let deeper = &self.current.levels[self.c.out_level + 1..];
         let mut outputs: Vec<Arc<Table>> = Vec::new();
+        // Finishes an output table and opens it.
+        let seal = |id, writer: SstWriter| {
+            writer.finish()?;
+            Table::open(&*env.fs, &env.dir, id, &env.read_ctx)
+        };
         // (table id, writer, bytes so far, last user key written)
         let mut current: Option<(u64, SstWriter, usize, Vec<u8>)> = None;
         for item in merged {
@@ -293,11 +294,7 @@ impl CompactionJob {
             if let Some((_, _, size, last)) = &current {
                 if *size >= env.target_file_size && *last != key {
                     let (id, writer, _, _) = current.take().expect("just checked");
-                    writer.finish()?;
-                    outputs.push(Arc::new(Table {
-                        id,
-                        reader: Arc::new(open_table(&*env.fs, &env.dir, id, &env.read_ctx)?),
-                    }));
+                    outputs.push(seal(id, writer)?);
                 }
             }
             if current.is_none() {
@@ -316,11 +313,7 @@ impl CompactionJob {
             *last = key;
         }
         if let Some((id, writer, _, _)) = current.take() {
-            writer.finish()?;
-            outputs.push(Arc::new(Table {
-                id,
-                reader: Arc::new(open_table(&*env.fs, &env.dir, id, &env.read_ctx)?),
-            }));
+            outputs.push(seal(id, writer)?);
         }
         Ok(outputs)
     }
@@ -329,8 +322,9 @@ impl CompactionJob {
 /// Encoded size of an entry's value plus the fixed entry header
 /// (kind, seq, two lengths).
 fn entry_len(entry: &Entry) -> usize {
-    17 + match entry {
-        Entry::Value(v) => v.len(),
-        Entry::Tombstone => 0,
-    }
+    ENTRY_HEADER_LEN
+        + match entry {
+            Entry::Value(v) => v.len(),
+            Entry::Tombstone => 0,
+        }
 }

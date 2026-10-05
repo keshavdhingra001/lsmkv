@@ -70,11 +70,17 @@ pub(super) struct Pending {
 }
 
 impl Pending {
+    /// Plain writes: no conflict check.
+    pub(super) fn writes(ops: Vec<Record>) -> Self {
+        Self {
+            ops,
+            read_seq: None,
+            also_check: Vec::new(),
+        }
+    }
+
     pub(super) fn bytes(&self) -> usize {
-        self.ops
-            .iter()
-            .map(|op| op.key().len() + op.value_len())
-            .sum()
+        self.ops.iter().map(Record::size).sum()
     }
 }
 
@@ -135,11 +141,7 @@ impl Db {
     /// Writes every operation in `batch` atomically: a crash keeps all of
     /// them or none, and a reader sees all of them or none.
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
-        self.commit(Pending {
-            ops: batch.ops,
-            read_seq: None,
-            also_check: Vec::new(),
-        })
+        self.commit(Pending::writes(batch.ops))
     }
 
     /// Starts a transaction reading at a snapshot of the database as it is now.
