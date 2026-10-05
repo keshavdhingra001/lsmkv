@@ -7,7 +7,7 @@ and a Redis-protocol server, so `redis-cli` talks to it.
 
 Its crash safety is tested two ways: real `kill -9`s of a running process (300 rounds, over a million acknowledged writes, none lost), and a
 **deterministic simulation** that runs the engine on a simulated disk and cuts the power at random points. The
-simulation found two real bugs the crash tests never could (a manifest commit torn by a power cut, and recovery serving unsynced data), and catches 9 of
+simulation found three real bugs the crash tests never could (a manifest commit torn by a power cut, and recovery acting on unsynced WAL and manifest data), and catches 9 of
 10 planted durability bugs that `kill -9` misses entirely. See [how it's tested](#how-its-tested).
 
 About 9,800 lines of Rust (8,100 in `src/`, unit tests included). Three runtime dependencies: `crc32fast`, `crossbeam-skiplist` and `thiserror`.

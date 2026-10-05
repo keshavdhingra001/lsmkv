@@ -38,7 +38,7 @@ All three planned Tier 3 milestones are built: M13 batches + transactions, M14 R
 1. **The review-question quiz** is the priority: 95 questions, M1–M15, below. Ask them one at a time, have the owner answer in their own words, correct and explain, and record each answer and a short verdict under its question. Suggested order (what interviewers probe most): M2 (WAL), M4 (flush/recovery), M7 (group commit), M8 (concurrency/snapshots), M15 (power loss + the bug it found), M13 (transactions), then the rest.
 2. For each milestone, it helps to open the code alongside: the "Code map" below says where each piece lives, and DESIGN.md has a decision index (D1–D28).
 3. The headline stories to be able to tell, start to finish:
-   - **The two bugs the simulation found** (D28): the torn manifest commit (seed 44, the `Group(n)` fix), and recovery serving un-fsynced WAL data (seed 14676, fsync on replay). Why `kill -9` can't find either.
+   - **The three bugs the simulation found** (D28): the torn manifest commit (seed 44, the `Group(n)` fix), recovery serving un-fsynced WAL data (seed 14676, fsync on replay), and recovery acting on an un-fsynced manifest commit (seed 2793, fsync the manifest on open). Why `kill -9` can't find any of them.
    - **Sim vs kill -9:** 9 of 10 planted durability bugs caught by the simulation, 0 of 10 by kill -9 (D28's table).
    - **Compaction memory** 265 → 24 MiB (D20). **RocksDB comparison** and why the first run wasn't trusted (D24).
 4. Optional: install `valkey` (`sudo pacman -S valkey`) and try `valkey-cli -p 6380` against `cargo run --release --bin lsmkv-server`. The server was tested with a socket-level RESP client, not yet with the real `redis-cli`/`valkey-cli`, so do that once.
@@ -106,7 +106,7 @@ A 20,000-seed release run found a second real bug (seed 14676): recovery replaye
 **Left running (detached):** a 20,000-seed simulation rerun on the final code (`target/sim20k-final.log`), and the 10,000-round kill -9 soak started in M13 (`target/soak10k.log`, built from M13-era code). Check both first thing. If they passed, update the README's long-run numbers (it currently cites the 300-round soak and "20,000-seed release runs"), and rerun the demo to refresh the README's demo output (it gained a transactions step). If either failed, replay it (`LSMKV_SIM_SEED=<n>`) before anything else.
 
 **2026-10-05: Cleanup pass (no behavior or format change).** Removed duplication: one WAL record writer (`Wal::write_record`) for plain and batch records, `Record::size`; one manifest record decoder (the CRC was checked twice per record); `SuperVersion::newest` behind both `get` and `newest_seq`; `Shared::read_view`, `Pending::writes`, `State::new_file_number`, `Table::open`, `bytes(level)`; `ENTRY_HEADER_LEN` instead of a literal 17; a shared `test_util::val`. `db.rs` tests moved to `src/db/tests.rs` (like `sstable/tests.rs`). 184 tests pass; simulation seeds 0–2792 pass (see below).
-Simulation sweep (`LSMKV_SIM_SEEDS=20000`, release) on this machine: **seed 2186** failed because a failed-fsync fault armed for an epoch that ended in a clean close stayed armed into the next reopen. That's a harness bug, fixed with `SimFs::disarm` on clean close. **Seed 2793 fails on the original code too, and looks like a real durability bug:** after a power cut during an inline flush/compaction in `Always` mode, durable keys come back missing or at an older version (`k077` lost, `k092` s196 -> s110). Not fixed: needs the owner (durability). Replay: `LSMKV_SIM_SEED=2793 cargo test --release --test sim -- --nocapture`. The README's "20,000 seeds pass" claim doesn't hold until this is resolved.
+Simulation sweep (`LSMKV_SIM_SEEDS=20000`, release) on this machine: **seed 2186** failed because a failed-fsync fault armed for an epoch that ended in a clean close stayed armed into the next reopen. That's a harness bug, fixed with `SimFs::disarm` on clean close. **Seed 2793 was a real durability bug:** a flush's manifest commit was only in the page cache when the process died; the next open replayed it, deleted the WAL it retired, and never fsynced the manifest, so a later power cut lost the commit *and* the WAL. Fixed: `Manifest::open` fsyncs what it replayed (D28, `a_replayed_commit_survives_a_later_power_cut`). All 20,000 seeds pass now.
 Commit history rewritten (owner approved 2026-10-05) to drop AI co-author trailers; new commits carry none.
 
 **Next step:** see RESUME HERE (the quiz in a new chat).
@@ -233,10 +233,11 @@ Commit history rewritten (owner approved 2026-10-05) to drop AI co-author traile
 6. What makes a simulation run deterministic, and how is that checked? What's still not deterministic about the real engine?
 7. Why did flushing right after each memtable switch hide two planted bugs? What does that teach about test schedules?
 8. What's the `Periodic`-mode guarantee the simulation checks ("a prefix, never a hole"), and why does a log-structured design give it naturally?
+9. Seed 2793: walk through how a manifest commit that was never fsynced ends up losing a WAL. Why must `Manifest::open` fsync even when it found no torn tail, and why couldn't a `kill -9` alone (no power cut) ever show this?
 
 ## Blockers / open decisions
 - [x] Rust 1.99.0 installed
 - [x] GitHub repo https://github.com/keshavdhingra001/lsmkv
 - [x] Git email links to GitHub account keshavdhingra001
 - [x] D2: mid-log WAL corruption fails loud (owner approved 2026-10-04)
-- [ ] Simulation seed 2793: durable writes lost after a power cut mid-compaction (see 2026-10-05 cleanup entry)
+- [x] Simulation seed 2793: manifest not fsynced on recovery (fixed 2026-10-05)

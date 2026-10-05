@@ -177,6 +177,13 @@ impl Manifest {
         if valid_len < buf.len() as u64 {
             // Cut the torn tail so new edits aren't appended after garbage.
             file.set_len(valid_len)?;
+        }
+        if valid_len > 0 {
+            // What was just replayed is acted on from now on (`Db::open`
+            // deletes the WALs and tables it retires), so it must be
+            // durable: a commit whose fsync never finished may only be in
+            // the page cache, and a later power cut could take it back
+            // after the files it retired are gone (D28; seed 2793).
             file.sync()?;
         }
         let mut manifest = Self {
@@ -341,6 +348,7 @@ fn replay(buf: &[u8]) -> Result<(Version, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, OpenOptions};
 
     /// The edit in one encoded record, if it is a valid edit.
     fn decode(rec: &[u8]) -> Option<Edit> {
@@ -349,7 +357,6 @@ mod tests {
             Rec::Group(_) => None,
         }
     }
-    use std::fs::{self, OpenOptions};
 
     fn reopen(dir: &Path) -> Version {
         Manifest::open(dir).unwrap().1
@@ -368,6 +375,36 @@ mod tests {
         Version {
             format: FORMAT_VERSION,
             ..Version::default()
+        }
+    }
+
+    /// A commit that's only in the page cache when the process dies (its
+    /// fsync never finished) is replayed by the next open, which then acts
+    /// on it: `Db::open` deletes the WALs it retires. So the open must make
+    /// it durable: a power cut afterwards must not take it back (D28;
+    /// simulation seed 2793).
+    #[test]
+    fn a_replayed_commit_survives_a_later_power_cut() {
+        use crate::vfs::SimFs;
+        let dir = Path::new("/sim/db");
+        // A power cut keeps a random part of unsynced data: try several.
+        for seed in 0..20 {
+            let sim = SimFs::new(seed);
+            let (mut m, _) = Manifest::open_in(&sim, dir).unwrap();
+            sim.crash_after(2); // the write lands, the fsync dies
+            assert!(m.append(&[add(7), Edit::SetLogNumber(9)]).is_err());
+            drop(m);
+            sim.process_restart(); // kill -9: the page cache survives
+
+            let (_, v) = Manifest::open_in(&sim, dir).unwrap();
+            assert_eq!((ids(&v), v.log_number), (vec![7], 9), "replayed");
+            sim.power_cut();
+            let (_, v) = Manifest::open_in(&sim, dir).unwrap();
+            assert_eq!(
+                (ids(&v), v.log_number),
+                (vec![7], 9),
+                "seed {seed}: a commit the reopened manifest served was lost"
+            );
         }
     }
 
