@@ -33,9 +33,10 @@ Not planned: compression, column families, Raft.
 - [x] **M17** Trivial moves out of level 0 *(D29; `fillseq` write amplification 2.28 → 1.17)*
 - [x] **M18** Restart points in data blocks, format 5 *(D30; in-block lookups 1.2x–9.3x faster; format-4 databases still open)*
 
-## ▶ RESUME HERE (2026-10-05, after M18: Tier 4 done)
+## ▶ RESUME HERE (2026-10-06, after M18: Tier 4 done and merged)
 
-**State:** M0–M18 are done. M0–M15 are on `main`; M16–M18 are on branch `ccr-26eafa08-mvbvvg`, waiting for the owner to review and merge (a PR).
+**State:** M0–M18 are done and merged to `main` (PR #1: cleanup pass; PR #2: seed 2793 fix + M16–M18). Nothing is in flight.
+No milestone is planned after M18: the next step is the owner's study, not more building.
 196 tests pass (`cargo test`, about 70 s), clippy clean, CI green.
 
 **What the owner does next: study, then merge.**
@@ -122,7 +123,32 @@ M16: CI on every push (short soaks) and nightly (long); five libFuzzer targets, 
 M17: level-0 trivial moves (`fillseq` write amp 2.28 → 1.17). M18: restart points, format 5 (in-block lookups 1.2x on 4 KiB blocks of 100-byte values, 9.3x on 64 KiB blocks); format-4 databases still open (`tests/compat.rs`).
 Found along the way: CI's second run caught a flaky orphan check (a compaction finishing between listing files and counting tables); "LSMKVSS3" and "LSMKVSS2" differ in one bit, so the footer CRC now covers the magic; the first D29 tests used `compact_all`, which repaired bad moves before anything looked (all planted bugs survived them); the mutation runner's control mode showed `writes_and_reads_continue_while_a_flush_runs` was timing-sensitive under load (400 ms → 2 s margin); LazyFS's completion FIFO must stay open; GitHub archive downloads are blocked here, so LazyFS's `spdlog` is fetched with git.
 
-**Next step:** see RESUME HERE (the quiz in a new chat), then merge M16–M18.
+**2026-10-05/06: session record (what the owner asked for, and what was done).**
+- *Commit history:* all 49 commits carried `Co-Authored-By: Claude`. The owner asked for them gone and approved a rewrite: history was rewritten (messages only; trees and dates identical) and `main` force-pushed. From then on, no AI attribution anywhere (rule in CLAUDE.md).
+- *Working logs:* CHECKPOINT.md's internal environment notes (SSH agent paths, other local sessions' names, scratchpad scripts) and the per-milestone "(Claude; ...)" tags were removed, at the owner's choice ("trim it").
+- *Cleanup pass* (PR #1, merged by the owner), then *seed 2793* root-caused and fixed, then *Tier 4* (M16–M18) built at the owner's request while they study; the owner approved D29 and D30 up front and said "do your recommendation" for the PR, so Claude opened PR #2, waited for green CI, removed an auto-added attribution footer from its description, and merged it (2026-10-05).
+- *The owner's level question:* the project reads as senior-level (L5) work in scope and depth, but an interview rates what the owner can defend; the 117 review questions are the gap that matters most. Study topics and the Rust concepts to know were given in chat; they follow the review-question order below.
+
+**Next step:** see RESUME HERE: the quiz in a new chat.
+
+## Study guide (given to the owner 2026-10-05)
+
+**Storage-engine topics, in interview priority order** (DESIGN entry, then the code, then that milestone's questions):
+1. LSM-tree basics: sequential writes instead of in-place updates; write/read/space amplification; vs B-trees.
+2. WAL and durability (M2, D2–D4): CRCs, torn tails, truncation on recovery, what fsync guarantees, fsyncgate. `wal.rs`
+3. Flush, recovery, manifest (M4, D6–D7): the commit point, crash at every step, poisoning, file numbers. `db.rs` `open_with`, `manifest.rs`, `db/background.rs`
+4. Group commit (M7, D11): leader/followers, lock released during fsync, the sync modes. `Db::commit`
+5. Concurrency and snapshots (M8, D12–D18): sequence numbers, SuperVersion, lock-free reads, what compaction may drop. `key.rs`, `db/snapshot.rs`
+6. Power loss and the simulation (M15, D28): seeds 44, 14676 and 2793 end to end; why `kill -9` can't find them. `vfs.rs`, `tests/sim.rs`
+7. Transactions (M13, D25–D26): atomic batches, optimistic concurrency, snapshot isolation, write skew, `get_for_update`.
+8. Compaction (M5, D8, D29): leveled vs size-tiered, safe tombstone drop, trivial moves.
+9. SSTables, bloom filters, block cache (M3, M6, D30): layout, false-positive math, LRU, restart points.
+10. Range scans (M9): heap k-way merge; why an open scan needs no registered snapshot.
+11. Benchmarking (M11, D24): p99 vs mean; why the first RocksDB run wasn't trusted.
+12. Redis server (M14): RESP, pipelining, thread-per-connection vs async.
+Background reading: *Designing Data-Intensive Applications* ch. 3 and 7; LevelDB/RocksDB wikis (group commit); the PostgreSQL "fsyncgate" write-ups (2018).
+
+**Rust concepts the code relies on:** ownership and borrowing (`&[u8]` vs `Vec<u8>`, moving into threads); lifetimes (`Snapshot<'a>`, passing `MutexGuard<'a, State>` in and out of functions); `Arc`/`Mutex`/`Condvar` (`wait_timeout_while`, lost wakeups, lock order, poisoning); atomics and `Ordering::Relaxed`; `Send`/`Sync`; trait objects vs generics (`Box<dyn Fs>`, `impl RangeBounds<K>` with `K: ?Sized`); implementing `Iterator`, `Ord` (heap + `Reverse`) and `Drop`; errors (`thiserror`, `?`, `From`); patterns (`let … else`, slice patterns); `#[cfg(test)]` failpoints; iterator adapters and `FnMut`; `thread::spawn` vs `thread::scope`; Unix I/O (`read_exact_at`, `BufWriter`, `set_len`); proptest.
 
 ## M1 review questions (owner answers)
 1. Why does `delete` insert a tombstone instead of `map.remove(key)`? What breaks once SSTables exist?
