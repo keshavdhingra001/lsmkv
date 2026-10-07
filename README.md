@@ -318,15 +318,15 @@ user:2 = bob
 lsmkv demo, database in target/demo
 
 == 1. write a batch ==
-200000 puts in 527.45ms; tables per level: L0=1 L1=4 L2=32
-write amplification so far: 3.47 (4 MiB written by callers -> 8 MiB flushed + 7 MiB compacted)
+200000 puts in 508.31ms; tables per level: L0=1 L1=3 L2=21
+write amplification so far: 1.78 (4 MiB written by callers -> 8 MiB flushed + 0 MiB compacted)
 
 == 2. kill -9 a writer mid-stream, then recover ==
-the child acknowledged 412 writes (last: crash:000411) before SIGKILL; reopened in 735.86µs
+the child acknowledged 353 writes (last: crash:000352) before SIGKILL; reopened in 441.84µs
 acknowledged writes missing after recovery: 0 (plus 1 in flight that made it to the log too)
 
 == 3. a snapshot survives overwrites, a delete and a full compaction ==
-snapshot taken at sequence 200413
+snapshot taken at sequence 200354
   user:000042: now "OVERWRITTEN"    snapshot "profile-42"
   user:000043: now (deleted)        snapshot "profile-43"
 
@@ -336,14 +336,20 @@ snapshot taken at sequence 200413
   user:000042 = OVERWRITTEN
   user:000044 = profile-44
   user:000045 = profile-45
-full scan: 200412 keys in 15.52ms
+full scan: 200353 keys in 14.97ms
 
-== 5. stats (counters since the reopen in step 2) ==
+== 5. an atomic batch, then a transaction that conflicts ==
+batch: alice=100, bob=50 written together (one WAL record)
+  (meanwhile, another writer sets alice=90)
+transfer of 30: conflict, nothing applied ("acct:alice" was written after this transaction's snapshot (seq 200358))
+retried: alice=60, bob=80 (total still 140)
+
+== 6. stats (counters since the reopen in step 2) ==
 tables per level: L6=32
-8 MiB of tables after compact_all; reads: 2018 blocks from disk, 66 from the block cache; bloom filters skipped 2045 table lookups (18 false positives)
+8 MiB of tables after compact_all; reads: 2028 blocks from disk, 54 from the block cache; bloom filters skipped 2047 table lookups (16 false positives)
 
-== 6. short benchmark (Periodic sync, one thread) ==
-100000 random overwrites: 455k/s; 100000 random gets: 849k/s
+== 7. short benchmark (Periodic sync, one thread) ==
+100000 random overwrites: 432k/s; 100000 random gets: 990k/s
 
 done
 ```
